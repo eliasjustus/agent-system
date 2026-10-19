@@ -198,7 +198,7 @@ def review_leave_out(repo, private, head, snapshot):
     files = set()
     for revision in (snapshot, *([head] if head else [])):
         files.update(os.fsdecode(raw) for raw in git(
-            repo, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", revision,
+            repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-r", "--name-only", "-z", revision,
             "--", *entries, text=False).split(b"\0") if raw)
     return [entry for entry in entries
             if any(name == entry or name.startswith(entry + "/") for name in files)]

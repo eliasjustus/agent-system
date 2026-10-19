@@ -552,6 +552,29 @@ assert (cwd / "models-old").read_text() == "keep"
                         self.assertIn(phrase, prompt)
                     self.assertFalse(Path(record["cwd"]).exists())
 
+    def test_LO_S8_subdirectory_repo_uses_root_relative_leave_out_paths(self):
+        path = self.leave_out_project()
+        (self.repo / "big").mkdir()
+        (self.repo / "big/weights").write_text("omit")
+        sub = self.repo / "sub"
+        sub.mkdir()
+        (sub / "kept").write_text("keep")
+        shutil.copyfile(self.repo / "AGENTS.md", sub / "AGENTS.md")
+        self.git("add", ".")
+        self.git("commit", "-qm", "subdirectory leave-out fixture")
+        path.write_text("big\n")
+        self.agent_extra('''
+record["big_present"] = (cwd / "big").exists()
+record["sub_content"] = (cwd / "sub/kept").read_text()
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        record = self.review_checkout("--repo", sub)
+        header = self.out.read_text().split("\n\n", 1)[0]
+        self.assertIn("Checkout: left-out paths ['big']", header)
+        self.assertIn("Checkout: left-out paths ['big']", record["stdin"])
+        self.assertFalse(record["big_present"])
+        self.assertEqual(record["sub_content"], "keep")
+
     def test_LO_S2_snapshot_changes_force_full_checkout(self):
         self.leave_out_project()
         for kind in ("add", "modify", "delete", "rename-in", "rename-out", "type"):
