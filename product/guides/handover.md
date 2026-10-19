@@ -32,7 +32,16 @@ cover the known needs.
 Codex challengers and reviewers start without plugins, apps, skill instructions or discovered MCP
 servers. Their role contract and the project's `AGENTS.md` still load. If discovery fails or times
 out, the session starts with MCP servers unchanged and reports this in stderr and the header.
-The header records the executable, requested sandbox, network setting and environment restriction.
+Servers also stay enabled when their names cannot be written as bare keys (ASCII letters, digits,
+`_` and `-`); stderr and the header list those names. Other Codex roles keep the user's configured
+environment. Claude sessions use a fixed tool list and no MCP servers.
+
+`--timeout` applies to the agent session. Server discovery adds at most 30 seconds before it.
+The header records the executable and, for Codex, `Requested sandbox:`, `Network:` and
+`Requested environment:`. The requested environment is `restricted` (with any MCP fallback reason)
+or `user configuration`. If snapshot or worktree creation fails before discovery, it is
+`restricted; discovery did not run`. Discovery stderr is saved in the session's sibling `.log` file
+alongside the agent's stderr.
 
 For a committed candidate, you can instead create a detached worktree at the exact commit:
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family

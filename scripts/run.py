@@ -101,12 +101,12 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt(signum)
 
 
-def discover_servers(executable, cwd, env, timeout):
+def discover_servers(executable, cwd, env, timeout, log):
     process = None
     try:
         process = subprocess.Popen([executable, "mcp", "list", "--json"], cwd=cwd, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
+                                   stderr=log, start_new_session=True)
         stdout, _ = process.communicate(timeout=timeout)
         if process.returncode:
             return [], f"discovery exited {process.returncode}"
@@ -229,8 +229,8 @@ def main():
         return 127
     executable = os.path.abspath(found)
     restricted = args.family == "codex" and args.role in ("challenger", "reviewer")
-    environment = ("restricted with MCP servers not disabled: discovery did not complete"
-                   if restricted else "full")
+    environment = ("restricted; discovery did not run"
+                   if restricted else "user configuration")
     start, snapshot, code = utc(), "", 1
     skipped = []
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -324,8 +324,11 @@ def main():
                 if restricted:
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
-                    servers, reason = discover_servers(executable, cwd, agent_env,
-                                                       min(30, args.timeout or 30))
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with out.with_suffix(".log").open("wb") as log:
+                        environment = "restricted with MCP servers not disabled: discovery did not complete"
+                        servers, reason = discover_servers(executable, cwd, agent_env,
+                                                           min(30, args.timeout or 30), log)
                     environment = "restricted"
                     if reason:
                         environment += f" with MCP servers not disabled: {reason}"
@@ -359,7 +362,7 @@ def main():
                 print("systemd-run unavailable; running without a scope", file=sys.stderr)
             with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
-                with out.with_suffix(".log").open("wb") as log:
+                with out.with_suffix(".log").open("ab" if restricted else "wb") as log:
                     process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
                                                stderr=log, env=agent_env, start_new_session=True)
                 try:
@@ -389,9 +392,9 @@ def main():
                 end = utc()
                 header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {model}\n"
                           f"Executable: {executable}\n"
-                          + (f"Sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
+                          + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
                              f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
-                             f"Environment: {environment}\n" if args.family == "codex" else "")
+                             f"Requested environment: {environment}\n" if args.family == "codex" else "")
                           + f"Author family: {args.author_family or ''}\n"
                           f"Same-family reason: {args.same_family_reason or ''}\n"
                           f"Scope: {unit or 'none'}\n"

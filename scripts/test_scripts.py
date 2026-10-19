@@ -23,6 +23,8 @@ if args == ["mcp", "list", "--json"]:
     pathlib.Path(os.environ["RECORD"] + ".discovery").write_text(json.dumps({
         "executable": sys.argv[0], "cwd": str(cwd), "tmpdir": os.environ.get("TMPDIR"),
         "pid": os.getpid()}))
+    if os.environ.get("MCP_STDERR"):
+        print(os.environ["MCP_STDERR"], file=sys.stderr, flush=True)
     if os.environ.get("MCP_SLEEP"):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         pathlib.Path(os.environ["RECORD"] + ".discovery-child").write_text(str(child.pid))
@@ -232,7 +234,7 @@ class ScriptsTest(unittest.TestCase):
                 discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
                 self.assertEqual(discovery["cwd"], record["cwd"])
                 self.assertEqual(discovery["tmpdir"], record["tmpdir"])
-                self.assertIn("Environment: restricted\n", self.out.read_text())
+                self.assertIn("Requested environment: restricted\n", self.out.read_text())
 
     def snapshot(self):
         return next(line.split(": ", 1)[1] for line in self.out.read_text().splitlines()
@@ -288,8 +290,8 @@ class ScriptsTest(unittest.TestCase):
                 self.assertIn("sandbox_workspace_write.network_access=true", args)
                 self.assertIn(str(cache), args)
                 self.assertIn("Network: on\n", self.out.read_text())
-                self.assertIn("Sandbox: workspace-write\n", self.out.read_text())
-                self.assertIn("Environment: full\n", self.out.read_text())
+                self.assertIn("Requested sandbox: workspace-write\n", self.out.read_text())
+                self.assertIn("Requested environment: user configuration\n", self.out.read_text())
                 self.assertFalse(Path(str(self.record) + ".discovery").exists())
 
     def test_CE_S4_network_refused_before_start_for_other_roles_and_family(self):
@@ -342,7 +344,8 @@ class ScriptsTest(unittest.TestCase):
                                          ('[{"name":"a","enabled":1}]', "0", "invalid server list"),
                                          ('[{"name":3,"enabled":true}]', "0", "invalid server list")):
             with self.subTest(output=output, exit_code=exit_code):
-                self.env.update(MCP_JSON=output, MCP_EXIT=exit_code)
+                self.env.update(MCP_JSON=output, MCP_EXIT=exit_code,
+                                MCP_STDERR="discovery diagnostic", SESSION_STDERR="agent diagnostic")
                 result = self.launch("reviewer", "codex", "--author-family", "claude")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = json.loads(self.record.read_text())["argv"]
@@ -352,9 +355,11 @@ class ScriptsTest(unittest.TestCase):
                 self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
                 self.assertIn("MCP servers were not disabled", result.stderr)
                 self.assertIn(reason, result.stderr)
-                self.assertIn("Environment: restricted with MCP servers not disabled: discovery ",
+                self.assertIn("Requested environment: restricted with MCP servers not disabled: discovery ",
                               self.out.read_text())
                 self.assertIn(reason, self.out.read_text())
+                self.assertEqual(self.out.with_suffix(".log").read_text(),
+                                 "discovery diagnostic\nagent diagnostic\n")
 
     def test_CE_S6_empty_and_disabled_server_lists_are_successful(self):
         for output in ('[]', '[{"name":"off","enabled":false}]'):
@@ -363,7 +368,7 @@ class ScriptsTest(unittest.TestCase):
                 result = self.launch("challenger", "codex", "--author-family", "claude")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("MCP servers were not disabled", result.stderr)
-                self.assertIn("Environment: restricted\n", self.out.read_text())
+                self.assertIn("Requested environment: restricted\n", self.out.read_text())
                 args = json.loads(self.record.read_text())["argv"]
                 self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
 
@@ -382,12 +387,13 @@ class ScriptsTest(unittest.TestCase):
                 self.assertIn("plugins", args)
                 self.assertIn("apps", args)
                 note = f"MCP servers not all disabled: unsupported server names: {ascii(name)}"
-                self.assertIn(f"Environment: restricted with {note}\n", self.out.read_text())
+                self.assertIn(f"Requested environment: restricted with {note}\n", self.out.read_text())
                 self.assertIn(f"MCP servers were not all disabled: unsupported server names: {ascii(name)}",
                               result.stderr)
 
     def test_CE_S6_S9_discovery_timeout_kills_group_then_runs_agent(self):
-        self.env["MCP_SLEEP"] = "1"
+        self.env.update(MCP_SLEEP="1", MCP_STDERR="discovery timeout diagnostic",
+                        SESSION_STDERR="agent diagnostic")
         self.inject_launcher('''
 import subprocess
 original = subprocess.Popen.communicate
@@ -401,6 +407,8 @@ subprocess.Popen.communicate = communicate
         result = self.launch("reviewer", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("discovery timed out after 30 seconds", result.stderr)
+        self.assertEqual(self.out.with_suffix(".log").read_text(),
+                         "discovery timeout diagnostic\nagent diagnostic\n")
         self.assertIn("MCP servers not disabled", self.out.read_text())
         self.assert_discovery_cleaned()
 
@@ -435,6 +443,26 @@ subprocess.Popen.communicate = communicate
         self.assertFalse(Path(discovery["tmpdir"]).parent.exists())
         self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
 
+    def test_CE_S9_failure_before_discovery_reports_it_did_not_run(self):
+        for operation in (["write-tree"], ["worktree", "add"]):
+            with self.subTest(operation=operation):
+                self.inject_launcher(f"""
+import subprocess
+original = subprocess.check_output
+def check_output(args, *positional, **kwargs):
+    if args[0] == "git" and args[4:4 + {len(operation)}] == {operation!r}:
+        raise subprocess.CalledProcessError(31, args)
+    return original(args, *positional, **kwargs)
+subprocess.check_output = check_output
+""")
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Requested environment: restricted; discovery did not run\n",
+                              self.out.read_text())
+                self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                self.assertFalse(self.record.exists())
+                self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+
     def test_CE_S9_interrupt_during_discovery_saves_header_and_cleans(self):
         self.env["MCP_SLEEP"] = "1"
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -466,9 +494,9 @@ subprocess.Popen.communicate = communicate
                 self.assertEqual(result.returncode, code, result.stderr)
                 header = self.out.read_text()
                 self.assertIn(f"Executable: {self.env['AGENT_CODEX_CMD']}\n", header)
-                self.assertIn("Sandbox: read-only\n", header)
+                self.assertIn("Requested sandbox: read-only\n", header)
                 self.assertIn("Network: not requested (user config applies)\n", header)
-                self.assertIn("Environment: restricted\n", header)
+                self.assertIn("Requested environment: restricted\n", header)
                 self.assertIn(f"Exit code: {code}\n", header)
                 self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
 
