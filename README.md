@@ -72,11 +72,24 @@ and `codex`. Builders work in the project. Investigators work there read-only an
 records. Review roles require `--author-family`; a same-family check requires a recorded reason
 through `--same-family-reason`.
 
+Codex challengers and reviewers start with plugins, apps, skill instructions and discovered MCP
+servers disabled. If server discovery fails or times out, the session still starts; stderr and the
+answer's header explain that MCP servers were not disabled. Role contracts and the project's
+`AGENTS.md` still load. Other roles keep the user's configured environment.
+
+For Codex builders and verifiers, add `--network` when checks need local servers, child processes
+from Node or network access. Without it, the user's network configuration applies. Add
+`--writable DIR` for a directory outside the usual writable roots, for example
+`--writable ~/.gradle` for a build cache. These permissions are independent: `--network` does not
+open extra directories. There is no full-access option because these cover the known needs.
+
 Review roles run on a snapshot of committed, staged and uncommitted files, including untracked
 files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
 the answer's header. Check that list before trusting a review. The answer and its header are saved
 at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and worktrees are removed after the run.
+The header records the executable's absolute path and, for Codex, the requested sandbox, network
+setting and whether the environment was restricted.
 
 Shielding prevents accidental leaks of the private root into briefs and through Claude's own file
 tools. It is not a security boundary: Codex sessions can read the private folder, and a writable

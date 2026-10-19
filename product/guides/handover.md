@@ -23,6 +23,17 @@ review through yourself or summarise it before reading it in full.
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md`
 
+For Codex builders and verifiers, add `--network` when the assignment needs local servers, child
+processes from Node or network access; otherwise the user's network configuration applies. Use
+`--writable DIR` to open an extra directory, for example `--writable ~/.gradle` for a build cache.
+Network access does not open extra directories. There is no full-access option because these
+cover the known needs.
+
+Codex challengers and reviewers start without plugins, apps, skill instructions or discovered MCP
+servers. Their role contract and the project's `AGENTS.md` still load. If discovery fails or times
+out, the session starts with MCP servers unchanged and reports this in stderr and the header.
+The header records the executable, requested sandbox, network setting and environment restriction.
+
 For a committed candidate, you can instead create a detached worktree at the exact commit:
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family
 there, give it the role contract and the brief (and `guides/verification.md` for a verifier), and
