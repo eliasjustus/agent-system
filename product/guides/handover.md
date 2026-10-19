@@ -38,7 +38,9 @@ private records when the brief needs them.
 
 Run builders and reviews in the background and stay available to the user. Before repeating
 something that timed out, check whether it already took effect. Stop only the processes you
-started, by their recorded identity, never by name matching.
+started, by their recorded identity, never by name matching. Wait for them the same way: on the
+started process itself or its exact process ID, never with a `pgrep -f` loop: a pattern that also
+appears in the loop's own command line matches the loop itself, and the loop never ends.
 
 ## After each delegation
 
