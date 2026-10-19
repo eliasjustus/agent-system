@@ -101,6 +101,32 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt(signum)
 
 
+def discover_servers(executable, cwd, env, timeout, log):
+    process = None
+    try:
+        process = subprocess.Popen([executable, "mcp", "list", "--json"], cwd=cwd, env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=log, start_new_session=True)
+        stdout, _ = process.communicate(timeout=timeout)
+        if process.returncode:
+            return [], f"discovery exited {process.returncode}"
+        try:
+            servers = json.loads(stdout)
+        except (ValueError, UnicodeError):
+            return [], "discovery returned invalid JSON"
+        if not isinstance(servers, list) or any(
+                not isinstance(server, dict) or not isinstance(server.get("name"), str)
+                or not isinstance(server.get("enabled"), bool) for server in servers):
+            return [], "discovery returned an invalid server list"
+        return [server["name"] for server in servers if server["enabled"]], ""
+    except subprocess.TimeoutExpired:
+        return [], f"discovery timed out after {timeout:g} seconds"
+    except (OSError, UnicodeError) as error:
+        return [], f"discovery failed: {error}"
+    finally:
+        stop_session("", process)
+
+
 def check_entries(repo, method, private):
     entry = repo / "AGENTS.md"
     path = entry
@@ -151,10 +177,15 @@ def main():
     parser.add_argument("--private", default=DEFAULT_PRIVATE)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--writable", action="append", default=[], type=Path, metavar="DIR")
+    parser.add_argument("--network", action="store_true")
     local = Path(__file__).resolve().parent
     parser.add_argument("--method", default=local if (local / "roles").is_dir()
                         else Path("~/.local/share/agent-method"), type=Path)
     args = parser.parse_args()
+    if args.network and args.role not in ("builder", "verifier"):
+        parser.error("--network is allowed for only builder and verifier roles")
+    if args.network and args.family != "codex":
+        parser.error("--network is supported only for the codex family")
     if args.writable and args.role not in ("builder", "verifier"):
         parser.error("--writable is allowed for only builder and verifier roles")
     if args.writable and args.family != "codex":
@@ -192,9 +223,14 @@ def main():
     model = (os.environ.get(f"AGENT_{args.family.upper()}_MODEL")
              or ("claude-opus-5-5" if args.family == "claude" else "gpt-6.1-sol"))
     executable = os.environ.get(f"AGENT_{args.family.upper()}_CMD") or args.family
-    if shutil.which(executable) is None:
+    found = shutil.which(executable)
+    if found is None:
         print(f"Cannot find agent executable: {executable}", file=sys.stderr)
         return 127
+    executable = os.path.abspath(found)
+    restricted = args.family == "codex" and args.role in ("challenger", "reviewer")
+    environment = ("restricted; discovery did not run"
+                   if restricted else "user configuration")
     start, snapshot, code = utc(), "", 1
     skipped = []
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -283,6 +319,30 @@ def main():
                 for path in [*roots, *([source] if args.role == "verifier" else []),
                              *([temporary] if writable else [])]:
                     command += ["--add-dir", str(path)]
+                if args.network:
+                    command += ["-c", "sandbox_workspace_write.network_access=true"]
+                if restricted:
+                    command += ["--disable", "plugins", "--disable", "apps",
+                                "-c", "skills.include_instructions=false"]
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with out.with_suffix(".log").open("wb") as log:
+                        environment = "restricted with MCP servers not disabled: discovery did not complete"
+                        servers, reason = discover_servers(executable, cwd, agent_env,
+                                                           min(30, args.timeout or 30), log)
+                    environment = "restricted"
+                    if reason:
+                        environment += f" with MCP servers not disabled: {reason}"
+                        print(f"Warning: MCP servers were not disabled: {reason}", file=sys.stderr)
+                    unsupported = []
+                    for name in servers:
+                        if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                            command += ["-c", f"mcp_servers.{name}.enabled=false"]
+                        else:
+                            unsupported.append(ascii(name))
+                    if unsupported:
+                        reason = f"unsupported server names: {', '.join(unsupported)}"
+                        environment += f" with MCP servers not all disabled: {reason}"
+                        print(f"Warning: MCP servers were not all disabled: {reason}", file=sys.stderr)
                 command += ["-"]
             else:
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
@@ -302,7 +362,7 @@ def main():
                 print("systemd-run unavailable; running without a scope", file=sys.stderr)
             with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
-                with out.with_suffix(".log").open("wb") as log:
+                with out.with_suffix(".log").open("ab" if restricted else "wb") as log:
                     process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
                                                stderr=log, env=agent_env, start_new_session=True)
                 try:
@@ -331,7 +391,11 @@ def main():
                         sys.stderr.writelines(deque(log, maxlen=20))
                 end = utc()
                 header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {model}\n"
-                          f"Author family: {args.author_family or ''}\n"
+                          f"Executable: {executable}\n"
+                          + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
+                             f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
+                             f"Requested environment: {environment}\n" if args.family == "codex" else "")
+                          + f"Author family: {args.author_family or ''}\n"
                           f"Same-family reason: {args.same_family_reason or ''}\n"
                           f"Scope: {unit or 'none'}\n"
                           + (f"Snapshot commit: {snapshot}\n" if review else "")

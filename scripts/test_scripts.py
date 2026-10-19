@@ -19,7 +19,20 @@ FAKE = '''#!/usr/bin/env python3
 import json, os, pathlib, re, subprocess, sys, time
 args = sys.argv[1:]
 cwd = pathlib.Path.cwd()
+if args == ["mcp", "list", "--json"]:
+    pathlib.Path(os.environ["RECORD"] + ".discovery").write_text(json.dumps({
+        "executable": sys.argv[0], "cwd": str(cwd), "tmpdir": os.environ.get("TMPDIR"),
+        "pid": os.getpid()}))
+    if os.environ.get("MCP_STDERR"):
+        print(os.environ["MCP_STDERR"], file=sys.stderr, flush=True)
+    if os.environ.get("MCP_SLEEP"):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        pathlib.Path(os.environ["RECORD"] + ".discovery-child").write_text(str(child.pid))
+        time.sleep(30)
+    print(os.environ.get("MCP_JSON", "[]"))
+    sys.exit(int(os.environ.get("MCP_EXIT", "0")))
 record = {"argv": args, "cwd": str(cwd), "stdin": sys.stdin.read(),
+          "executable": sys.argv[0],
           "git_index_file": os.environ.get("GIT_INDEX_FILE"),
           "tmpdir": os.environ.get("TMPDIR"),
           "changed": (cwd / "tracked").read_text(),
@@ -195,6 +208,297 @@ class ScriptsTest(unittest.TestCase):
         return self.run_script("setup.py", "--project", self.repo, "--id", "demo",
                                "--private", self.private, "--method", self.method,
                                *extra)
+
+    def test_CE_S1_restricted_roles_disable_extensions_and_enabled_servers(self):
+        names = ['plain', 'node_repl', 'dash-name', 'A0', '123']
+        self.env["MCP_JSON"] = json.dumps(
+            [{"name": name, "enabled": True} for name in names]
+            + [{"name": "already-off", "enabled": False}])
+        (self.repo / "AGENTS.md").write_text("Project instructions\n")
+        for role in ("challenger", "reviewer"):
+            with self.subTest(role=role):
+                result = self.launch(role, "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(self.record.read_text())
+                args = record["argv"]
+                self.assertEqual([args[i + 1] for i, a in enumerate(args) if a == "--disable"],
+                                 ["plugins", "apps"])
+                config = [args[i + 1] for i, a in enumerate(args) if a == "-c"]
+                self.assertIn("skills.include_instructions=false", config)
+                overrides = [c for c in config if c.startswith("mcp_servers.")]
+                self.assertEqual(overrides, [f"mcp_servers.{name}.enabled=false" for name in names])
+                self.assertTrue(record["stdin"].startswith(
+                    (self.method / "roles" / f"{role}.md").read_text() + "\n---\n"))
+                self.assertEqual(self.git("show", self.snapshot() + ":AGENTS.md"),
+                                 "Project instructions")
+                discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
+                self.assertEqual(discovery["cwd"], record["cwd"])
+                self.assertEqual(discovery["tmpdir"], record["tmpdir"])
+                self.assertIn("Requested environment: restricted\n", self.out.read_text())
+
+    def snapshot(self):
+        return next(line.split(": ", 1)[1] for line in self.out.read_text().splitlines()
+                    if line.startswith("Snapshot commit:"))
+
+    def test_CE_S2_discovery_is_role_scoped_and_native_commands_are_preserved(self):
+        for family in ("codex", "claude"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                if family == "codex" and role in ("challenger", "reviewer"):
+                    continue
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    writable = role in ("builder", "verifier")
+                    evidence = str(Path(record["tmpdir"]).parent / "evidence")
+                    if family == "codex":
+                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
+                                    "-s", "workspace-write" if writable else "read-only",
+                                    "-C", record["cwd"], "-o",
+                                    str(Path(record["tmpdir"]).parent / "answer")]
+                    else:
+                        settings = {"permissions": {"deny": [] if role == "investigator" else
+                                    [f"{tool}(/{self.private}/**)" for tool in ("Read", "Edit")]}}
+                        tools = "Read,Grep,Glob,Bash,Write,Edit" if writable else "Read,Grep,Glob"
+                        expected = ["-p", "--model", "claude-opus-5-5", "--output-format", "text",
+                                    "--settings", json.dumps(settings), "--allowedTools", tools,
+                                    "--tools", tools, "--strict-mcp-config"]
+                    if role == "verifier":
+                        expected += ["--add-dir", evidence]
+                    if writable:
+                        expected += ["--add-dir", record["tmpdir"]]
+                    if family == "codex":
+                        expected += ["-"]
+                    self.assertEqual(record["argv"], expected)
+                    self.assertFalse(Path(str(self.record) + ".discovery").exists())
+        for role in ("challenger", "reviewer"):
+            result = self.launch(role, "codex", "--author-family", "claude")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            discovery = Path(str(self.record) + ".discovery")
+            self.assertTrue(discovery.exists(), f"no discovery for {role}")
+            discovery.unlink()
+
+    def test_CE_S2_network_is_explicit_and_preserves_writable_roots(self):
+        for role in ("builder", "verifier"):
+            with self.subTest(role=role):
+                cache = self.home / ".gradle"
+                result = self.launch(role, "codex", "--author-family", "claude",
+                                     "--network", "--writable", cache)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertIn("sandbox_workspace_write.network_access=true", args)
+                self.assertIn(str(cache), args)
+                self.assertIn("Network: on\n", self.out.read_text())
+                self.assertIn("Requested sandbox: workspace-write\n", self.out.read_text())
+                self.assertIn("Requested environment: user configuration\n", self.out.read_text())
+                self.assertFalse(Path(str(self.record) + ".discovery").exists())
+
+    def test_CE_S4_network_refused_before_start_for_other_roles_and_family(self):
+        for family in ("codex", "claude"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                if family == "codex" and role in ("builder", "verifier"):
+                    continue
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--network", "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--network is", result.stderr)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                    self.assertFalse((self.home / ".cache/agent-method/sessions").exists())
+
+    def test_CE_S5_S7_executable_identity_for_path_wrapper_relative_and_symlink(self):
+        original = self.base / "fake"
+        link = self.bin / "codex-link"
+        link.symlink_to(original)
+        wrapper = self.base / "absolute-wrapper"
+        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                           + " \"$WRAPPED_CLI\" \"$@\"\n")
+        wrapper.chmod(0o755)
+        self.env["WRAPPED_CLI"] = str(original)
+        for family in ("codex", "claude"):
+            for invoked, absolute in (("codex-link", link), (str(wrapper), wrapper),
+                                      ("../fake", original), (str(link), link)):
+                with self.subTest(family=family, invoked=invoked):
+                    self.env[f"AGENT_{family.upper()}_CMD"] = invoked
+                    result = self.launch("reviewer", family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"Executable: {absolute}\n", self.out.read_text())
+                    scope = next(p for p in self.scope_state.iterdir() if p.suffix != ".stop")
+                    command = json.loads(scope.read_text())
+                    self.assertEqual(command[command.index("--") + 1], str(absolute))
+                    for path in self.scope_state.iterdir():
+                        path.unlink()
+                    if family == "codex":
+                        discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
+                        if absolute != wrapper:
+                            self.assertEqual(discovery["executable"], str(absolute))
+
+    def test_CE_S6_discovery_failure_keeps_restrictions_and_explains_fallback(self):
+        for output, exit_code, reason in (("[]", "9", "exited 9"),
+                                         ("not JSON", "0", "invalid JSON"),
+                                         ('{}', "0", "invalid server list"),
+                                         ('[{}]', "0", "invalid server list"),
+                                         ('[{"name":"a","enabled":1}]', "0", "invalid server list"),
+                                         ('[{"name":3,"enabled":true}]', "0", "invalid server list")):
+            with self.subTest(output=output, exit_code=exit_code):
+                self.env.update(MCP_JSON=output, MCP_EXIT=exit_code,
+                                MCP_STDERR="discovery diagnostic", SESSION_STDERR="agent diagnostic")
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertIn("skills.include_instructions=false", args)
+                self.assertIn("plugins", args)
+                self.assertIn("apps", args)
+                self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
+                self.assertIn("MCP servers were not disabled", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertIn("Requested environment: restricted with MCP servers not disabled: discovery ",
+                              self.out.read_text())
+                self.assertIn(reason, self.out.read_text())
+                self.assertEqual(self.out.with_suffix(".log").read_text(),
+                                 "discovery diagnostic\nagent diagnostic\n")
+
+    def test_CE_S6_empty_and_disabled_server_lists_are_successful(self):
+        for output in ('[]', '[{"name":"off","enabled":false}]'):
+            with self.subTest(output=output):
+                self.env["MCP_JSON"] = output
+                result = self.launch("challenger", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("MCP servers were not disabled", result.stderr)
+                self.assertIn("Requested environment: restricted\n", self.out.read_text())
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
+
+    def test_CE_S6_unsupported_server_names_are_skipped_and_reported(self):
+        for name in ('dot.name', 'space name', 'quote"slash\\line\n\x00\x7f', 'café 😀', '', '\ud800'):
+            with self.subTest(name=name):
+                self.env["MCP_JSON"] = json.dumps([
+                    {"name": "node_repl", "enabled": True},
+                    {"name": name, "enabled": True}])
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertEqual([a for a in args if a.startswith("mcp_servers.")],
+                                 ["mcp_servers.node_repl.enabled=false"])
+                self.assertIn("skills.include_instructions=false", args)
+                self.assertIn("plugins", args)
+                self.assertIn("apps", args)
+                note = f"MCP servers not all disabled: unsupported server names: {ascii(name)}"
+                self.assertIn(f"Requested environment: restricted with {note}\n", self.out.read_text())
+                self.assertIn(f"MCP servers were not all disabled: unsupported server names: {ascii(name)}",
+                              result.stderr)
+
+    def test_CE_S6_S9_discovery_timeout_kills_group_then_runs_agent(self):
+        self.env.update(MCP_SLEEP="1", MCP_STDERR="discovery timeout diagnostic",
+                        SESSION_STDERR="agent diagnostic")
+        self.inject_launcher('''
+import subprocess
+original = subprocess.Popen.communicate
+def communicate(self, *args, **kwargs):
+    if self.args[1:] == ["mcp", "list", "--json"]:
+        assert kwargs["timeout"] == 30
+        kwargs["timeout"] = 0.3
+    return original(self, *args, **kwargs)
+subprocess.Popen.communicate = communicate
+''')
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("discovery timed out after 30 seconds", result.stderr)
+        self.assertEqual(self.out.with_suffix(".log").read_text(),
+                         "discovery timeout diagnostic\nagent diagnostic\n")
+        self.assertIn("MCP servers not disabled", self.out.read_text())
+        self.assert_discovery_cleaned()
+
+    def test_CE_S6_discovery_is_bounded_by_short_session_timeout(self):
+        self.env["MCP_SLEEP"] = "1"
+        self.inject_launcher('''
+import subprocess
+original = subprocess.Popen.communicate
+def communicate(self, *args, **kwargs):
+    if self.args[1:] == ["mcp", "list", "--json"]:
+        assert kwargs["timeout"] == 0.3, kwargs["timeout"]
+    return original(self, *args, **kwargs)
+subprocess.Popen.communicate = communicate
+''')
+        result = self.launch("reviewer", "codex", "--author-family", "claude", "--timeout", "0.3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("discovery timed out after 0.3 seconds", result.stderr)
+        self.assertIn("MCP servers not disabled", self.out.read_text())
+        args = json.loads(self.record.read_text())["argv"]
+        self.assertIn("skills.include_instructions=false", args)
+        self.assertIn("plugins", args)
+        self.assertIn("apps", args)
+        self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
+        self.assert_discovery_cleaned()
+
+    def assert_discovery_cleaned(self):
+        discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
+        for pid in (discovery["pid"], int(Path(str(self.record) + ".discovery-child").read_text())):
+            stat = Path(f"/proc/{pid}/stat")
+            self.assertTrue(not stat.exists() or stat.read_text().split()[2] == "Z",
+                            f"discovery process {pid} survived")
+        self.assertFalse(Path(discovery["tmpdir"]).parent.exists())
+        self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_CE_S9_failure_before_discovery_reports_it_did_not_run(self):
+        for operation in (["write-tree"], ["worktree", "add"]):
+            with self.subTest(operation=operation):
+                self.inject_launcher(f"""
+import subprocess
+original = subprocess.check_output
+def check_output(args, *positional, **kwargs):
+    if args[0] == "git" and args[4:4 + {len(operation)}] == {operation!r}:
+        raise subprocess.CalledProcessError(31, args)
+    return original(args, *positional, **kwargs)
+subprocess.check_output = check_output
+""")
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Requested environment: restricted; discovery did not run\n",
+                              self.out.read_text())
+                self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                self.assertFalse(self.record.exists())
+                self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_CE_S9_interrupt_during_discovery_saves_header_and_cleans(self):
+        self.env["MCP_SLEEP"] = "1"
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                self.record = self.base / f"signal-{sig}.json"
+                process = self.start_launcher(role="reviewer")
+                self.wait_record(Path(str(self.record) + ".discovery"))
+                deadline = time.monotonic() + 5
+                while not Path(str(self.record) + ".discovery-child").exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                process.send_signal(sig)
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 128 + sig, stderr)
+                self.assertIn(f"Exit code: {128 + sig}\n", self.out.read_text())
+                self.assertIn("Executable:", self.out.read_text())
+                self.assertIn("discovery did not complete", self.out.read_text())
+                self.assertFalse(self.record.exists())
+                self.assert_discovery_cleaned()
+
+    def test_CE_S9_environment_header_survives_every_agent_outcome(self):
+        for outcome, code in (("success", 0), ("failure", 7), ("empty", 1), ("timeout", 124)):
+            with self.subTest(outcome=outcome):
+                self.env.update(SESSION_EXIT="7" if outcome == "failure" else "0",
+                                NO_ANSWER="1" if outcome == "empty" else "",
+                                SLEEP="1" if outcome == "timeout" else "")
+                result = self.launch("reviewer", "codex", "--author-family", "claude",
+                                     *(("--timeout", "0.3") if outcome == "timeout" else ()))
+                self.assertEqual(result.returncode, code, result.stderr)
+                header = self.out.read_text()
+                self.assertIn(f"Executable: {self.env['AGENT_CODEX_CMD']}\n", header)
+                self.assertIn("Requested sandbox: read-only\n", header)
+                self.assertIn("Network: not requested (user config applies)\n", header)
+                self.assertIn("Requested environment: restricted\n", header)
+                self.assertIn(f"Exit code: {code}\n", header)
+                self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
 
     def test_S4_old_python_refused_before_writes_or_launch(self):
         for script in ("setup.py", "run.py"):
