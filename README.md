@@ -97,6 +97,22 @@ and `Requested environment:`. The requested environment is `restricted` (with an
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
 
+To reduce checkout writes for challengers and reviewers, keep an optional
+`<private>/projects/<id>/review-leave-out.txt` beside the project's private records. The launcher
+gets the ID from the project's entry header and uses its default private root or `--private`.
+Setup never creates or changes this list. Put one literal repository-relative file or directory
+path per line; trailing slashes and spaces are allowed. Lines starting with `#` are comments.
+Absolute paths, the repository root and paths containing a `..` component warn and are ignored;
+paths matching nothing are ignored. A missing or empty list gives a full checkout; an unreadable
+or invalid UTF-8 list warns and gives a full checkout.
+
+Listed paths remain in Git but are absent from the checkout. The prompt and answer header name
+them; agents should say if their checks need those paths. If the snapshot changes a listed path,
+the launcher uses a full checkout and explains why. Use `--full-checkout` when a check needs all
+files, including when reviewing a commit already on HEAD that touched listed paths. A checkout
+with left-out paths skips the Git post-checkout hook. Builder, investigator and verifier sessions
+always keep their usual checkout behavior.
+
 Shielding prevents accidental leaks of the private root into briefs and through Claude's own file
 tools. It is not a security boundary: Codex sessions can read the private folder, and a writable
 Claude session has shell access. Give checking sessions only the brief, role contract and evidence

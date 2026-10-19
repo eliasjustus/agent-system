@@ -24,6 +24,8 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
   (`git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`).
   Put known-good and other temporary checkouts there too, using shared clones that write nothing
   into the source repository. Never stash, revert or edit the candidate's files.
+  Make each extra checkout once and reuse it between cases, resetting it between cases; never
+  create a checkout per case.
 - Each check of new or repaired behavior must **fail on the before state for the reason under
   test**, then pass on the candidate. Keep the first failing output.
 - Where a known-good version exists, the check also passes on it.
