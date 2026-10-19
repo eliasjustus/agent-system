@@ -23,8 +23,9 @@ DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 
 
 def git(repo, *args, env=None, input=None, text=True):
-    return subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *args],
-                                   env=env, input=input, text=text).strip()
+    result = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *args],
+                                     env=env, input=input, text=text)
+    return result.strip() if text else result.rstrip(b"\n")
 
 
 def utc():
@@ -165,6 +166,45 @@ def check_entries(repo, method, private):
         print(f"Warning: {path} differs from the installed method; see {command}", file=sys.stderr)
 
 
+def review_leave_out(repo, private, head, snapshot):
+    path = repo / "AGENTS.md"
+    try:
+        if not path.is_file():
+            return []
+        first = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
+        if not match or match[1] in (".", ".."):
+            return []
+        path = private / "projects" / match[1] / "review-leave-out.txt"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+    except (OSError, UnicodeError) as error:
+        print(f"Warning: cannot read {path}: {error}; using a full checkout", file=sys.stderr)
+        return []
+    entries = []
+    for line in lines:
+        if not line.strip() or line.startswith("#"):
+            continue
+        entry = os.path.normpath(line)
+        if (line.startswith("/") or ".." in line.split("/") or entry == "." or "\0" in line
+                or entry.split("/", 1)[0] in ("AGENTS.md", "CLAUDE.md", ".claude", ".codex")):
+            print(f"Warning: ignoring invalid leave-out path {line!r}", file=sys.stderr)
+        elif entry not in entries:
+            entries.append(entry)
+    if not entries:
+        return []
+    # HEAD keeps deleted paths eligible for the full-checkout fallback.
+    files = set()
+    for revision in (snapshot, *([head] if head else [])):
+        files.update(os.fsdecode(raw) for raw in git(
+            repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-r", "--name-only", "-z", revision,
+            "--", *entries, text=False).split(b"\0") if raw)
+    return [entry for entry in entries
+            if any(name == entry or name.startswith(entry + "/") for name in files)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True, choices=("builder", "investigator", "verifier", "challenger", "reviewer"))
@@ -175,6 +215,8 @@ def main():
     parser.add_argument("--author-family", choices=("claude", "codex"))
     parser.add_argument("--same-family-reason")
     parser.add_argument("--private", default=DEFAULT_PRIVATE)
+    parser.add_argument("--full-checkout", action="store_true",
+                        help="include all paths even when a review leave-out list is configured")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--writable", action="append", default=[], type=Path, metavar="DIR")
     parser.add_argument("--network", action="store_true")
@@ -233,6 +275,7 @@ def main():
                    if restricted else "user configuration")
     start, snapshot, code = utc(), "", 1
     skipped = []
+    checkout_note = ""
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     if not cache.is_absolute():
         cache = Path.home() / ".cache"
@@ -298,7 +341,43 @@ def main():
                     env.setdefault(f"GIT_{kind}_EMAIL", "snapshot@localhost")
                 snapshot = git(repo, "commit-tree", tree, *(["-p", head] if head else []),
                                env=env, input="Review snapshot\n")
-                git(repo, "worktree", "add", "--detach", str(work), snapshot)
+                leave_out = (review_leave_out(repo, private, head, snapshot)
+                             if args.role in ("challenger", "reviewer") and not args.full_checkout else [])
+                if args.full_checkout and args.role in ("challenger", "reviewer"):
+                    checkout_note = "Checkout: full (--full-checkout)"
+                elif leave_out:
+                    base = head or git(repo, "hash-object", "-t", "tree", "--stdin", input="")
+                    changed = [os.fsdecode(raw) for raw in git(
+                        repo, "diff", "--no-renames", "--name-only", "-z", base, snapshot,
+                        text=False).split(b"\0") if raw]
+                    touched = [name for name in changed if any(
+                        name == path or name.startswith(path + "/") for path in leave_out)]
+                    if touched:
+                        checkout_note = (f"Checkout: full because snapshot changes touch leave-out paths "
+                                         f"{leave_out!r}: {touched!r}")
+                        leave_out = []
+                    else:
+                        checkout_note = f"Checkout: left-out paths {leave_out!r}"
+                if leave_out:
+                    git(repo, "worktree", "add", "--no-checkout", "--detach", str(work), snapshot)
+                    git(work, "read-tree", snapshot)
+                    omitted = git(work, "--literal-pathspecs", "ls-files", "-z", "--",
+                                  *leave_out, text=False)
+                    git(work, "update-index", "-z", "--skip-worktree", "--stdin",
+                        input=omitted, text=False)
+                    git(work, "checkout-index", "-a")
+                    if any(os.path.lexists(work / path) for path in leave_out):
+                        checkout_note = ("Checkout: full because left-out paths were checked out anyway "
+                                         "(Git older than 2.37?)")
+                        leave_out = []
+                else:
+                    git(repo, "worktree", "add", "--detach", str(work), snapshot)
+                if checkout_note:
+                    prompt += "\n" + checkout_note + "\n"
+                if leave_out:
+                    hint = f" (`git show {snapshot}:<path>`)" if args.family == "codex" else ""
+                    prompt += (f"These paths are absent from the file system but present in Git{hint}. "
+                               "If your check needs them, say so in your answer.\n")
                 cwd = work
             if args.role == "verifier":
                 source.mkdir()
@@ -399,6 +478,7 @@ def main():
                           f"Same-family reason: {args.same_family_reason or ''}\n"
                           f"Scope: {unit or 'none'}\n"
                           + (f"Snapshot commit: {snapshot}\n" if review else "")
+                          + (checkout_note + "\n" if checkout_note else "")
                           + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
                           + f"Start UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 out.parent.mkdir(parents=True, exist_ok=True)

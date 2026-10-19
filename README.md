@@ -97,6 +97,27 @@ and `Requested environment:`. The requested environment is `restricted` (with an
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
 
+To reduce checkout writes for challengers and reviewers, keep an optional
+`<private>/projects/<id>/review-leave-out.txt` beside the project's private records. The launcher
+gets the ID from the first line of `AGENTS.md` in `--repo` and uses its default private root or
+`--private`. A subdirectory `--repo` without its own `AGENTS.md` gets a full checkout. Setup never
+creates or changes this list. Put one literal repository-relative file or directory path per line;
+trailing slashes are allowed. Spaces are part of the path and lines are not trimmed. Lines starting
+with `#` are comments. Absolute paths, the repository root and paths containing a `..` component
+warn and are ignored. Entries targeting the repository root's `AGENTS.md`, `CLAUDE.md`, `.claude`
+or `.codex`, including their contents, also warn and are ignored. Paths matching nothing are
+ignored. A missing or empty list gives a full checkout; an unreadable or invalid UTF-8 list warns
+and gives a full checkout.
+
+Listed paths remain in Git but are absent from the checkout. The prompt and answer header name
+them; agents should say if their checks need those paths. If the snapshot changes a listed path,
+the launcher uses a full checkout and explains why. A review of committed changes already on HEAD
+is not detected by this fallback: pass `--full-checkout` when the reviewed range touches listed
+paths. Also use `--full-checkout` whenever a check needs all files; it skips reading the list.
+A checkout with left-out paths skips the Git post-checkout hook. If Git checks out the listed
+paths anyway, the launcher reports a full checkout. Builder, investigator and verifier sessions
+always keep their usual checkout behavior.
+
 Shielding prevents accidental leaks of the private root into briefs and through Claude's own file
 tools. It is not a security boundary: Codex sessions can read the private folder, and a writable
 Claude session has shell access. Give checking sessions only the brief, role contract and evidence
