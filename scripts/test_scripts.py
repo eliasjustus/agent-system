@@ -11,7 +11,6 @@ import sys
 import tempfile
 import textwrap
 import time
-import tomllib
 import unittest
 
 
@@ -209,7 +208,7 @@ class ScriptsTest(unittest.TestCase):
                                *extra)
 
     def test_CE_S1_restricted_roles_disable_extensions_and_enabled_servers(self):
-        names = ['plain', 'dot.name', 'quote"slash\\line\n\x00\x7f', 'café U0001f600']
+        names = ['plain', 'node_repl', 'dash-name', 'A0', '123']
         self.env["MCP_JSON"] = json.dumps(
             [{"name": name, "enabled": True} for name in names]
             + [{"name": "already-off", "enabled": False}])
@@ -224,9 +223,8 @@ class ScriptsTest(unittest.TestCase):
                                  ["plugins", "apps"])
                 config = [args[i + 1] for i, a in enumerate(args) if a == "-c"]
                 self.assertIn("skills.include_instructions=false", config)
-                overrides = [tomllib.loads(c)["mcp_servers"] for c in config
-                             if c.startswith("mcp_servers.")]
-                self.assertEqual(overrides, [{name: {"enabled": False}} for name in names])
+                overrides = [c for c in config if c.startswith("mcp_servers.")]
+                self.assertEqual(overrides, [f"mcp_servers.{name}.enabled=false" for name in names])
                 self.assertTrue(record["stdin"].startswith(
                     (self.method / "roles" / f"{role}.md").read_text() + "\n---\n"))
                 self.assertEqual(self.git("show", self.snapshot() + ":AGENTS.md"),
@@ -369,6 +367,25 @@ class ScriptsTest(unittest.TestCase):
                 args = json.loads(self.record.read_text())["argv"]
                 self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
 
+    def test_CE_S6_unsupported_server_names_are_skipped_and_reported(self):
+        for name in ('dot.name', 'space name', 'quote"slash\\line\n\x00\x7f', 'café 😀', '', '\ud800'):
+            with self.subTest(name=name):
+                self.env["MCP_JSON"] = json.dumps([
+                    {"name": "node_repl", "enabled": True},
+                    {"name": name, "enabled": True}])
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertEqual([a for a in args if a.startswith("mcp_servers.")],
+                                 ["mcp_servers.node_repl.enabled=false"])
+                self.assertIn("skills.include_instructions=false", args)
+                self.assertIn("plugins", args)
+                self.assertIn("apps", args)
+                note = f"MCP servers not all disabled: unsupported server names: {ascii(name)}"
+                self.assertIn(f"Environment: restricted with {note}\n", self.out.read_text())
+                self.assertIn(f"MCP servers were not all disabled: unsupported server names: {ascii(name)}",
+                              result.stderr)
+
     def test_CE_S6_S9_discovery_timeout_kills_group_then_runs_agent(self):
         self.env["MCP_SLEEP"] = "1"
         self.inject_launcher('''
@@ -385,6 +402,28 @@ subprocess.Popen.communicate = communicate
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("discovery timed out after 30 seconds", result.stderr)
         self.assertIn("MCP servers not disabled", self.out.read_text())
+        self.assert_discovery_cleaned()
+
+    def test_CE_S6_discovery_is_bounded_by_short_session_timeout(self):
+        self.env["MCP_SLEEP"] = "1"
+        self.inject_launcher('''
+import subprocess
+original = subprocess.Popen.communicate
+def communicate(self, *args, **kwargs):
+    if self.args[1:] == ["mcp", "list", "--json"]:
+        assert kwargs["timeout"] == 0.3, kwargs["timeout"]
+    return original(self, *args, **kwargs)
+subprocess.Popen.communicate = communicate
+''')
+        result = self.launch("reviewer", "codex", "--author-family", "claude", "--timeout", "0.3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("discovery timed out after 0.3 seconds", result.stderr)
+        self.assertIn("MCP servers not disabled", self.out.read_text())
+        args = json.loads(self.record.read_text())["argv"]
+        self.assertIn("skills.include_instructions=false", args)
+        self.assertIn("plugins", args)
+        self.assertIn("apps", args)
+        self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
         self.assert_discovery_cleaned()
 
     def assert_discovery_cleaned(self):

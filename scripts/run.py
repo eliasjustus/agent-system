@@ -101,13 +101,13 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt(signum)
 
 
-def discover_servers(executable, cwd, env):
+def discover_servers(executable, cwd, env, timeout):
     process = None
     try:
         process = subprocess.Popen([executable, "mcp", "list", "--json"], cwd=cwd, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
-        stdout, _ = process.communicate(timeout=30)
+        stdout, _ = process.communicate(timeout=timeout)
         if process.returncode:
             return [], f"discovery exited {process.returncode}"
         try:
@@ -118,13 +118,9 @@ def discover_servers(executable, cwd, env):
                 not isinstance(server, dict) or not isinstance(server.get("name"), str)
                 or not isinstance(server.get("enabled"), bool) for server in servers):
             return [], "discovery returned an invalid server list"
-        keys = [json.dumps(server["name"], ensure_ascii=False).replace("\x7f", "\\u007f")
-                for server in servers if server["enabled"]]
-        for key in keys:
-            key.encode("utf-8")
-        return keys, ""
+        return [server["name"] for server in servers if server["enabled"]], ""
     except subprocess.TimeoutExpired:
-        return [], "discovery timed out after 30 seconds"
+        return [], f"discovery timed out after {timeout:g} seconds"
     except (OSError, UnicodeError) as error:
         return [], f"discovery failed: {error}"
     finally:
@@ -328,13 +324,22 @@ def main():
                 if restricted:
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
-                    servers, reason = discover_servers(executable, cwd, agent_env)
+                    servers, reason = discover_servers(executable, cwd, agent_env,
+                                                       min(30, args.timeout or 30))
                     environment = "restricted"
                     if reason:
                         environment += f" with MCP servers not disabled: {reason}"
                         print(f"Warning: MCP servers were not disabled: {reason}", file=sys.stderr)
-                    for key in servers:
-                        command += ["-c", f"mcp_servers.{key}.enabled=false"]
+                    unsupported = []
+                    for name in servers:
+                        if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                            command += ["-c", f"mcp_servers.{name}.enabled=false"]
+                        else:
+                            unsupported.append(ascii(name))
+                    if unsupported:
+                        reason = f"unsupported server names: {', '.join(unsupported)}"
+                        environment += f" with MCP servers not all disabled: {reason}"
+                        print(f"Warning: MCP servers were not all disabled: {reason}", file=sys.stderr)
                 command += ["-"]
             else:
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
