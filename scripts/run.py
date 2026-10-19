@@ -188,7 +188,8 @@ def review_leave_out(repo, private, head, snapshot):
         if not line.strip() or line.startswith("#"):
             continue
         entry = os.path.normpath(line)
-        if line.startswith("/") or ".." in line.split("/") or entry == "." or "\0" in line:
+        if (line.startswith("/") or ".." in line.split("/") or entry == "." or "\0" in line
+                or entry.split("/", 1)[0] in ("AGENTS.md", "CLAUDE.md", ".claude", ".codex")):
             print(f"Warning: ignoring invalid leave-out path {line!r}", file=sys.stderr)
         elif entry not in entries:
             entries.append(entry)
@@ -341,10 +342,9 @@ def main():
                 snapshot = git(repo, "commit-tree", tree, *(["-p", head] if head else []),
                                env=env, input="Review snapshot\n")
                 leave_out = (review_leave_out(repo, private, head, snapshot)
-                             if args.role in ("challenger", "reviewer") else [])
+                             if args.role in ("challenger", "reviewer") and not args.full_checkout else [])
                 if args.full_checkout and args.role in ("challenger", "reviewer"):
                     checkout_note = "Checkout: full (--full-checkout)"
-                    leave_out = []
                 elif leave_out:
                     base = head or git(repo, "hash-object", "-t", "tree", "--stdin", input="")
                     changed = [os.fsdecode(raw) for raw in git(
@@ -358,12 +358,7 @@ def main():
                         leave_out = []
                     else:
                         checkout_note = f"Checkout: left-out paths {leave_out!r}"
-                if checkout_note:
-                    prompt += "\n" + checkout_note + "\n"
                 if leave_out:
-                    prompt += ("These paths are absent from the file system but present in Git "
-                               f"(`git show {snapshot}:<path>`). If your check needs them, "
-                               "say so in your answer.\n")
                     git(repo, "worktree", "add", "--no-checkout", "--detach", str(work), snapshot)
                     git(work, "read-tree", snapshot)
                     omitted = git(work, "--literal-pathspecs", "ls-files", "-z", "--",
@@ -371,8 +366,18 @@ def main():
                     git(work, "update-index", "-z", "--skip-worktree", "--stdin",
                         input=omitted, text=False)
                     git(work, "checkout-index", "-a")
+                    if any(os.path.lexists(work / path) for path in leave_out):
+                        checkout_note = ("Checkout: full because left-out paths were checked out anyway "
+                                         "(Git older than 2.37?)")
+                        leave_out = []
                 else:
                     git(repo, "worktree", "add", "--detach", str(work), snapshot)
+                if checkout_note:
+                    prompt += "\n" + checkout_note + "\n"
+                if leave_out:
+                    hint = f" (`git show {snapshot}:<path>`)" if args.family == "codex" else ""
+                    prompt += (f"These paths are absent from the file system but present in Git{hint}. "
+                               "If your check needs them, say so in your answer.\n")
                 cwd = work
             if args.role == "verifier":
                 source.mkdir()

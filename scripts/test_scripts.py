@@ -547,10 +547,96 @@ assert (cwd / "models-old").read_text() == "keep"
                                      self.git("rev-parse", pinned + "^{tree}"))
                     prompt = record["stdin"]
                     for phrase in ("left-out paths ['models']", "absent from the file system",
-                                   "present in Git", f"git show {snapshot}:<path>",
+                                   "present in Git",
                                    "If your check needs them", "say so in your answer"):
                         self.assertIn(phrase, prompt)
+                    self.assertEqual(f"git show {snapshot}:<path>" in prompt, family == "codex")
                     self.assertFalse(Path(record["cwd"]).exists())
+
+    def test_LO_review_fix_protects_root_instructions(self):
+        path = self.leave_out_project()
+        protected = ["AGENTS.md", "CLAUDE.md", ".claude/agents/reviewer.md", ".codex/config.toml"]
+        for name in protected[1:] + ["docs/AGENTS.md"]:
+            target = self.repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("instructions\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "instruction fixtures")
+        entries = ["AGENTS.md", "./AGENTS.md", "CLAUDE.md", ".claude/", ".codex",
+                   ".claude/agents/reviewer.md", "./.codex/config.toml"]
+        path.write_text("\n".join([*entries, "models", "docs/AGENTS.md"]) + "\n")
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for entry in entries:
+            self.assertIn(f"Warning: ignoring invalid leave-out path {entry!r}", result.stderr)
+        record = json.loads(self.record.read_text())
+        for name in protected:
+            self.assertIn(name, record["files"])
+        self.assertFalse(record["models_present"])
+        self.assertNotIn("docs/AGENTS.md", record["files"])
+        self.assertIn("Checkout: left-out paths ['models', 'docs/AGENTS.md']", record["stdin"])
+
+    def test_LO_review_fix_git_show_hint_only_for_codex(self):
+        self.leave_out_project()
+        for role in ("challenger", "reviewer"):
+            for family in ("claude", "codex"):
+                with self.subTest(role=role, family=family):
+                    record = self.review_checkout(role=role, family=family)
+                    self.assertFalse(record["models_present"])
+                    self.assertIn("If your check needs them, say so in your answer.", record["stdin"])
+                    self.assertEqual("git show " in record["stdin"], family == "codex")
+
+    def test_LO_review_fix_old_git_reports_full_checkout(self):
+        self.leave_out_project()
+        wrapper = self.bin / "git"
+        real_git = str(wrapper.resolve())
+        marker = self.base / "old-git-checkout"
+        wrapper.unlink()
+        wrapper.write_text(
+            "#!/usr/bin/env python3\nimport os, pathlib, sys\nargs = sys.argv[1:]\n"
+            "if 'checkout-index' in args:\n"
+            "    args.append('--ignore-skip-worktree-bits')\n"
+            f"    pathlib.Path({str(marker)!r}).touch()\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *args])\n")
+        wrapper.chmod(0o755)
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                marker.unlink(missing_ok=True)
+                record = self.review_checkout(family=family)
+                self.assertTrue(marker.exists())
+                self.assertTrue(record["models_present"])
+                self.assertEqual(record["status"], "")
+                for text in (record["stdin"], self.out.read_text()):
+                    self.assertIn("Checkout: full because left-out paths were checked out anyway "
+                                  "(Git older than 2.37?)", text)
+                    self.assertNotIn("Checkout: left-out paths", text)
+                self.assertNotIn("absent from the file system", record["stdin"])
+                self.assertNotIn("git show ", record["stdin"])
+                self.assertNotIn("If your check needs them", record["stdin"])
+
+    def test_LO_review_fix_full_checkout_never_reads_list(self):
+        self.leave_out_project()
+        marker = self.base / "list-read"
+        self.inject_launcher(f'''
+import pathlib
+original = pathlib.Path.read_text
+def denied(path, *args, **kwargs):
+    if path.name == "review-leave-out.txt":
+        pathlib.Path({str(marker)!r}).touch()
+        raise PermissionError("leave-out list must not be read")
+    return original(path, *args, **kwargs)
+pathlib.Path.read_text = denied
+''')
+        for role in ("challenger", "reviewer"):
+            with self.subTest(role=role):
+                result = self.launch(role, "codex", "--author-family", "claude", "--full-checkout")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(marker.exists(), "--full-checkout read the leave-out list")
+                self.assertNotIn("Warning:", result.stderr)
+                record = json.loads(self.record.read_text())
+                self.assertTrue(record["models_present"])
+                self.assertIn("Checkout: full (--full-checkout)", record["stdin"])
+                self.assertNotIn("absent from the file system", record["stdin"])
 
     def test_LO_S8_subdirectory_repo_uses_root_relative_leave_out_paths(self):
         path = self.leave_out_project()
