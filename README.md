@@ -97,6 +97,11 @@ and `Requested environment:`. The requested environment is `restricted` (with an
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
 
+The header's `Write bytes:` line reports the bytes the launcher and its reaped children wrote to
+files, in MiB, including data deleted before it reached the disk, or `unavailable` when
+`/proc/self/io` cannot be read or parsed. It misses daemons and processes that were re-parented or
+still running when the session was stopped.
+
 To reduce checkout writes for challengers and reviewers, keep an optional
 `<private>/projects/<id>/review-leave-out.txt` beside the project's private records. The launcher
 gets the ID from the first line of `AGENTS.md` in `--repo` and uses its default private root or

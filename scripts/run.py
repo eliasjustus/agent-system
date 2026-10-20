@@ -32,6 +32,14 @@ def utc():
     return datetime.now(timezone.utc).isoformat()
 
 
+def write_bytes():
+    try:
+        values = dict(line.split(":") for line in Path("/proc/self/io").read_text().splitlines())
+        return int(values["write_bytes"])
+    except (OSError, ValueError, KeyError, UnicodeError):
+        return None
+
+
 def cleanup_failed(what, error):
     print(f"Cleanup failed: {what}: {error}", file=sys.stderr)
 
@@ -282,6 +290,7 @@ def main():
     root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)
+        initial_io = write_bytes()
         session = tempfile.TemporaryDirectory(prefix="", dir=root)
     except OSError as error:
         print(f"Cannot create session folder under {root}: {error}", file=sys.stderr)
@@ -474,6 +483,9 @@ def main():
                     with out.with_suffix(".log").open(errors="replace") as log:
                         sys.stderr.writelines(deque(log, maxlen=20))
                 end = utc()
+                final_io = write_bytes()
+                writes = (f"{(final_io - initial_io) / 1024**2:.1f} MiB"
+                          if initial_io is not None and final_io is not None else "unavailable")
                 header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {model}\n"
                           f"Executable: {executable}\n"
                           + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
@@ -485,7 +497,7 @@ def main():
                           + (f"Snapshot commit: {snapshot}\n" if review else "")
                           + (checkout_note + "\n" if checkout_note else "")
                           + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
-                          + f"Start UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
+                          + f"Write bytes: {writes}\nStart UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(header.encode() + answer_bytes)
                 evidence = out.with_name(out.stem + "-evidence")
