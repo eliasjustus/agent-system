@@ -115,7 +115,8 @@ Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repo
 where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash
 from its resolved Git common directory. Main trees, linked worktrees, symlinks and subdirectory
 `--repo` paths share one pool; different repositories with the same name do not. No Agent System
-entry is required. Each repository has **3 slots**, using up to three built trees of disk space.
+entry is required. Verifiers require Linux (the lease guard uses `prctl`). Each repository has
+**3 slots**, using up to three built trees of disk space.
 Before each use, a slot is reset to the detached candidate and cleaned of tracked edits and
 untracked files, including nested repositories. Ignored build output remains warm. Source working
 files, index, branches and config stay untouched.
@@ -129,7 +130,8 @@ session worktree and says `pool busy` in the header. Session cleanup never remov
 Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
 runs count), when a lockfile or toolchain/build definition changes in either direction, and with
 verifier-only `--clean-checkout`. The fixed list covers npm/yarn/pnpm, Cargo, Gradle (including
-wrapper properties and lockfiles), Go, Python requirements/uv/poetry, Gemfile.lock, composer.lock,
+wrapper properties and lockfiles), Go, Python requirements/uv/poetry and pyproject.toml/setup.py/setup.cfg,
+Gemfile.lock, composer.lock,
 flake.lock, bun.lock/bun.lockb and toolchain pins (including .java-version). Changes to any
 Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files and files under
 any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. Counts
@@ -141,15 +143,17 @@ Gradle and Cargo incremental builds must notice deleted source files; the tests 
 a still-referenced deleted Java class and Rust module, plus a removed Cargo executable. The Cargo
 manifest and executable-source deep-clean rules prevent obsolete binaries from passing a check.
 Custom output paths, other build systems and custom build scripts may still reuse stale ignored
-output incorrectly. Retry with `--clean-checkout` after an environment-looking failure and report
+output incorrectly. Changes to package.json alone do not trigger a deep clean; `npm ci` reinstalls
+node_modules anyway. Retry with `--clean-checkout` after an environment-looking failure and report
 both results; a warm pass alone cannot establish that a custom build is correct. No shared Rust
 compile cache (sccache) is configured.
 
 A Linux subreaper supervisor holds the pool locks outside systemd-run, stops and waits for the
 agent's descendants, and releases locks only after they are gone. If the launcher is killed, the
 supervisor stops the agent and its descendants, keeps its leases until they are reaped, and removes
-the orphaned session folder. This does not rely on systemd-run forwarding file descriptors.
-Pool supervision requires Linux.
+the orphaned session folder. A launcher killed before its lease guard starts can leave its session
+folder under `<cache>/am`; the kernel releases its locks. This does not rely on systemd-run
+forwarding file descriptors. Pool supervision requires Linux.
 
 Codex challengers and reviewers read the snapshot through `git show <snapshot>:<path>`,
 `git grep <pattern> <snapshot>` and `git diff`. Only root `AGENTS.md` and `CLAUDE.md`, if present,
@@ -232,12 +236,13 @@ To inspect a pool, read its `slot-*.json` files (commit and use count), run
 `git -C /path/to/project worktree list`, and inspect its size with
 `du -sh <cache>/am-pool/<name>-<hash>`. To remove a repository's pool safely, first stop its launcher
 sessions and wait for their agents and supervisors to finish, including orphaned sessions. Then
-remove each registered slot with
-`git -C /path/to/project worktree remove --force --force <pool>/slot-N` before deleting that
-repository's pool folder. For a deleted slot folder, the same remove command usually clears its
+remove each registered slot while holding its lock, checking it is free:
+`flock -n <pool>/slot-N.lock git -C /path/to/project worktree remove --force --force <pool>/slot-N`.
+If the lock is busy, wait for its session to finish. Before deleting that repository's pool folder,
+ensure no launcher can start. For a deleted slot folder, the same remove command usually clears its
 registration; if it fails, remove only the matching entry under the common Git directory's
 `worktrees/` whose `gitdir` names that slot. Do not prune unrelated worktrees. Never delete or
-replace a live slot's `.lock` file. Check that the pool registrations are gone before deleting
+replace `.lock` files while launchers may start. Check that the pool registrations are gone before deleting
 its lock and metadata files.
 
 Moved, renamed or deleted repositories leave pools that are never reclaimed automatically.
@@ -259,6 +264,7 @@ you delete them.
 ## Platforms
 
 Setup is tested on Linux. macOS and WSL2 should work but are untested; WSL1 is not supported.
+Verifiers require Linux because their lease guard uses `prctl`.
 Without `systemd-run`, launcher sessions run without a scope and use process-group cleanup.
 
 ## Before a release

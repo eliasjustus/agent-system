@@ -24,8 +24,9 @@ import tempfile
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 POOL_SLOTS = 3
 POOL_USES = 20
+GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
-                   "-c", "index.sparse=false")
+                   "-c", "index.sparse=false", "-c", "core.attributesFile=")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -34,6 +35,7 @@ BUILD_INPUTS = {
     "gradle.properties", "settings.gradle", "settings.gradle.kts",
     "build.gradle", "build.gradle.kts", "libs.versions.toml",
     ".nvmrc", ".node-version", ".tool-versions", ".python-version",
+    "pyproject.toml", "setup.py", "setup.cfg",
 }
 
 # This supervisor, outside systemd-run, owns the inherited leases. Linux's
@@ -90,7 +92,7 @@ sys.exit(code if code >= 0 else 128 - code)
 
 
 def git(repo, *args, env=None, input=None, text=True):
-    result = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *args],
+    result = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG, *args],
                                      env=env, input=input, text=text)
     return result.strip() if text else result.rstrip(b"\n")
 
@@ -113,7 +115,7 @@ def cleanup_failed(what, error):
 
 def cleanup_worktrees(repo, session):
     try:
-        probe = subprocess.run(["git", "--no-optional-locks", "-C", str(repo),
+        probe = subprocess.run(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
                                 "rev-parse", "--is-inside-work-tree"],
                                text=True, capture_output=True)
         if probe.returncode or probe.stdout.strip() != "true":
@@ -293,6 +295,9 @@ def check_checkout(work, commit):
 
 def reset_checkout(work, commit, deep_clean):
     admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
+    attributes = admin / "info/attributes"
+    rewrite = os.path.lexists(attributes)
+    attributes.unlink(missing_ok=True)
     # This belongs only to the slot. Previous agents can leave filters, excludes,
     # hooks or fsmonitor commands here, not just sparse-checkout settings.
     (admin / "config.worktree").unlink(missing_ok=True)
@@ -318,16 +323,37 @@ def reset_checkout(work, commit, deep_clean):
     index = Path(git(work, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     index.unlink(missing_ok=True)
     git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", "HEAD")
+    # Include ignored attributes, and use the rebuilt index so staged additions
+    # cannot masquerade as committed attributes. Remove them before any refresh.
+    for raw in git(work, *CHECKOUT_CONFIG, "ls-files", "--others", "-z", "--",
+                   ".gitattributes", ":(glob)**/.gitattributes", text=False).split(b"\0"):
+        if raw:
+            (work / os.fsdecode(raw)).unlink()
+            rewrite = True
+    changed = git(work, *CHECKOUT_CONFIG, "diff", "--no-renames", "--name-only", "-z",
+                  "HEAD", commit, text=False).split(b"\0")
+    rewrite |= any(Path(os.fsdecode(path)).name == ".gitattributes" for path in changed if path)
+    rewrite |= bool(git(work, *CHECKOUT_CONFIG, "diff", "--name-only", "--", ".gitattributes",
+                        ":(glob)**/.gitattributes"))
     # Refresh stat data without writing working files, preserving warm leases'
     # unchanged files. Exit 1 means modified files; checkout below restores them.
-    refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
-                              *CHECKOUT_CONFIG,
-                              "-c", "core.ignorestat=false", "update-index", "--refresh"],
-                             capture_output=True)
-    if refresh.returncode not in (0, 1):
-        refresh.check_returncode()
+    if not rewrite:
+        refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
+                                  *GIT_CONFIG, *CHECKOUT_CONFIG,
+                                  "-c", "core.ignorestat=false", "update-index", "--refresh"],
+                                 capture_output=True)
+        if refresh.returncode not in (0, 1):
+            refresh.check_returncode()
     git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "checkout", "--force", "--detach", commit)
-    git(work, *CHECKOUT_CONFIG, "clean", "-ffd" + ("x" if deep_clean else ""))
+    if rewrite:
+        # Checkout must use the NEW attributes even for unchanged blobs. Its
+        # transition above also removes paths tracked only by the previous tree.
+        # Discard stat data again: diff/checkout can cache paths as up to date
+        # under the old attributes, and checkout-index --force trusts that data.
+        index.unlink()
+        git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", commit)
+        git(work, *CHECKOUT_CONFIG, "checkout-index", "--all", "--force")
+    git(work, *CHECKOUT_CONFIG, "-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
     check_checkout(work, commit)
 
 
@@ -594,7 +620,7 @@ def main():
                     git(repo, "read-tree", head or "--empty", env=env)
                 git(repo, "add", "-u", env=env)
                 untracked = subprocess.check_output(
-                    ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"],
+                    ["git", "-C", str(repo), *GIT_CONFIG, "ls-files", "--others", "--exclude-standard", "-z"],
                     env=env)
                 paths = []
                 for raw in untracked.split(b"\0"):

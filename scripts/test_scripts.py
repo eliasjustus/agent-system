@@ -367,6 +367,157 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertEqual(record["cwd"], str(slot))
         self.assertFalse(marker.exists(), "a command left by the previous slot user ran")
 
+    def assert_slot_bytes_match_fresh(self, slot):
+        fresh = self.base / "fresh-checkout"
+        subprocess.check_call(["git", "-C", str(self.repo), "-c", "core.attributesFile=",
+                               "worktree", "add", "--detach", str(fresh), "HEAD"], env=self.env)
+        try:
+            paths = subprocess.check_output(["git", "-C", str(fresh), "ls-files", "-z"], env=self.env)
+            for raw in paths.split(b"\0"):
+                if raw:
+                    name = os.fsdecode(raw)
+                    self.assertEqual((slot / name).read_bytes(), (fresh / name).read_bytes(), name)
+        finally:
+            self.git("worktree", "remove", "--force", str(fresh))
+
+    def test_POOL_R8_nontracked_attributes_cannot_hide_changed_file_bytes(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub/data").write_bytes(b"nested\n")
+        (self.repo / "ignored").mkdir()
+        (self.repo / "ignored/data").write_bytes(b"ignored directory\n")
+        (self.repo / ".gitignore").write_text("ignored\nwarm-output\n")
+        self.git("add", "-f", "ignored/data")
+        self.git("add", ".")
+        self.git("commit", "-qm", "text fixtures")
+        slot = Path(self.verifier()["cwd"])
+        for name, target, ignored in ((".gitattributes", "tracked", False),
+                                      ("sub/.gitattributes", "sub/data", True),
+                                      ("ignored/.gitattributes", "ignored/data", True)):
+            with self.subTest(name=name, ignored=ignored):
+                if ignored:
+                    (self.repo / ".gitignore").write_text("ignored\nwarm-output\n**/.gitattributes\n")
+                    self.git("add", ".gitignore")
+                    if self.git("diff", "--cached", "--name-only"):
+                        self.git("commit", "-qm", "ignore attributes")
+                (slot / name).write_text("* text\n")
+                (slot / target).write_bytes((slot / target).read_bytes().replace(b"\n", b"\r\n"))
+                # Avoid Git's same-second racy-stat fallback hiding the bug.
+                os.utime(slot / target, (1, 1))
+                (slot / "warm-output").write_text("warm build")
+                self.assertEqual(self.verifier()["cwd"], str(slot))
+                self.assertFalse((slot / name).exists())
+                self.assert_slot_bytes_match_fresh(slot)
+                self.assertEqual((slot / "warm-output").read_text(), "warm build")
+
+    def test_POOL_R8_committed_attributes_changes_rewrite_unchanged_blobs(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / ".gitattributes").write_text("tracked text eol=lf\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "LF attributes")
+        blob = self.git("rev-parse", "HEAD:tracked")
+        slot = Path(self.verifier()["cwd"])
+        for eol in ("crlf", "lf"):
+            with self.subTest(eol=eol):
+                (self.repo / ".gitattributes").write_text(f"tracked text eol={eol}\n")
+                self.git("add", ".gitattributes")
+                self.git("commit", "-qm", "change attributes only")
+                self.assertEqual(self.git("rev-parse", "HEAD:tracked"), blob)
+                os.utime(slot / "tracked", (1, 1))
+                (slot / "ignored").write_text("warm build")
+                self.assertEqual(self.verifier()["cwd"], str(slot))
+                self.assert_slot_bytes_match_fresh(slot)
+                self.assertEqual((slot / "ignored").read_text(), "warm build")
+
+    def test_POOL_R8_local_tracked_attributes_cannot_hide_changed_file_bytes(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / ".gitattributes").write_text("tracked text eol=lf\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "LF attributes")
+        slot = Path(self.verifier()["cwd"])
+        (slot / ".gitattributes").write_text("tracked text\n")
+        (slot / "tracked").write_bytes(b"original\r\n")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R8_slot_private_and_configured_attributes_are_neutralized(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "text fixture")
+        slot = Path(self.verifier()["cwd"])
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            text=True, env=self.env).strip())
+        for kind in ("private", "configured"):
+            with self.subTest(kind=kind):
+                if kind == "private":
+                    attributes = admin / "info/attributes"
+                    attributes.parent.mkdir(exist_ok=True)
+                else:
+                    attributes = self.base / "global-attributes"
+                    self.git("config", "core.attributesFile", str(attributes))
+                attributes.write_text("tracked text eol=crlf\n")
+                (slot / "tracked").write_bytes(b"original\r\n")
+                config = (self.repo / ".git/config").read_bytes()
+                self.assertEqual(self.verifier()["cwd"], str(slot))
+                if kind == "private":
+                    self.assertFalse(attributes.exists())
+                self.assert_slot_bytes_match_fresh(slot)
+                self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+
+    def test_POOL_R8_shared_fsmonitor_and_split_index_do_not_affect_launcher(self):
+        slot = Path(self.verifier()["cwd"])
+        monitor = self.base / "fsmonitor"
+        marker = self.base / "monitor-ran"
+        monitor.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n')
+        monitor.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(monitor))
+        self.git("config", "core.splitIndex", "true")
+        common = self.repo / ".git"
+        before = {path: path.read_bytes() for path in common.rglob("sharedindex.*")}
+        config = (common / "config").read_bytes()
+        # Read effective settings without allowing the fake agent's own status
+        # commands to run a monitor or write split indexes.
+        self.agent_extra('''
+record["git_config"] = subprocess.check_output(["git", "config", "--list"], text=True)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse(marker.exists())
+        self.assertEqual({path: path.read_bytes() for path in common.rglob("sharedindex.*")}, before)
+        self.assertEqual((common / "config").read_bytes(), config)
+        # Snapshot creation also uses a copied index.
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual({path: path.read_bytes() for path in common.rglob("sharedindex.*")}, before)
+
+    def test_POOL_R8_global_excludes_do_not_protect_slot_leftovers(self):
+        slot = Path(self.verifier()["cwd"])
+        excludes = self.base / "global-excludes"
+        excludes.write_text("leftover\n")
+        self.git("config", "core.excludesFile", str(excludes))
+        (slot / "leftover").write_text("must be removed")
+        (slot / "ignored").write_text("warm build")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse((slot / "leftover").exists())
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+
+    def test_POOL_R8_split_index_copies_do_not_write_shared_indexes(self):
+        slot = Path(self.verifier()["cwd"])
+        self.git("config", "core.splitIndex", "true")
+        self.git("update-index", "--split-index", "--assume-unchanged", "tracked")
+        common = self.repo / ".git"
+        before = {path: path.read_bytes() for path in common.rglob("sharedindex.*")}
+        self.assertTrue(before, "fixture must exercise an existing split index")
+        index = (common / "index").read_bytes()
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertEqual((common / "index").read_bytes(), index)
+        self.assertEqual({path: path.read_bytes() for path in common.rglob("sharedindex.*")}, before)
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((common / "index").read_bytes(), index)
+        self.assertEqual({path: path.read_bytes() for path in common.rglob("sharedindex.*")}, before)
+
     def test_POOL_R2_operation_state_is_cleared_on_every_reset(self):
         slot = Path(self.verifier()["cwd"])
         admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
@@ -736,6 +887,24 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 target.write_text("changed build input")
                 self.git("add", ".")
                 self.git("commit", "-qm", "build input")
+                for reverse in (False, True):
+                    (slot / "ignored").write_text("stale output")
+                    if reverse:
+                        self.git("reset", "--hard", baseline)
+                    self.verifier()
+                    self.assertFalse((slot / "ignored").exists())
+                    self.assertIn("deep clean: lockfile or toolchain changed", self.out.read_text())
+
+    def test_POOL_R8_python_build_definitions_clean_in_both_directions(self):
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        for name in ("pyproject.toml", "setup.py", "setup.cfg"):
+            with self.subTest(name=name):
+                target = self.repo / "nested" / name
+                target.parent.mkdir(exist_ok=True)
+                target.write_text("changed build definition")
+                self.git("add", ".")
+                self.git("commit", "-qm", "Python build definition")
                 for reverse in (False, True):
                     (slot / "ignored").write_text("stale output")
                     if reverse:
@@ -1443,7 +1612,10 @@ subprocess.Popen.communicate = communicate
 import subprocess
 original = subprocess.check_output
 def check_output(args, *positional, **kwargs):
-    if args[0] == "git" and args[4:4 + {len(operation)}] == {operation!r}:
+    command = args[4:]
+    while command[:1] == ["-c"]:
+        command = command[2:]
+    if args[0] == "git" and command[:{len(operation)}] == {operation!r}:
         raise subprocess.CalledProcessError(31, args)
     return original(args, *positional, **kwargs)
 subprocess.check_output = check_output
