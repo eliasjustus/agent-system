@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1594,6 +1595,142 @@ subprocess.check_output = changed_paths_only
         self.assertIn("commit first", result.stderr)
         self.assertEqual(Path(str(self.record) + ".hashed").read_bytes(), b'"tracked"\n')
         self.assertFalse(self.pool_root().exists())
+
+    def test_POOL_R12_ignored_symlinks_are_removed_without_touching_targets(self):
+        (self.repo / ".gitignore").write_text("ignored\nnode_modules\ntarget\n.venv\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignored dependency trees")
+        slot = Path(self.verifier()["cwd"])
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("untouched")
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                (slot / "ignored").mkdir(exist_ok=True)
+                (slot / "ignored/warm").write_text("build output")
+                for name in ("node_modules", "target", ".venv", "ignored/nested-link"):
+                    (slot / name).unlink(missing_ok=True)
+                    (slot / name).symlink_to(outside, target_is_directory=True)
+                record = self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual(record["cwd"], str(slot))
+                for name in ("node_modules", "target", ".venv", "ignored/nested-link"):
+                    self.assertFalse(os.path.lexists(slot / name), name)
+                self.assertEqual(list(outside.iterdir()), [outside / "keep"])
+                self.assertEqual((outside / "keep").read_text(), "untouched")
+                self.assertEqual((slot / "ignored/warm").exists(), not clean)
+                self.assertIn("--clean-checkout" if clean else "warm reset", self.out.read_text())
+
+    def test_POOL_R12_special_files_are_removed_on_warm_and_deep_resets(self):
+        slot = Path(self.verifier()["cwd"])
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                for directory in (slot, slot / "sub", slot / "ignored"):
+                    directory.mkdir(exist_ok=True)
+                    (directory / "pipe").unlink(missing_ok=True)
+                    os.mkfifo(directory / "pipe")
+                    # A socket inode exercises cleanup without requiring bind
+                    # permission in the launcher's restricted test environment.
+                    (directory / "socket").unlink(missing_ok=True)
+                    os.mknod(directory / "socket", stat.S_IFSOCK | 0o600)
+                record = self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual(record["cwd"], str(slot))
+                for directory in (slot, slot / "sub", slot / "ignored"):
+                    for name in ("pipe", "socket"):
+                        self.assertFalse(os.path.lexists(directory / name), str(directory / name))
+                self.assertIn("--clean-checkout" if clean else "warm reset", self.out.read_text())
+
+    def test_POOL_R12_reftable_uses_one_fresh_worktree_without_pool(self):
+        probe = subprocess.run(["git", "init", "-q", "--ref-format=reftable", str(self.base / "probe")],
+                               env=self.env, capture_output=True, text=True)
+        if probe.returncode:
+            self.skipTest("installed Git does not support reftable: " + probe.stderr)
+        shutil.rmtree(self.repo / ".git")
+        self.git("init", "-q", "--ref-format=reftable")
+        self.git("add", ".")
+        self.git("commit", "-qm", "reftable candidate")
+        self.inject_launcher('''
+import os, pathlib, subprocess
+original = subprocess.check_output
+def count_adds(command, *args, **kwargs):
+    if "worktree" in command and "add" in command:
+        with pathlib.Path(os.environ["RECORD"] + ".adds").open("a") as log:
+            log.write("add\\n")
+    return original(command, *args, **kwargs)
+subprocess.check_output = count_adds
+''')
+        self.pool_probe()
+        for _ in range(2):
+            record = self.verifier()
+            self.assertEqual(record["head"], self.git("rev-parse", "HEAD"))
+            self.assertEqual(record["status"], "")
+            self.assertFalse(self.pool_root().exists())
+            self.assertIn("reftable; fresh session worktree", self.out.read_text())
+            self.assert_session_cleaned(record)
+        self.assertEqual(Path(str(self.record) + ".adds").read_text(), "add\nadd\n")
+
+    def test_POOL_R12_source_permissions_and_hardlinks_do_not_refuse(self):
+        # This committed CRLF blob looks modified to diff under LF attributes,
+        # so the source content check must accept the actual checkout bytes.
+        (self.repo / "tracked").write_bytes(b"original\r\n")
+        self.git("add", "tracked")
+        self.git("commit", "-qm", "CRLF blob")
+        (self.repo / ".gitattributes").write_text("* text eol=lf\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "LF attributes")
+        (self.repo / "tracked").chmod(0o644)
+        self.assertIn("tracked", self.git("diff", "--name-only"))
+        mask = self.current_umask()
+        try:
+            for test_mask, hardlinked in ((0o002, False), (0o022, True)):
+                with self.subTest(umask=oct(test_mask), hardlinked=hardlinked):
+                    os.umask(test_mask)
+                    if hardlinked:
+                        (self.base / "hardlink").hardlink_to(self.repo / "tracked")
+                    paths = (self.repo / "tracked", self.repo / ".git/index", self.repo / ".git/config")
+                    before = [(p.read_bytes(), p.stat()) for p in paths]
+                    self.verifier()
+                    self.assertEqual([(p.read_bytes(), p.stat()) for p in paths], before)
+        finally:
+            os.umask(mask)
+
+    def test_POOL_R12_source_directory_replaced_by_file_says_commit_first(self):
+        (self.repo / "dir").mkdir()
+        (self.repo / "dir/file").write_text("committed")
+        self.git("add", ".")
+        self.git("commit", "-qm", "tracked directory")
+        shutil.rmtree(self.repo / "dir")
+        (self.repo / "dir").write_text("replacement")
+        index = (self.repo / ".git/index").read_bytes()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("commit first", result.stderr)
+        self.assertIn("dir/file", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(self.pool_root().exists())
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual((self.repo / "dir").read_text(), "replacement")
+
+    def test_POOL_R12_moved_source_gitlink_refuses_and_names_path(self):
+        self.env["PATH"] += os.pathsep + os.environ["PATH"]
+        module = self.base / "module"
+        subprocess.check_call(["git", "init", "-q", str(module)], env=self.env)
+        (module / "file").write_text("one")
+        for args in (("add", "."), ("commit", "-qm", "one")):
+            subprocess.check_call(["git", "-C", str(module), *args], env=self.env)
+        subprocess.check_call(["git", "-C", str(self.repo), "-c", "protocol.file.allow=always",
+                               "submodule", "add", "-q", str(module), "vendor/module"], env=self.env)
+        self.git("commit", "-qam", "submodule")
+        sub = self.repo / "vendor/module"
+        (sub / "file").write_text("two")
+        subprocess.check_call(["git", "-C", str(sub), "commit", "-qam", "two"], env=self.env)
+        index = (self.repo / ".git/index").read_bytes()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("commit first", result.stderr)
+        self.assertIn("vendor/module", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(self.pool_root().exists())
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
 
     def test_POOL_R10_09_unchanged_index_stat_data_survives_reset(self):
         self.verifier()

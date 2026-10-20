@@ -311,8 +311,8 @@ def check_checkout(work, commit, pass_fds=()):
         raise ValueError("checkout is not clean and detached at the candidate")
 
 
-def checkout_mismatches(work, pass_fds=(), paths=None):
-    """Check raw content and Git modes without refreshing or writing the tree."""
+def checkout_mismatches(work, pass_fds=(), paths=None, source=False):
+    """Check raw content and (for slots) modes without writing the tree."""
     run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
     entries = []
     for entry in run("ls-files", "--stage", "-z", text=False).split(b"\0"):
@@ -336,17 +336,18 @@ def checkout_mismatches(work, pass_fds=(), paths=None):
         try:
             info = file.lstat()
             actual = info.st_mode
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             mismatches.append(path)
             continue
-        if info.st_nlink > 1:
+        if not source and info.st_nlink > 1:
             mismatches.append(path)
         elif mode == b"120000" and symlinks:
             if not stat.S_ISLNK(actual) or run("hash-object", "--stdin",
                     input=os.fsencode(os.readlink(file)), text=False) != blob:
                 mismatches.append(path)
         elif (not stat.S_ISREG(actual)
-              or stat.S_IMODE(actual) != ((0o777 if mode == b"100755" else 0o666) & ~umask)):
+              or (not source and stat.S_IMODE(actual) != (
+                  (0o777 if mode == b"100755" else 0o666) & ~umask))):
             mismatches.append(path)
         else:
             regular.append((path, blob))
@@ -512,11 +513,41 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
             input=b"\0".join(mismatches) + b"\0", text=False)
         if checkout_mismatches(work, pass_fds):
             raise ValueError("checkout bytes or modes differ from candidate")
+    # Git clean leaves ignored symlinks and special files behind. Never retain
+    # links into another tree, and never let a FIFO/socket survive as input.
+    ignored = {Path(os.fsdecode(raw.rstrip(b"/"))) for raw in run(
+        "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+        text=False).split(b"\0") if raw}
+    ignored_parents = {parent for path in ignored for parent in (path, *path.parents)}
+    tracked = set(paths)
+    pending = [(work, False)]
+    while pending:
+        directory, inside_ignored = pending.pop()
+        # scandir reuses directory-entry type information without statting each
+        # build file. Errors must propagate so an unreadable tree is recreated.
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if path == work / ".git":
+                    continue
+                relative = path.relative_to(work)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((path, inside_ignored or relative in ignored))
+                elif os.fsencode(relative) not in tracked and (
+                        (entry.is_symlink() and (inside_ignored or relative in ignored_parents))
+                        or (not entry.is_symlink() and not entry.is_file(follow_symlinks=False))):
+                    path.unlink()
     run("-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
     check_checkout(work, commit, pass_fds)
 
 
 def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()):
+    # Reftable keeps per-worktree refs in admin/reftable, which the pool's
+    # admin-state reset cannot discard. Bypass it before creating any slots.
+    if git(repo, "config", "--default=files", "--get", "extensions.refStorage") == "reftable":
+        git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
+        check_checkout(fresh, commit)
+        return fresh, "reftable; fresh session worktree"
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     main = os.fsdecode(git(repo, "worktree", "list", "--porcelain", "-z",
                            text=False).split(b"\0", 1)[0]).removeprefix("worktree ")
@@ -690,13 +721,24 @@ def main():
                 for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
                     git(repo, "update-index", flag, "-z", "--stdin", env=env,
                         input=b"\0".join(flagged) + b"\0", text=False)
-            staged = git(repo, "diff", "--cached", "--name-only", candidate, "--", env=env)
-            changed = set(git(repo, "diff", "--name-only", "-z", candidate, "--", env=env,
-                              text=False).split(b"\0")) - {b""}
+            staged = set(git(repo, "diff", "--cached", "--ignore-submodules=none", "--name-only", "-z", candidate, "--",
+                             env=env, text=False).split(b"\0")) - {b""}
+            changes = git(repo, "diff", "--raw", "--no-renames", "--ignore-submodules=none", "-z",
+                          candidate, "--", env=env, text=False).split(b"\0")
+            changed, structural = set(), set()
+            for header, path in zip(changes[::2], changes[1::2]):
+                changed.add(path)
+                old_mode, new_mode = header.split()[:2]
+                if old_mode[1:] != new_mode or b"160000" in (old_mode[1:], new_mode):
+                    structural.add(path)
             # Some committed blobs look dirty even in a fresh checkout. Accept
-            # those only when their bytes and modes match checkout conversion.
-            if staged or (changed and checkout_mismatches(repo, paths=changed)):
-                parser.error("commit first: verifier requires tracked files to match HEAD")
+            # those only when their bytes match checkout conversion. Git judges
+            # source mode changes and gitlinks; full permissions/hardlink counts
+            # are slot checks, not conditions on the user's working tree.
+            dirty = staged or structural or (changed and checkout_mismatches(repo, paths=changed, source=True))
+            if dirty:
+                parser.error("commit first: verifier requires tracked files to match HEAD: "
+                             + ", ".join(os.fsdecode(path) for path in sorted(dirty)))
         untracked = [os.fsdecode(path) for path in git(
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
         if args.before:

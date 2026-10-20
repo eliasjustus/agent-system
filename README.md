@@ -117,6 +117,8 @@ from its resolved Git common directory. Main trees, linked worktrees, symlinks a
 `--repo` paths share one pool; different repositories with the same name do not. No Agent System
 entry is required. Verifiers require Linux (the lease guard uses `prctl`). Each repository has
 **3 slots**, using up to three built trees of disk space.
+Repositories using `extensions.refStorage=reftable` bypass the pool and create one fresh session
+worktree per requested checkout, removed at session end; they do not retain warm build output.
 Before each use, a slot is reset to the detached candidate and cleaned of tracked edits and
 untracked files, including nested repositories. Slot resets and content checks run with Git hooks
 disabled, including relative `core.hooksPath` hooks. Ignored build output remains warm. Source working

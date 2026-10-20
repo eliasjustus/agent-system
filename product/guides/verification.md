@@ -8,9 +8,12 @@ Commit before verification. The launcher refuses staged or unstaged tracked chan
 the committed HEAD captured when it starts. Untracked files stay out of the checkout and are named
 in the header: a forgotten file must fail. When the header names untracked source files left out
 and your checks pass, say so in your answer. Check `Snapshot commit:` against the brief's candidate.
-Pool checkouts are reset before use; ignored build output remains warm. After an environment-looking
-failure, the verifier reports it and recommends an orchestrator rerun with `--clean-checkout`, keeping
-both results. Custom build scripts may reuse stale ignored output, so establish which build actually ran.
+Pool checkouts are reset before use; ignored build output remains warm.
+Ignored files may come from earlier sessions; if a check depends on one other than build output the
+check itself produces, ask the orchestrator for a rerun with `--clean-checkout`.
+After an environment-looking failure, the verifier reports it and recommends an orchestrator rerun
+with `--clean-checkout`, keeping both results. Custom build scripts may reuse stale ignored output,
+so establish which build actually ran.
 
 Use the cheapest real environment that exercises the behavior: the running service over its real
 interface, a real browser for a component, a real repository or filesystem. A narrower environment
