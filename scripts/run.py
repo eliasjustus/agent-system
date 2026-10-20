@@ -8,6 +8,8 @@ if sys.version_info < (3, 13):
 import argparse
 from collections import deque
 from datetime import datetime, timezone
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,62 @@ import tempfile
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
+POOL_SLOTS = 3
+POOL_USES = 20
+BUILD_INPUTS = {
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.lock", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
+    "pdm.lock", "pylock.toml", "gradle.lockfile", "gradle-wrapper.properties",
+    "gradle.properties", "settings.gradle", "settings.gradle.kts",
+    "build.gradle", "build.gradle.kts", "libs.versions.toml",
+    ".nvmrc", ".node-version", ".tool-versions", ".python-version",
+}
+
+# This supervisor, outside systemd-run, owns the inherited leases. Linux's
+# subreaper keeps even double-forked children attached to it if the launcher dies.
+# Do not pass the descriptors to the agent: programs routinely close extra fds.
+LEASE_GUARD = r'''
+import ctypes, os, signal, subprocess, sys
+launcher = int(sys.argv[4])
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0):
+    raise OSError(ctypes.get_errno(), "cannot become lease subreaper")
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+def kill_children(pid):
+    try:
+        children = open(f"/proc/{pid}/task/{pid}/children").read().split()
+    except FileNotFoundError:
+        return
+    for child in children:
+        kill_children(int(child))
+        try:
+            os.kill(int(child), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+try:
+    process = subprocess.Popen(sys.argv[5:])
+    code = process.wait()
+finally:
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    # Reap orphaned descendants too. Repeat because killing a child may adopt
+    # its children. The locks stay held until there are no children left.
+    while True:
+        kill_children(os.getpid())
+        try:
+            os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+    if os.getppid() != launcher:
+        import pathlib, runpy, shutil
+        helpers = runpy.run_path(sys.argv[1])
+        helpers["cleanup_worktrees"](pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
+        shutil.rmtree(sys.argv[3], ignore_errors=True)
+sys.exit(code if code >= 0 else 128 - code)
+'''
 
 
 def git(repo, *args, env=None, input=None, text=True):
@@ -85,7 +143,7 @@ def cleanup_worktrees(repo, session):
         cleanup_failed(f"session worktrees under {session}", error)
 
 
-def stop_session(unit, process):
+def stop_session(unit, process, guarded=False):
     if unit:
         try:
             result = subprocess.run(["systemctl", "--user", "stop", unit],
@@ -97,7 +155,10 @@ def stop_session(unit, process):
             cleanup_failed(f"scope {unit}", error)
     if process is not None and (not unit or process.poll() is None):
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if guarded:
+                process.terminate()  # The supervisor stops and reaps all descendants.
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except OSError as error:
@@ -213,6 +274,91 @@ def review_leave_out(repo, private, head, snapshot):
             if any(name == entry or name.startswith(entry + "/") for name in files)]
 
 
+def check_checkout(work, commit):
+    if (git(work, "rev-parse", "HEAD") != commit
+            or git(work, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
+            or git(work, "status", "--porcelain", "--ignored=no")):
+        raise ValueError("checkout is not clean and detached at the candidate")
+
+
+def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    main = os.fsdecode(git(repo, "worktree", "list", "--porcelain", "-z",
+                           text=False).split(b"\0", 1)[0]).removeprefix("worktree ")
+    key = hashlib.sha256(os.fsencode(common)).hexdigest()[:12]
+    pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
+    pool.mkdir(parents=True, exist_ok=True)
+    for number in range(1, POOL_SLOTS + 1):
+        slot = pool / f"slot-{number}"
+        lock = (pool / f"slot-{number}.lock").open("a+b")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            continue
+        leases.append(lock)
+        metadata = pool / f"slot-{number}.json"
+        reason = ""
+        try:
+            previous = json.loads(metadata.read_text())
+            if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
+                    or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])):
+                raise ValueError("invalid metadata")
+        except (OSError, ValueError, KeyError, TypeError):
+            previous = {"uses": 0, "commit": ""}
+            reason = "missing or corrupt metadata"
+        if force_clean:
+            reason = "--clean-checkout"
+        elif previous["uses"] >= POOL_USES:
+            reason = f"{POOL_USES} uses"
+        elif previous["commit"]:
+            try:
+                changed = git(repo, "diff", "--no-renames", "--name-only", "-z",
+                              previous["commit"], commit, text=False).split(b"\0")
+                if any(Path(os.fsdecode(path)).name in BUILD_INPUTS
+                       or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
+                       or os.fsdecode(path).endswith(".lockfile") for path in changed if path):
+                    reason = "lockfile or toolchain changed"
+            except subprocess.CalledProcessError:
+                reason = "missing previous commit"
+        # Absence is an interrupted-reset marker, including when checkout hooks fail.
+        metadata.unlink(missing_ok=True)
+        try:
+            registered = git(repo, "worktree", "list", "--porcelain", "-z", text=False)
+            if (b"worktree " + os.fsencode(slot.resolve()) + b"\0" not in registered
+                    or slot.is_symlink() or not slot.is_dir()
+                    or Path(git(slot, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve() != common):
+                raise ValueError("missing checkout or registration")
+            if previous["commit"] != git(slot, "rev-parse", "HEAD"):
+                reason = reason or "checkout differs from metadata"
+            git(slot, "-c", "core.sparseCheckout=false", "checkout", "--force", "--detach", commit)
+            git(slot, "clean", "-ffd" + ("x" if reason else ""))
+            check_checkout(slot, commit)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            reason = (reason + "; " if reason else "") + f"recreated ({error})"
+            try:
+                cleanup_worktrees(repo, slot)
+                if slot.is_symlink():
+                    slot.unlink()
+                elif slot.exists():
+                    shutil.rmtree(slot)
+                cleanup_worktrees(repo, slot)
+                git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(slot), commit)
+                check_checkout(slot, commit)
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                cleanup_worktrees(repo, slot)
+                git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(fresh), commit)
+                check_checkout(fresh, commit)
+                return fresh, "pool slot broken; fresh session worktree"
+        metadata.with_suffix(".json.tmp").write_text(json.dumps({
+            "uses": 1 if reason else previous["uses"] + 1, "commit": commit}))
+        metadata.with_suffix(".json.tmp").replace(metadata)
+        return slot, f"pool {slot}; " + (f"deep clean: {reason}" if reason else "warm reset")
+    git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(fresh), commit)
+    check_checkout(fresh, commit)
+    return fresh, "pool busy; fresh session worktree"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True, choices=("builder", "investigator", "verifier", "challenger", "reviewer"))
@@ -225,6 +371,9 @@ def main():
     parser.add_argument("--private", default=DEFAULT_PRIVATE)
     parser.add_argument("--full-checkout", action="store_true",
                         help="include all paths even when a review leave-out list is configured")
+    parser.add_argument("--before", help="lease a second verifier checkout at this commit")
+    parser.add_argument("--clean-checkout", action="store_true",
+                        help="deep-clean verifier checkouts, including ignored build output")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--writable", action="append", default=[], type=Path, metavar="DIR")
     parser.add_argument("--network", action="store_true")
@@ -232,6 +381,8 @@ def main():
     parser.add_argument("--method", default=local if (local / "roles").is_dir()
                         else Path("~/.local/share/agent-method"), type=Path)
     args = parser.parse_args()
+    if (args.before or args.clean_checkout) and args.role != "verifier":
+        parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
         parser.error("--network is allowed for only builder and verifier roles")
     if args.network and args.family != "codex":
@@ -252,6 +403,22 @@ def main():
     brief = args.brief.expanduser().read_text()
     private = Path(args.private).expanduser().resolve()
     repo, out = args.repo.expanduser().resolve(), args.out.expanduser().resolve()
+    candidate, before_commit, untracked = "", "", []
+    if args.role == "verifier":
+        try:
+            repo = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+            candidate = git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+        except subprocess.CalledProcessError:
+            parser.error("commit first: verifier requires a committed candidate")
+        # Check both paths: the index may differ even if the worktree matches HEAD.
+        # --no-optional-locks prevents an index refresh in the source repository.
+        if (git(repo, "diff", "--name-only", candidate, "--")
+                or git(repo, "diff", "--cached", "--name-only", candidate, "--")):
+            parser.error("commit first: verifier requires tracked files to match HEAD")
+        untracked = [os.fsdecode(path) for path in git(
+            repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
+        if args.before:
+            before_commit = git(repo, "rev-parse", "--verify", args.before + "^{commit}")
     roots = [path.expanduser().resolve() for path in args.writable]
     for path in roots:
         if (path in (Path("/"), Path.home().resolve()) or path.is_relative_to(private)
@@ -283,7 +450,9 @@ def main():
                    if restricted else "user configuration")
     start, snapshot, code = utc(), "", 1
     skipped = []
-    checkout_note = ""
+    checkout_note, before_note = "", ""
+    before = None
+    leases = []
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     if not cache.is_absolute():
         cache = Path.home() / ".cache"
@@ -320,7 +489,17 @@ def main():
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         try:
             cwd = repo
-            if review:
+            if args.role == "verifier":
+                snapshot = candidate
+                work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout)
+                checkout_note = "Checkout: " + note
+                if before_commit:
+                    before, note = lease_checkout(repo, cache, before_commit, temp / "before", leases,
+                                                  args.clean_checkout)
+                    before_note = f"Before checkout: {before} ({before_commit}); {note}"
+                    prompt += "\n" + before_note + "\nUse this writable checkout for the before state.\n"
+                cwd = work
+            elif review:
                 env = dict(os.environ, GIT_INDEX_FILE=str(temp / "index"))
                 try:
                     head = git(repo, "rev-parse", "--verify", "-q", "HEAD")
@@ -355,9 +534,12 @@ def main():
                     env.setdefault(f"GIT_{kind}_EMAIL", "snapshot@localhost")
                 snapshot = git(repo, "commit-tree", tree, *(["-p", head] if head else []),
                                env=env, input="Review snapshot\n")
+                git_only = args.family == "codex"
                 leave_out = (review_leave_out(repo, private, head, snapshot)
-                             if args.role in ("challenger", "reviewer") and not args.full_checkout else [])
-                if args.full_checkout and args.role in ("challenger", "reviewer"):
+                             if not git_only and not args.full_checkout else [])
+                if git_only:
+                    checkout_note = "Checkout: Git-only (root AGENTS.md and CLAUDE.md)"
+                elif args.full_checkout:
                     checkout_note = "Checkout: full (--full-checkout)"
                 elif leave_out:
                     base = head or git(repo, "hash-object", "-t", "tree", "--stdin", input="")
@@ -372,11 +554,15 @@ def main():
                         leave_out = []
                     else:
                         checkout_note = f"Checkout: left-out paths {leave_out!r}"
-                if leave_out:
+                if leave_out or git_only:
                     git(repo, "worktree", "add", "--no-checkout", "--detach", str(work), snapshot)
                     git(work, "read-tree", snapshot)
-                    omitted = git(work, "--literal-pathspecs", "ls-files", "-z", "--",
-                                  *leave_out, text=False)
+                    if git_only:
+                        omitted = b"\0".join(path for path in git(work, "ls-files", "-z", text=False).split(b"\0")
+                                             if path and path not in (b"AGENTS.md", b"CLAUDE.md")) + b"\0"
+                    else:
+                        omitted = git(work, "--literal-pathspecs", "ls-files", "-z", "--",
+                                      *leave_out, text=False)
                     git(work, "update-index", "-z", "--skip-worktree", "--stdin",
                         input=omitted, text=False)
                     git(work, "checkout-index", "-a")
@@ -388,6 +574,9 @@ def main():
                     git(repo, "worktree", "add", "--detach", str(work), snapshot)
                 if checkout_note:
                     prompt += "\n" + checkout_note + "\n"
+                if git_only:
+                    prompt += (f"Read the code through Git: `git show {snapshot}:<path>`, "
+                               f"`git grep <pattern> {snapshot}` and `git diff`.\n")
                 if leave_out:
                     hint = f" (`git show {snapshot}:<path>`)" if args.family == "codex" else ""
                     prompt += (f"These paths are absent from the file system but present in Git{hint}. "
@@ -410,6 +599,7 @@ def main():
                            "-s", "workspace-write" if writable else "read-only",
                            "-C", str(cwd), "-o", str(answer)]
                 for path in [*roots, *([source] if args.role == "verifier" else []),
+                             *([before] if before else []),
                              *([temporary] if writable else [])]:
                     command += ["--add-dir", str(path)]
                 if args.network:
@@ -446,6 +636,8 @@ def main():
                            tools, "--tools", tools, "--strict-mcp-config"]
                 if args.role == "verifier":
                     command += ["--add-dir", str(source)]
+                    if before:
+                        command += ["--add-dir", str(before)]
                 if writable:
                     command += ["--add-dir", str(temporary)]
             if unit:
@@ -453,11 +645,15 @@ def main():
                            "--slice=agents.slice", f"--unit={unit}", "--", *command]
             else:
                 print("systemd-run unavailable; running without a scope", file=sys.stderr)
+            if leases:
+                command = [sys.executable, "-c", LEASE_GUARD, str(Path(__file__).resolve()),
+                           str(repo), str(temp), str(os.getpid()), *command]
             with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with out.with_suffix(".log").open("ab" if restricted else "wb") as log:
                     process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
-                                               stderr=log, env=agent_env, start_new_session=True)
+                                               stderr=log, env=agent_env, start_new_session=True,
+                                               pass_fds=tuple(lock.fileno() for lock in leases))
                 try:
                     process.communicate(prompt.encode(), timeout=args.timeout)
                     code = process.returncode
@@ -473,7 +669,7 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
-            stop_session(unit, process)
+            stop_session(unit, process, guarded=bool(leases))
             try:
                 answer_bytes = answer.read_bytes() if answer.exists() else b""
                 if not answer_bytes.decode("utf-8", errors="replace").strip():
@@ -496,6 +692,10 @@ def main():
                           f"Scope: {unit or 'none'}\n"
                           + (f"Snapshot commit: {snapshot}\n" if review else "")
                           + (checkout_note + "\n" if checkout_note else "")
+                          + (before_note + "\n" if before_note else "")
+                          + ("Untracked files left out: " + ", ".join(ascii(path) for path in untracked[:20])
+                             + (f"; {len(untracked) - 20} more" if len(untracked) > 20 else "") + "\n"
+                             if args.role == "verifier" else "")
                           + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
                           + f"Write bytes: {writes}\nStart UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 out.parent.mkdir(parents=True, exist_ok=True)
@@ -513,6 +713,8 @@ def main():
             finally:
                 cleanup_worktrees(repo, temp)
     finally:
+        for lock in leases:
+            lock.close()
         try:
             session.cleanup()
         except OSError as error:

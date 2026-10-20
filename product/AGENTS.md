@@ -43,7 +43,8 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
 1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build.
 2. Above the floor, agree the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
-   the rules. Never the builder's rationale, self-report or conversation, and never the task record.
+   the rules. Commit the candidate before verifying; untracked files are excluded and named by
+   the launcher. Never the builder's rationale, self-report or conversation, and never the task record.
 4. A check of new or repaired behavior fails before the change, for the reason under test, and
    passes after it and on a known-good version where one exists. Preservation checks pass before
    and after. A skipped, unavailable or merely
@@ -82,7 +83,8 @@ counterexample you tried; if you edited it yourself, a verifier still checks it.
 - **Builder:** Codex for settled, well-specified work; Claude for work that still needs judgment.
 - **Verifier, challenger, reviewer:** always from the other model family than the author of what
   they check: the builder for code, you for scenarios, designs and documents. Each runs in its own
-  session on its own checkout. Where only one family is available, use a separate session and say
+  session on its own committed checkout for verification; Codex challengers and reviewers read
+  their snapshot through Git. Where only one family is available, use a separate session and say
   that independence comes only from that.
 - **Investigator:** research, analysis or a design draft that changes nothing; either family.
 

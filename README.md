@@ -87,11 +87,12 @@ from Node or network access. Without it, the user's network configuration applie
 `--writable ~/.gradle` for a build cache. These permissions are independent: `--network` does not
 open extra directories. There is no full-access option because these cover the known needs.
 
-Review roles run on a snapshot of committed, staged and uncommitted files, including untracked
-files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
+Challengers and reviewers run on a snapshot of committed, staged and uncommitted files, including
+untracked files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
 the answer's header. Check that list before trusting a review. The answer and its header are saved
 at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
-folder. Empty answers fail. Temporary session folders and worktrees are removed after the run.
+folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
+verifier pool slots remain for reuse.
 The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
@@ -104,7 +105,52 @@ reached the disk, and is `unavailable` when `/proc/self/io` cannot be read or pa
 tmpfs folder add nothing; writes elsewhere, such as Git objects in the repository, still count. It
 misses daemons, descendants that no parent waited for, and saving the answer and cleanup.
 
-To reduce checkout writes for challengers and reviewers, keep an optional
+Verifiers test the commit that HEAD names when the launcher starts. Commit before verifying:
+staged or unstaged tracked changes, including conflicts, refuse the session before a checkout is
+leased. Untracked files of any size stay in the source tree and are omitted from the verifier's
+checkout; the header names at most 20, then reports the remaining count. A forgotten file must fail
+verification. `Snapshot commit:` records the committed candidate, even if the builder commits again.
+
+Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repository hash>/`,
+where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash
+from its resolved Git common directory. Main trees, linked worktrees, symlinks and subdirectory
+`--repo` paths share one pool; different repositories with the same name do not. No Agent System
+entry is required. Each repository has **3 slots**, using up to three built trees of disk space.
+Before each use, a slot is reset to the detached candidate and cleaned of tracked edits and
+untracked files, including nested repositories. Ignored build output remains warm. Source working
+files, index, branches and config stay untouched.
+
+Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
+path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
+$TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
+use the same pool. When all slots are busy, the launcher creates a temporary session worktree
+and says `pool busy` in the header. Session cleanup never removes a pool checkout.
+
+Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
+runs count), when a lockfile or toolchain/build definition changes in either direction, and with
+verifier-only `--clean-checkout`. The fixed list covers npm/yarn/pnpm, Cargo, Gradle (including
+wrapper properties and lockfiles), Go, Python requirements/uv/poetry and toolchain pins. Counts
+survive restarts. Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
+are recreated, with a fresh session worktree as a fallback. The header says whether a reset was
+warm or deep and why. Pool reset writes count in `Write bytes:`.
+
+Gradle and Cargo incremental builds must notice deleted source files; the tests exercise this with
+a still-referenced deleted Java class and Rust module. Custom build scripts may reuse stale ignored
+output incorrectly. Retry with `--clean-checkout` after an environment-looking failure and report
+both results; a warm pass alone cannot establish that a custom build is correct. No shared Rust
+compile cache (sccache) is configured.
+
+A Linux subreaper supervisor holds the pool locks outside systemd-run, stops and waits for the
+agent's descendants, and releases locks only after they are gone. If the launcher is killed, the
+supervisor keeps its leases, reaps descendants and removes the orphaned session folder. This does
+not rely on systemd-run forwarding file descriptors. Pool supervision requires Linux.
+
+Codex challengers and reviewers read the snapshot through `git show <snapshot>:<path>`,
+`git grep <pattern> <snapshot>` and `git diff`. Only root `AGENTS.md` and `CLAUDE.md`, if present,
+are materialized; the index is clean and the post-checkout hook is skipped. `--full-checkout` does
+not change this Codex behavior. Builders and investigators keep their existing checkout behavior.
+
+For **Claude** challengers and reviewers, keep an optional
 `<private>/projects/<id>/review-leave-out.txt` beside the project's private records. The launcher
 gets the ID from the first line of `AGENTS.md` in `--repo` and uses its default private root or
 `--private`. A subdirectory `--repo` without its own `AGENTS.md` gets a full checkout. Setup never
@@ -120,10 +166,9 @@ Listed paths remain in Git but are absent from the checkout. The prompt and answ
 them; agents should say if their checks need those paths. If the snapshot changes a listed path,
 the launcher uses a full checkout and explains why. A review of committed changes already on HEAD
 is not detected by this fallback: pass `--full-checkout` when the reviewed range touches listed
-paths. Also use `--full-checkout` whenever a check needs all files; it skips reading the list.
+paths. Also use `--full-checkout` whenever a Claude check needs all files; it skips reading the list.
 A checkout with left-out paths skips the Git post-checkout hook. If Git checks out the listed
-paths anyway, the launcher reports a full checkout. Builder, investigator and verifier sessions
-always keep their usual checkout behavior.
+paths anyway, the launcher reports a full checkout.
 
 Shielding prevents accidental leaks of the private root into briefs and through Claude's own file
 tools. It is not a security boundary: Codex sessions can read the private folder, and a writable
@@ -140,7 +185,8 @@ Start a fresh session of the other model family in that checkout. Give it the ap
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
 evidence. Remove the checkout with `git worktree remove /path/to/checkout` after checking.
-Uncommitted or untracked candidates go through `run.py` to capture the exact snapshot.
+Commit the candidate before verification. Uncommitted work may go through `run.py` for a
+challenger or reviewer snapshot.
 
 ## Environment
 
@@ -151,7 +197,7 @@ Uncommitted or untracked candidates go through `run.py` to capture the exact sna
 | `AGENT_CODEX_EFFORT` | Codex reasoning effort; default `high`. Values pass through to the CLI, which rejects unsupported values. |
 | `AGENT_CLAUDE_CMD` | Claude executable name or path; default `claude` |
 | `AGENT_CODEX_CMD` | Codex executable name or path; default `codex` |
-| `XDG_CACHE_HOME` | Session cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `am/<8 random characters>/` beneath it. |
+| `XDG_CACHE_HOME` | Session and pool cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `am/<8 random characters>/` beneath it. |
 
 Set the model variable when running setup to change generated Claude builder definitions; rerun
 setup for each project to update its copy. Command variables take a single executable, without
@@ -175,14 +221,28 @@ python3 scripts/setup.py --project /path/to/project --id my-project
 ```
 
 Include your custom `--private` and `--method` on both commands if you used them. Private records
-are kept. To roll back, check out the previous release tag in this clone and rerun setup for each
+are kept. Upgrading creates pool slots lazily; existing session caches need no migration.
+To inspect a pool, read its `slot-*.json` files (commit and use count), run
+`git -C /path/to/project worktree list`, and inspect its size with
+`du -sh <cache>/am-pool/<name>-<hash>`. To remove a repository's pool safely, first stop its launcher
+sessions and wait for their agents and supervisors to finish, including orphaned sessions. Then
+remove each registered slot with
+`git -C /path/to/project worktree remove --force --force <pool>/slot-N` before deleting that
+repository's pool folder. For a deleted slot folder, the same remove command usually clears its
+registration; if it fails, remove only the matching entry under the common Git directory's
+`worktrees/` whose `gitdir` names that slot. Do not prune unrelated worktrees. Never delete or
+replace a live slot's `.lock` file. Check that the pool registrations are gone before deleting
+its lock and metadata files.
+
+To roll back, stop current sessions, remove their pool with the procedure above, check out the previous release tag in this clone and rerun setup for each
 project with those same arguments.
 
 To remove the method from a project, remove its generated `AGENTS.md` and
 `.claude/agents/builder.md`, the `/.claude/agents/builder.md` line from Git's `info/exclude`, and any
 `@AGENTS.md` line you added. Once no project uses the shared method folder and no session is
 running, remove the method folder and delete only the session folder `<cache>/am/` from the
-cache. Private records stay unless you delete them.
+cache. Remove each repository pool using the procedure above too. Private records stay unless
+you delete them.
 
 ## Platforms
 

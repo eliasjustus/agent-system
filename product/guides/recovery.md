@@ -11,8 +11,10 @@ Write down in a few lines: expected and observed behavior, which candidate and c
 run, the original output, and the next question. First establish whether the behavior under test
 actually ran. Then classify it: implementation defect, invalid check, environment failure, unclear
 intent or unknown. Prefer one small observation that separates the explanations over another broad
-run. Compare with the before state in a shared clone inside $TMPDIR that writes nothing into the
-source repository, never by stashing or reverting.
+run. For a verifier, compare with the `--before` checkout named by the launcher, or a shared clone
+inside $TMPDIR that writes nothing into the source repository, never by stashing or reverting.
+After an environment-looking failure in a warm checkout, retry with `--clean-checkout` and keep both
+results; do not silently count the retry as proof about the original failure.
 
 ## Correct a check only on evidence
 
