@@ -293,6 +293,77 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertIn("warm reset", self.out.read_text())
         self.assert_session_cleaned(second)
 
+    def test_POOL_R5_populated_submodules_are_emptied_without_shared_state_changes(self):
+        # git-submodule and Git's submodule status need system utilities too.
+        self.env["PATH"] += os.pathsep + os.environ["PATH"]
+        module = self.base / "module"
+        subprocess.check_call(["git", "init", "-q", str(module)], env=self.env)
+        (module / "content").write_text("submodule content")
+        (module / ".gitignore").write_text("ignored\noutside-link\n")
+        for args in (("add", "."), ("commit", "-qm", "submodule baseline")):
+            subprocess.check_call(["git", "-C", str(module), *args], env=self.env)
+        path = "vendor/sub module"
+        subprocess.check_call([
+            "git", "-C", str(self.repo), "-c", "protocol.file.allow=always",
+            "submodule", "add", "-q", str(module), path], env=self.env)
+        self.git("commit", "-qam", "add submodule")
+        self.agent_extra(f'''
+record["submodule_entries"] = sorted(p.name for p in (cwd / {path!r}).iterdir())
+record["status"] = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        first = self.verifier()
+        slot = Path(first["cwd"])
+        self.assertEqual(first["submodule_entries"], [])
+        fresh = self.base / "fresh"
+        self.git("worktree", "add", "--quiet", "--detach", str(fresh), "HEAD")
+        self.assertEqual(list((fresh / path).iterdir()), [])
+
+        def shared_state():
+            modules = self.repo / ".git/modules"
+            return ((self.repo / ".git/config").read_bytes(),
+                    {str(p.relative_to(modules)): p.read_bytes()
+                     for p in modules.rglob("*") if p.is_file()})
+
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                subprocess.check_call([
+                    "git", "-C", str(slot), "-c", "protocol.file.allow=always",
+                    "submodule", "update", "--init", "--quiet", "--", path], env=self.env)
+                self.assertEqual((slot / path / "content").read_text(), "submodule content")
+                outside = self.base / "outside-submodule"
+                outside.mkdir(exist_ok=True)
+                (outside / "keep").write_text("untouched")
+                (slot / path / "outside-link").unlink(missing_ok=True)
+                (slot / path / "outside-link").symlink_to(outside, target_is_directory=True)
+                (slot / path / "ignored").write_text("ignored content")
+                before = shared_state()
+                record = self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual(record["cwd"], str(slot))
+                self.assertEqual(record["submodule_entries"], [])
+                self.assertEqual(record["status"], "")
+                self.assertEqual((outside / "keep").read_text(), "untouched")
+                self.assertEqual(shared_state(), before)
+                self.assertIn("--clean-checkout" if clean else "warm reset", self.out.read_text())
+
+        for kind in ("symlink", "embedded-git-directory", "missing"):
+            with self.subTest(gitlink=kind):
+                shutil.rmtree(slot / path)
+                if kind == "symlink":
+                    (slot / path).symlink_to(outside, target_is_directory=True)
+                elif kind == "embedded-git-directory":
+                    (slot / path / ".git").mkdir(parents=True)
+                    (slot / path / ".git/leftover").write_text("private module state")
+                before = shared_state()
+                record = self.verifier()
+                self.assertEqual(record["cwd"], str(slot))
+                self.assertFalse((slot / path).is_symlink())
+                self.assertEqual(record["submodule_entries"], [])
+                self.assertEqual(record["status"], "")
+                self.assertEqual((outside / "keep").read_text(), "untouched")
+                self.assertEqual(shared_state(), before)
+                self.assertIn("warm reset", self.out.read_text())
+
     def poisoned_flag_checkout(self, flag):
         slot = Path(self.verifier()["cwd"])
         for clean in (False, True):
@@ -459,7 +530,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 config = (self.repo / ".git/config").read_bytes()
                 self.assertEqual(self.verifier()["cwd"], str(slot))
                 if kind == "private":
-                    self.assertTrue(attributes.exists(), "slot-private info/attributes is not read by Git")
+                    self.assertFalse(attributes.exists(), "slot-private admin state must be cleared")
                 self.assert_slot_bytes_match_fresh(slot)
                 self.assertEqual((self.repo / ".git/config").read_bytes(), config)
 
@@ -1188,6 +1259,258 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.assertFalse((slot / "ignored").exists())
                     self.assertIn("deep clean: Cargo executable source removed", self.out.read_text())
 
+    def test_POOL_R10_01_gitdir_points_to_main_preserves_source(self):
+        slot = Path(self.verifier()["cwd"])
+        (slot / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
+        protected = [path for path in self.repo.rglob("*") if path.is_file()
+                     and not path.is_relative_to(self.repo / ".git/worktrees")]
+        before = {path: path.read_bytes() for path in protected}
+        record = self.verifier()
+        self.assertEqual(record["cwd"], str(slot))
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        self.assertIn("recreated", self.out.read_text())
+
+    def test_POOL_R10_02_relative_hooks_disabled_on_reset_and_content_check(self):
+        self.git("config", "core.hooksPath", ".githooks")
+        slot = Path(self.verifier()["cwd"])
+        hooks = slot / ".githooks"
+        hooks.mkdir()
+        marker = self.base / "hook-ran"
+        for name in ("post-checkout", "post-index-change"):
+            hook = hooks / name
+            hook.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n')
+            hook.chmod(0o755)
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse(marker.exists())
+        self.assertFalse(hooks.exists())
+
+    def test_POOL_R10_01_registration_must_point_back_to_slot(self):
+        slot = Path(self.verifier()["cwd"])
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            text=True, env=self.env).strip())
+        # A slot can point at a valid sibling's admin directory. Both halves of
+        # the registration must identify this slot, not just the common repo.
+        sibling = self.base / "sibling"
+        self.git("worktree", "add", "--detach", str(sibling), "HEAD")
+        sibling_git = (sibling / ".git").read_bytes()
+        (slot / ".git").write_bytes(sibling_git)
+        sibling_admin = Path(subprocess.check_output(
+            ["git", "-C", str(sibling), "rev-parse", "--absolute-git-dir"], text=True, env=self.env).strip())
+        protected = {path: path.read_bytes() for root in (sibling, sibling_admin)
+                     for path in root.rglob("*") if path.is_file()}
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertEqual({path: path.read_bytes() for path in protected}, protected)
+        self.assertEqual((admin / "gitdir").read_text().strip(), str(slot / ".git"))
+        self.assertIn("recreated", self.out.read_text())
+
+    def test_POOL_R10_03_committed_crlf_under_lf_attributes_stays_warm(self):
+        (self.repo / "tracked").write_bytes(b"committed\r\n")
+        self.git("add", "tracked")
+        self.git("commit", "-qm", "CRLF blob")
+        (self.repo / ".gitattributes").write_text("* text eol=lf\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "LF attributes without renormalizing blobs")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("warm build")
+        before = (slot / "ignored").stat()
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        after = (slot / "ignored").stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        self.assertEqual((slot / "tracked").read_bytes(), b"committed\r\n")
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+        self.assertIn("warm reset", self.out.read_text())
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R10_03_checkout_failure_is_plain_and_cleans_session(self):
+        self.busy_pool()
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def broken_status(command, *args, **kwargs):
+    result = original(command, *args, **kwargs)
+    if "status" in command:
+        return b"? unexpected\\0" if kwargs.get("text") is False else "?? unexpected"
+    return result
+subprocess.check_output = broken_status
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Session failed: checkout is not clean", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
+
+    def current_umask(self):
+        umask = os.umask(0)
+        os.umask(umask)
+        return umask
+
+    def test_POOL_R10_04_permissions_and_hardlinks_match_fresh_checkout(self):
+        (self.repo / "executable").write_text("exit 0\n")
+        (self.repo / "executable").chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-qm", "executable fixture")
+        slot = Path(self.verifier()["cwd"])
+        for mode in (0o444, 0o600):
+            for name in ("tracked", "executable"):
+                with self.subTest(mode=oct(mode), name=name):
+                    (slot / name).chmod(mode)
+                    self.verifier()
+                    self.assertEqual((slot / name).stat().st_mode & 0o777,
+                                     (0o777 if name == "executable" else 0o666) & ~self.current_umask())
+        outside = self.base / "hardlink"
+        outside.hardlink_to(slot / "tracked")
+        before = outside.read_bytes(), outside.stat().st_ino
+        self.verifier()
+        self.assertEqual((slot / "tracked").stat().st_nlink, 1)
+        self.assertNotEqual((slot / "tracked").stat().st_ino, outside.stat().st_ino)
+        self.assertEqual((outside.read_bytes(), outside.stat().st_ino), before)
+        previous_umask = os.umask(0o027)
+        try:
+            self.verifier()
+            self.assertEqual((slot / "tracked").stat().st_mode & 0o777, 0o640)
+            self.assertEqual((slot / "executable").stat().st_mode & 0o777, 0o750)
+        finally:
+            os.umask(previous_umask)
+
+    def test_POOL_R10_06_admin_state_is_removed(self):
+        self.git("config", "extensions.worktreeConfig", "true")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("warm output")
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            text=True, env=self.env).strip())
+        for name in ("ORIG_HEAD", "FETCH_HEAD", "logs/old", "refs/worktree/private",
+                     "refs/bisect/private", "refs/rewritten/private", "info/attributes", "config.worktree"):
+            path = admin / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("[core]\nignoreStat = true\n" if name == "config.worktree"
+                            else self.git("rev-parse", "HEAD") + "\n")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertEqual((slot / "ignored").read_text(), "warm output")
+        for name in ("ORIG_HEAD", "FETCH_HEAD", "index.lock", "logs/old", "refs", "info", "config.worktree"):
+            self.assertFalse((admin / name).exists(), name)
+
+    def test_POOL_R10_06_stale_index_lock_is_removed_without_recreation(self):
+        slot = Path(self.verifier()["cwd"])
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            text=True, env=self.env).strip())
+        (admin / "index.lock").touch()
+        (slot / "ignored").write_text("warm output")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse((admin / "index.lock").exists())
+        self.assertTrue((slot / "ignored").exists(), "stale lock must not require recreation")
+        self.assertEqual((slot / "ignored").read_text(), "warm output")
+
+    def test_POOL_R10_07_symlinked_parent_never_writes_outside_slot(self):
+        (self.repo / "dir").mkdir()
+        (self.repo / "dir/file").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "nested fixture")
+        slot = Path(self.verifier()["cwd"])
+        external = self.base / "external"
+        external.mkdir()
+        (external / "file").write_text("outside")
+        before = (external / "file").read_bytes(), (external / "file").stat().st_ino
+        shutil.rmtree(slot / "dir")
+        (slot / "dir").symlink_to(external, target_is_directory=True)
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertEqual(((external / "file").read_bytes(), (external / "file").stat().st_ino), before)
+        self.assertFalse((slot / "dir").is_symlink())
+        self.assertEqual((slot / "dir/file").read_text(), "candidate")
+        self.assertIn("recreated", self.out.read_text())
+
+    def test_POOL_R10_08_untracked_source_previously_tracked_cleans_stale_output(self):
+        (self.repo / "forgotten").write_text("needed source")
+        self.git("add", "forgotten")
+        self.git("commit", "-qm", "other lane tracks the source")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("old output that could hide forgotten source")
+        self.git("rm", "--cached", "forgotten")
+        self.git("commit", "-qm", "candidate forgot to track source")
+        self.verifier()
+        self.assertFalse((slot / "ignored").exists())
+        self.assertFalse((slot / "forgotten").exists())
+        self.assertEqual((self.repo / "forgotten").read_text(), "needed source")
+        self.assertIn("untracked source file was previously tracked", self.out.read_text())
+
+    def test_POOL_R10_09_unchanged_index_stat_data_survives_reset(self):
+        self.verifier()
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def check_index(command, *args, **kwargs):
+    if "read-tree" in command:
+        probe = command[:command.index("read-tree")] + ["ls-files", "--debug"]
+        index = original(probe, text=True)
+        assert index and "ctime: 0:0" not in index and "mtime: 0:0" not in index, index
+    return original(command, *args, **kwargs)
+subprocess.check_output = check_index
+''')
+        self.verifier()
+
+    def test_POOL_R10_10_before_prompt_uses_supplied_checkout(self):
+        record = self.verifier("codex", "--before", "HEAD")
+        self.assertIn("Use this writable checkout for the before state", record["stdin"])
+        self.assertNotIn("create before or known-good checkouts", record["stdin"])
+        self.assertIn("create known-good checkouts", record["stdin"])
+        record = self.verifier()
+        self.assertIn("create before or known-good checkouts", record["stdin"])
+
+    def test_POOL_R10_10_unusable_slots_are_named_in_fallback(self):
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def broken_slot(command, *args, **kwargs):
+    if "checkout" in command and any("/slot-" in str(arg) for arg in command):
+        raise subprocess.CalledProcessError(1, command)
+    return original(command, *args, **kwargs)
+subprocess.check_output = broken_slot
+''')
+        record = self.verifier()
+        self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
+        self.assertIn("pool busy or slots unusable", self.out.read_text())
+
+    def test_POOL_R10_11_reset_git_child_keeps_lock_after_launcher_sigkill(self):
+        (self.repo / ".gitattributes").write_text("tracked filter=blocked\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "smudge filter fixture")
+        slot = Path(self.verifier()["cwd"])
+        ready = self.base / "reset-child-ready"
+        release = self.base / "reset-child-release"
+        smudge = self.base / "blocked-smudge.py"
+        smudge.write_text(
+            "import os, pathlib, sys, time\n"
+            f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+            f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.02)\n"
+            "sys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+        self.git("config", "filter.blocked.smudge", shlex.join([sys.executable, str(smudge)]))
+        (slot / "tracked").write_text("force Git checkout to run the smudge filter")
+        process = self.start_launcher()
+        # Unblock the real Git checkout even if an assertion fails. The
+        # launcher pipes stay open until Git and the filter have exited.
+        self.addCleanup(release.touch)
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        process.kill()
+        process.wait(timeout=5)
+        with slot.with_suffix(".lock").open("a+b") as lock:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release.touch()
+            process.communicate(timeout=5)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail("reset Git child did not release the lease")
+                    time.sleep(0.02)
+        self.assertFalse(slot.with_suffix(".json").exists())
+
     def test_POOL_S8_broken_slots_recover_without_consuming_capacity(self):
         record = self.verifier()
         slot = Path(record["cwd"])
@@ -1223,7 +1546,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertFalse((slot / "ignored").exists())
                 self.assertEqual(json.loads(metadata.read_text())["uses"], 1)
 
-    def test_POOL_S8_checkout_hook_failure_recreates_and_interrupted_reset_deep_cleans(self):
+    def test_POOL_S8_checkout_hooks_are_disabled_and_interrupted_reset_deep_cleans(self):
         slot = Path(self.verifier()["cwd"])
         hook = self.repo / ".git/hooks/post-checkout"
         marker = self.base / "failed-hook"
@@ -1231,8 +1554,8 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                         'if not p.exists():\n    p.touch()\n    raise SystemExit(1)\n')
         hook.chmod(0o755)
         self.verifier()
-        self.assertTrue(marker.exists())
-        self.assertIn("deep clean: recreated", self.out.read_text())
+        self.assertFalse(marker.exists())
+        self.assertIn("warm reset", self.out.read_text())
         self.inject_launcher('''
 import os, signal, subprocess
 original = subprocess.check_output

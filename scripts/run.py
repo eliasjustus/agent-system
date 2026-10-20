@@ -8,6 +8,7 @@ if sys.version_info < (3, 13):
 import argparse
 from collections import deque
 from datetime import datetime, timezone
+from functools import partial
 import fcntl
 import hashlib
 import json
@@ -27,7 +28,7 @@ POOL_SLOTS = 3
 POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
-                   "-c", "index.sparse=false")
+                   "-c", "index.sparse=false", "-c", "core.hooksPath=/dev/null")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -92,9 +93,9 @@ sys.exit(code if code >= 0 else 128 - code)
 '''
 
 
-def git(repo, *args, env=None, input=None, text=True):
+def git(repo, *args, env=None, input=None, text=True, pass_fds=()):
     result = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG, *args],
-                                     env=env, input=input, text=text)
+                                     env=env, input=input, text=text, pass_fds=pass_fds)
     return result.strip() if text else result.rstrip(b"\n")
 
 
@@ -293,18 +294,26 @@ def review_leave_out(repo, private, head, snapshot):
             if any(name == entry or name.startswith(entry + "/") for name in files)]
 
 
-def check_checkout(work, commit):
-    if (git(work, "rev-parse", "HEAD") != commit
-            or git(work, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
-            or git(work, *CHECKOUT_CONFIG, "status", "--porcelain", "--ignored=no", "--untracked-files=all",
-                   "--ignore-submodules=none")):
+def check_checkout(work, commit, pass_fds=()):
+    run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
+    # Status can report tracked files modified even immediately after a fresh
+    # checkout (e.g. committed CRLF under eol=lf). Raw content is checked below
+    # by checkout_mismatches; status judges only untracked files and submodules.
+    status = run("status", "--porcelain=v2", "-z", "--ignored=no", "--untracked-files=all",
+                 "--ignore-submodules=none", text=False).split(b"\0")
+    dirty = any(entry.startswith(b"? ") or (
+        entry.startswith((b"1 ", b"2 ", b"u ")) and entry.split(b" ", 3)[2] != b"N...")
+        for entry in status)
+    if (run("rev-parse", "HEAD") != commit
+            or run("rev-parse", "--abbrev-ref", "HEAD") != "HEAD" or dirty):
         raise ValueError("checkout is not clean and detached at the candidate")
 
 
-def checkout_mismatches(work):
+def checkout_mismatches(work, pass_fds=()):
     """Check raw content and Git modes without refreshing or writing the tree."""
+    run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
     entries = []
-    for entry in git(work, "ls-files", "--stage", "-z", text=False).split(b"\0"):
+    for entry in run("ls-files", "--stage", "-z", text=False).split(b"\0"):
         if entry:
             info, path = entry.split(b"\t", 1)
             mode, blob, stage = info.split()
@@ -312,23 +321,28 @@ def checkout_mismatches(work):
                 raise ValueError("unmerged checkout index")
             if mode != b"160000":  # Submodules are checked by status, not as blobs.
                 entries.append((path, mode, blob))
-    symlinks = git(work, "config", "--type=bool", "--default=true", "--get", "core.symlinks") == "true"
+    symlinks = run("config", "--type=bool", "--default=true", "--get", "core.symlinks") == "true"
+    umask = os.umask(0)
+    os.umask(umask)
     mismatches = []
     literal = {path for path, mode, _ in entries if mode == b"120000"}
     regular = []
     for path, mode, blob in entries:
         file = work / os.fsdecode(path)
         try:
-            actual = file.lstat().st_mode
+            info = file.lstat()
+            actual = info.st_mode
         except FileNotFoundError:
             mismatches.append(path)
             continue
-        if mode == b"120000" and symlinks:
-            if not stat.S_ISLNK(actual) or git(work, "hash-object", "--stdin",
+        if info.st_nlink > 1:
+            mismatches.append(path)
+        elif mode == b"120000" and symlinks:
+            if not stat.S_ISLNK(actual) or run("hash-object", "--stdin",
                     input=os.fsencode(os.readlink(file)), text=False) != blob:
                 mismatches.append(path)
         elif (not stat.S_ISREG(actual)
-              or bool(actual & 0o111) != (mode == b"100755")):
+              or stat.S_IMODE(actual) != ((0o777 if mode == b"100755" else 0o666) & ~umask)):
             mismatches.append(path)
         else:
             regular.append((path, blob))
@@ -338,7 +352,7 @@ def checkout_mismatches(work):
     quoted = b"".join(b'"' + b"".join(
         bytes([byte]) if 32 <= byte < 127 and byte not in (34, 92)
         else f"\\{byte:03o}".encode() for byte in path) + b'"\n' for path, _ in regular)
-    hashes = git(work, "hash-object", "--no-filters", "--stdin-paths",
+    hashes = run("hash-object", "--no-filters", "--stdin-paths",
                  input=quoted, text=False).splitlines()
     if len(hashes) != len(regular):
         raise ValueError("incomplete checkout content check")
@@ -346,12 +360,12 @@ def checkout_mismatches(work):
     # attributes change. LF output is an identity conversion; CRLF, ident,
     # encodings and filters may change even those otherwise matching blobs.
     paths = b"\0".join(path for path, _ in regular) + b"\0"
-    attrs = git(work, "check-attr", "--all", "-z", "--stdin", input=paths, text=False).split(b"\0")
+    attrs = run("check-attr", "--all", "-z", "--stdin", input=paths, text=False).split(b"\0")
     attributes = {}
     for i in range(0, len(attrs) - 2, 3):
         attributes.setdefault(attrs[i], {})[attrs[i + 1]] = attrs[i + 2]
-    autocrlf = git(work, "config", "--type=bool-or-str", "--default=false", "--get", "core.autocrlf")
-    eol = git(work, "config", "--default=native", "--get", "core.eol").lower()
+    autocrlf = run("config", "--type=bool-or-str", "--default=false", "--get", "core.autocrlf")
+    eol = run("config", "--default=native", "--get", "core.eol").lower()
     for (path, blob), raw in zip(regular, hashes):
         if path in literal:  # core.symlinks=false checks out the literal link target.
             if raw != blob:
@@ -369,8 +383,8 @@ def checkout_mismatches(work):
         # Use a single-object response: batch --filters reports the ORIGINAL
         # blob size, so arbitrary converted binary output cannot be framed by it.
         content = subprocess.check_output([
-            "git", "--no-optional-locks", "-C", str(work), *GIT_CONFIG,
-            "cat-file", "--filters", "--path=" + os.fsdecode(path), blob.decode()])
+            "git", "--no-optional-locks", "-C", str(work), *GIT_CONFIG, *CHECKOUT_CONFIG,
+            "cat-file", "--filters", "--path=" + os.fsdecode(path), blob.decode()], pass_fds=pass_fds)
         digest = hashlib.new("sha1" if len(blob) == 40 else "sha256")
         digest.update(b"blob " + str(len(content)).encode() + b"\0")
         digest.update(content)
@@ -396,66 +410,100 @@ def remove_checkout_tree(path):
     shutil.rmtree(path, onexc=writable_retry)
 
 
-def reset_checkout(work, commit, deep_clean):
-    admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
-    # This belongs only to the slot. Previous agents can leave filters, excludes,
-    # hooks or fsmonitor commands here, not just sparse-checkout settings.
-    (admin / "config.worktree").unlink(missing_ok=True)
-    worktree_config = git(work, "config", "--type=bool", "--default=false", "--get",
-                         "extensions.worktreeConfig") == "true"
-    if worktree_config:
-        # Only write the slot's config, never the repository's shared config.
-        for setting in ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse"):
-            git(work, "config", "--worktree", setting, "false")
-    (admin / "info/sparse-checkout").unlink(missing_ok=True)
-    for state in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_AUTOSTASH", "AUTO_MERGE",
-                  "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "SQUASH_MSG",
-                  "rebase-merge", "rebase-apply", "sequencer",
-                  *(path.name for path in admin.glob("BISECT_*"))):
-        path = admin / state
+def check_checkout_parents(work, paths, missing_ok=False):
+    checked = {work}
+    for raw in paths:
+        parent = work
+        for part in Path(os.fsdecode(raw)).parts[:-1]:
+            parent /= part
+            if parent in checked:
+                continue
+            try:
+                mode = parent.lstat().st_mode
+            except FileNotFoundError:
+                if missing_ok:
+                    break
+                raise
+            if not stat.S_ISDIR(mode):
+                raise ValueError("checkout path has a non-directory parent")
+            checked.add(parent)
+
+
+def reset_checkout(work, commit, deep_clean, pass_fds=()):
+    run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
+    common = Path(run("rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    admin = Path(run("rev-parse", "--absolute-git-dir"))
+    # Check both directions before touching any Git state. A slot's .git can
+    # have been replaced with a pointer to the user's main Git directory.
+    if (admin.parent != common / "worktrees" or admin.is_symlink()
+            or admin.resolve() != admin
+            or (admin / "gitdir").read_bytes().removesuffix(b"\n") != os.fsencode(work / ".git")):
+        raise ValueError("checkout Git directory is not its own worktree registration")
+    # Everything else is private state from a previous session: operation
+    # state, config, attributes, refs, reflogs and locks. Keep the index's stat
+    # data so unchanged files need not be rehashed by checkout.
+    for path in admin.iterdir():
+        if path.name in ("HEAD", "commondir", "gitdir", "locked"):
+            continue
+        if path.name == "index" and path.is_file() and not path.is_symlink() and path.stat().st_nlink == 1:
+            continue
         if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
+            remove_checkout_tree(path)
         else:
-            path.unlink(missing_ok=True)
-    # Rebuild from the OLD committed tree first: even an index deletion of a
-    # now-ignored file must be restored so checkout can remove it. A new index
-    # also discards skip-worktree, assume-unchanged and staged state.
-    index = Path(git(work, "rev-parse", "--path-format=absolute", "--git-path", "index"))
-    index.unlink(missing_ok=True)
-    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", "HEAD")
+            path.unlink()
+    # Restore the OLD committed tree in the index first, including staged
+    # deletions of paths that the new candidate ignores. Preserve stat data
+    # for unchanged entries, but discard all assume-unchanged/skip-worktree bits.
+    flagged = [entry[2:] for entry in run("ls-files", "-v", "-z", text=False).split(b"\0")
+               if entry and (entry[:1] == b"S" or entry[:1].islower())]
+    if flagged:
+        for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
+            run("update-index", flag, "-z", "--stdin", input=b"\0".join(flagged) + b"\0", text=False)
+    run("-c", "core.ignorestat=false", "read-tree", "--reset", "HEAD")
     # Ignore rules left by an agent must not shield other untracked files.
     # Include ignored attributes too, before refresh or checkout reads them.
-    for raw in git(work, *CHECKOUT_CONFIG, "ls-files", "--others", "-z", "--",
-                   ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
-                   text=False).split(b"\0"):
-        if raw:
-            (work / os.fsdecode(raw)).unlink()
-    # Refresh stat data without writing working files. Git's clean filters can
-    # hide raw byte differences; checkout_mismatches checks those separately.
-    refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
-                              *GIT_CONFIG, *CHECKOUT_CONFIG,
-                              "-c", "core.ignorestat=false", "update-index", "--refresh"],
-                             capture_output=True)
-    if refresh.returncode not in (0, 1):
-        refresh.check_returncode()
-    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "checkout", "-q", "--force", "--detach", commit)
-    mismatches = checkout_mismatches(work)
+    leftovers = [raw for raw in run("ls-files", "--others", "-z", "--",
+                 ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
+                 text=False).split(b"\0") if raw]
+    check_checkout_parents(work, leftovers)
+    for raw in leftovers:
+        (work / os.fsdecode(raw)).unlink()
+    # Reject symlinked parents before Git or a repair can write through them.
+    # Missing directories are safe for checkout to create.
+    paths = run("ls-files", "-z", text=False).split(b"\0")
+    check_checkout_parents(work, [raw for raw in paths if raw], missing_ok=True)
+    run("-c", "core.ignorestat=false", "checkout", "-q", "--force", "--detach", commit)
+    # Fresh worktrees have empty gitlink directories. Empty populated modules
+    # directly: submodule deinit would change the shared repository config.
+    gitlinks = [entry.split(b"\t", 1)[1] for entry in
+                run("ls-files", "--stage", "-z", text=False).split(b"\0")
+                if entry.startswith(b"160000 ")]
+    check_checkout_parents(work, gitlinks, missing_ok=True)
+    for raw in gitlinks:
+        path = work / os.fsdecode(raw)
+        if path.is_dir() and not path.is_symlink():
+            remove_checkout_tree(path)
+        else:
+            path.unlink(missing_ok=True)
+        path.mkdir(parents=True)
+    mismatches = checkout_mismatches(work, pass_fds)
     if mismatches:
+        check_checkout_parents(work, mismatches)
         for raw in mismatches:
             path = work / os.fsdecode(raw)
             if path.is_dir() and not path.is_symlink():
                 remove_checkout_tree(path)
             else:
                 path.unlink(missing_ok=True)
-        git(work, *CHECKOUT_CONFIG, "checkout-index", "--index", "--force", "-z", "--stdin",
+        run("checkout-index", "--index", "--force", "-z", "--stdin",
             input=b"\0".join(mismatches) + b"\0", text=False)
-        if checkout_mismatches(work):
+        if checkout_mismatches(work, pass_fds):
             raise ValueError("checkout bytes or modes differ from candidate")
-    git(work, *CHECKOUT_CONFIG, "-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
-    check_checkout(work, commit)
+    run("-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
+    check_checkout(work, commit, pass_fds)
 
 
-def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
+def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     main = os.fsdecode(git(repo, "worktree", "list", "--porcelain", "-z",
                            text=False).split(b"\0", 1)[0]).removeprefix("worktree ")
@@ -497,13 +545,16 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                     reason = (reason + "; " if reason else "") + "Cargo manifest changed"
                 removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
                               previous["commit"], commit, text=False).split(b"\0")
+                if set(removed) & {os.fsencode(path) for path in untracked}:
+                    reason = (reason + "; " if reason else "") + "untracked source file was previously tracked"
                 if any(Path(os.fsdecode(path)).name == "main.rs"
                        or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
                     reason = (reason + "; " if reason else "") + "Cargo executable source removed"
             except subprocess.CalledProcessError:
                 reason = "missing previous commit"
-        # Absence is an interrupted-reset marker, including when checkout hooks fail.
+        # Absence is an interrupted-reset marker.
         metadata.unlink(missing_ok=True)
+        pass_fds = tuple(lease.fileno() for lease in leases)
         try:
             registered = git(repo, "worktree", "list", "--porcelain", "-z", text=False)
             if (b"worktree " + os.fsencode(slot.resolve()) + b"\0" not in registered
@@ -512,7 +563,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                 raise ValueError("missing checkout or registration")
             if previous["commit"] != git(slot, "rev-parse", "HEAD"):
                 reason = reason or "checkout differs from metadata"
-            reset_checkout(slot, commit, bool(reason))
+            reset_checkout(slot, commit, bool(reason), pass_fds)
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             reason = (reason + "; " if reason else "") + f"recreated ({error})"
             try:
@@ -522,8 +573,8 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                 elif slot.exists():
                     remove_checkout_tree(slot)
                 cleanup_worktrees(repo, slot)
-                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit)
-                reset_checkout(slot, commit, True)
+                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit, pass_fds=pass_fds)
+                reset_checkout(slot, commit, True, pass_fds)
             except (OSError, ValueError, subprocess.CalledProcessError):
                 cleanup_worktrees(repo, slot)
                 leases.remove(lock)
@@ -535,7 +586,9 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
         return slot, f"pool {slot}; " + (f"deep clean: {reason}" if reason else "warm reset")
     git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
     check_checkout(fresh, commit)
-    return fresh, "pool busy; fresh session worktree"
+    if checkout_mismatches(fresh):
+        raise ValueError("fresh checkout bytes or modes differ from candidate")
+    return fresh, "pool busy or slots unusable; fresh session worktree"
 
 
 def main():
@@ -613,8 +666,12 @@ def main():
                 for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
                     git(repo, "update-index", flag, "-z", "--stdin", env=env,
                         input=b"\0".join(flagged) + b"\0", text=False)
-            if (git(repo, "diff", "--name-only", candidate, "--", env=env)
-                    or git(repo, "diff", "--cached", "--name-only", candidate, "--", env=env)):
+            staged = git(repo, "diff", "--cached", "--name-only", candidate, "--", env=env)
+            changed = set(git(repo, "diff", "--name-only", "-z", candidate, "--", env=env,
+                              text=False).split(b"\0")) - {b""}
+            # Some committed blobs look dirty even in a fresh checkout. Accept
+            # those only when their bytes and modes match checkout conversion.
+            if staged or (changed and changed.intersection(checkout_mismatches(repo))):
                 parser.error("commit first: verifier requires tracked files to match HEAD")
         untracked = [os.fsdecode(path) for path in git(
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
@@ -695,11 +752,11 @@ def main():
             cwd = repo
             if args.role == "verifier":
                 snapshot = candidate
-                work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout)
+                work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout, untracked)
                 checkout_note = "Checkout: " + note
                 if before_commit:
                     before, note = lease_checkout(repo, cache, before_commit, temp / "before", leases,
-                                                  args.clean_checkout)
+                                                  args.clean_checkout, untracked)
                     before_note = f"Before checkout: {before} ({before_commit}); {note}"
                     prompt += "\n" + before_note + "\nUse this writable checkout for the before state.\n"
                 cwd = work
@@ -794,9 +851,11 @@ def main():
                 path.mkdir(parents=True, exist_ok=True)
             writable = args.role in ("builder", "verifier")
             if writable:
+                versions = "known-good" if before else "before or known-good"
+                extra = "known-good" if before else "before"
                 prompt += (f"\nTemporary folder: {temporary}; removed when the session ends; "
-                           "create before or known-good checkouts as shared clones inside it "
-                           "(git clone --quiet --shared --no-checkout . \"$TMPDIR/before\").\n")
+                           f"create {versions} checkouts as shared clones inside it "
+                           f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
             if args.family == "codex":
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
                 command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}",
@@ -865,7 +924,7 @@ def main():
                     code = 124
         except KeyboardInterrupt as error:
             code = 128 + (error.args[0] if error.args else signal.SIGINT)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             print(f"Session failed: {error}", file=sys.stderr)
             code = 127 if isinstance(error, FileNotFoundError) else 1
         finally:

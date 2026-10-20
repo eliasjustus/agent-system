@@ -6,7 +6,8 @@ Read by the orchestrator before sending the verifier, and given to the verifier 
 
 Commit before verification. The launcher refuses staged or unstaged tracked changes and tests only
 the committed HEAD captured when it starts. Untracked files stay out of the checkout and are named
-in the header: a forgotten file must fail. Check `Snapshot commit:` against the brief's candidate.
+in the header: a forgotten file must fail. When the header names untracked source files left out
+and your checks pass, say so in your answer. Check `Snapshot commit:` against the brief's candidate.
 Pool checkouts are reset before use; ignored build output remains warm. After an environment-looking
 failure, retry with `--clean-checkout` and keep both results. Custom build scripts may reuse stale
 ignored output, so establish which build actually ran.

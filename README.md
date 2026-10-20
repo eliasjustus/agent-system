@@ -118,14 +118,16 @@ from its resolved Git common directory. Main trees, linked worktrees, symlinks a
 entry is required. Verifiers require Linux (the lease guard uses `prctl`). Each repository has
 **3 slots**, using up to three built trees of disk space.
 Before each use, a slot is reset to the detached candidate and cleaned of tracked edits and
-untracked files, including nested repositories. Ignored build output remains warm. Source working
+untracked files, including nested repositories. Slot resets and content checks run with Git hooks
+disabled, including relative `core.hooksPath` hooks. Ignored build output remains warm. Source working
 files, index, branches and config stay untouched.
 
 Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
 path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
 $TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
 use the same pool. When all slots are busy, the launcher creates a full temporary checkout in a
-session worktree and says `pool busy` in the header. Session cleanup never removes a pool checkout.
+session worktree and says `pool busy or slots unusable` in the header. Session cleanup never removes
+a pool checkout.
 
 Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
 runs count), when a lockfile or toolchain/build definition changes in either direction, and with
@@ -134,7 +136,9 @@ wrapper properties and lockfiles), Go, Python requirements/uv/poetry and pyproje
 Gemfile.lock, composer.lock,
 flake.lock, bun.lock/bun.lockb and toolchain pins (including .java-version). Changes to any
 Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files and files under
-any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. Counts
+any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. A source file
+left untracked that was tracked in the slot's previous commit but is absent from the candidate also
+forces a deep clean, so stale output from another lane cannot hide that forgotten file. Counts
 survive restarts. Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
 are recreated, with a fresh session worktree as a fallback. The header says whether a reset was
 warm or deep and why. Pool reset writes count in `Write bytes:`.
@@ -152,8 +156,8 @@ A Linux subreaper supervisor holds the pool locks outside systemd-run, stops and
 agent's descendants, and releases locks only after they are gone. If the launcher is killed, the
 supervisor stops the agent and its descendants, keeps its leases until they are reaped, and removes
 the orphaned session folder. A launcher killed before its lease guard starts can leave its session
-folder under `<cache>/am`; the kernel releases its locks. This does not rely on systemd-run
-forwarding file descriptors. Pool supervision requires Linux.
+folder under `<cache>/am`; reset Git children inherit its locks and hold them until they exit.
+This does not rely on systemd-run forwarding file descriptors. Pool supervision requires Linux.
 
 Codex challengers and reviewers read the snapshot through `git show <snapshot>:<path>`,
 `git grep <pattern> <snapshot>` and `git diff`. Only root `AGENTS.md` and `CLAUDE.md`, if present,
