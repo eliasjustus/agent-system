@@ -126,7 +126,9 @@ files, index, branches and config stay untouched.
 Every reset removes FIFO/socket files and ignored symlinks whose resolved target is outside the
 slot, together with the top-level ignored folder containing such a link (a top-level link is
 removed itself). Targets are never removed. Internal dependency links, including dangling ones,
-stay warm. Files ignored only through the user's global `core.excludesFile` are removed every time;
+stay warm. Python virtual environments whose interpreter symlink points outside the slot are
+removed by this rule (including `.venv`) and must be rebuilt on every lease.
+Files ignored only through the user's global `core.excludesFile` are removed every time;
 projects should ignore build folders in their own `.gitignore` to keep them warm. A default ACL
 on a tracked directory is not reset; this is a known limit of checkout reuse.
 
@@ -268,6 +270,7 @@ Inspect all pool sizes with `du -sh <cache>/am-pool/*`. After stopping their ses
 delete pools whose repository is gone. If the repository still exists at a new path, remove its
 old pool and run `git -C /path/to/project worktree prune` there to clear the missing slots'
 registrations; check for unrelated stale registrations before pruning.
+Delete the old pool first: Git retains registrations while their checkout folders still exist.
 
 To roll back, stop current sessions, remove their pool with the procedure above, check out the previous release tag in this clone and rerun setup for each
 project with those same arguments.

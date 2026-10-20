@@ -1059,6 +1059,7 @@ sys.exit(9)
             self.assertIn(repr(name), line)
         self.assertNotIn(repr(names[20]), line)
         self.assertIn("4 more", line)
+        self.assertIn(line + "\n", json.loads(self.record.read_text())["stdin"])
         self.assertNotIn("Skipped untracked (>5 MB)", self.out.read_text())
         self.assertEqual({name: (self.repo / name).read_bytes() for name in names}, before)
         self.assertIn("FileNotFoundError", (self.out.parent / "answer-evidence/forgotten-file.txt").read_text())
@@ -1790,6 +1791,25 @@ subprocess.check_output = fail_remove
         self.assertIn("vendor/module", result.stderr)
         self.assertEqual((self.repo / ".git/index").read_bytes(), index)
 
+    def test_POOL_R14_reset_does_not_recurse_into_leftover_submodule(self):
+        self.env["PATH"] += os.pathsep + os.environ["PATH"]
+        module = self.base / "module"
+        subprocess.check_call(["git", "init", "-q", str(module)], env=self.env)
+        (module / "file").write_text("committed")
+        for args in (("add", "."), ("commit", "-qm", "module")):
+            subprocess.check_call(["git", "-C", str(module), *args], env=self.env)
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(module), "vendor/module")
+        self.git("commit", "-qam", "submodule")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("warm build")
+        (slot / "vendor/module/.git").write_text("broken leftover submodule")
+        self.git("config", "submodule.recurse", "true")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertIn("warm reset", self.out.read_text())
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+        self.assertEqual(list((slot / "vendor/module").iterdir()), [])
+        self.assertEqual(self.git("config", "submodule.recurse"), "true")
+
     def test_POOL_R13_removal_retry_preserves_external_hardlink_mode(self):
         slot = Path(self.verifier()["cwd"])
         external = self.base / "external-file"
@@ -1807,28 +1827,142 @@ subprocess.check_output = fail_remove
             if (slot / "ignored").exists():
                 (slot / "ignored").chmod(0o700)
 
+    def test_POOL_R14_guard_never_imports_candidate_or_ignored_modules_at_start(self):
+        marker = self.base / "slot-module-imported"
+        payload = (f"open({str(marker)!r}, 'w').write('unsafe import')\n"
+                   "raise RuntimeError('lease guard imported slot module')\n")
+        for committed in (True, False):
+            with self.subTest(committed=committed):
+                marker.unlink(missing_ok=True)
+                (self.repo / ".gitignore").write_text("ignored\nsignal.py\n")
+                module = self.repo / "signal.py"
+                if committed:
+                    module.write_text(payload)
+                    self.git("add", "-f", "signal.py")
+                else:
+                    self.git("rm", "-q", "signal.py")
+                self.git("add", ".gitignore")
+                self.git("commit", "-qm", "guard import fixture")
+                if not committed:
+                    # Ignored leftover files survive a warm reset.
+                    slot = Path(self.verifier()["cwd"])
+                    (slot / "signal.py").write_text(payload)
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assertFalse(marker.exists(), "guard imported signal.py from the slot")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if not committed:
+                    self.assertTrue((slot / "signal.py").exists(), "fixture must survive the warm reset")
+                    self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R14_orphan_guard_never_imports_candidate_or_agent_modules(self):
+        self.configure_scope(present=False)
+        self.addCleanup(self.kill_recorded_agents)
+        for committed in (True, False):
+            with self.subTest(committed=committed):
+                marker = self.base / f"orphan-import-{committed}"
+                payload = (f"open({str(marker)!r}, 'w').write('unsafe import')\n"
+                           "raise RuntimeError('orphan guard imported slot module')\n")
+                if committed:
+                    (self.repo / "shutil.py").write_text(payload)
+                    # The orphan must load the trusted launcher, never this file.
+                    (self.repo / "run.py").write_text(payload)
+                    self.git("add", ".")
+                else:
+                    self.git("rm", "-q", "shutil.py", "run.py")
+                self.git("commit", "-qm", "orphan import fixture")
+                self.env["SLOT_MODULE_PAYLOAD"] = payload
+                self.env["WRITE_SLOT_MODULES"] = "" if committed else "1"
+                self.agent_extra('''
+if os.environ["WRITE_SLOT_MODULES"]:
+    for name in ("shutil.py", "signal.py", "run.py"):
+        (cwd / name).write_text(os.environ["SLOT_MODULE_PAYLOAD"])
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()) + " " + str(child.pid))
+pathlib.Path(os.environ["RECORD"] + ".ready").touch()
+while True:
+    time.sleep(0.02)
+''')
+                record_path = self.base / f"orphan-{committed}.json"
+                process = self.start_launcher(record=record_path)
+                record = self.wait_agent_ready(record_path)
+                process.kill()
+                process.communicate(timeout=10)
+                with Path(record["cwd"]).with_suffix(".lock").open("a+b") as lock:
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                self.fail("orphan guard did not release the lease")
+                            time.sleep(0.02)
+                self.assertFalse(marker.exists(), "orphan guard imported code from the slot")
+                self.assertFalse(Path(record["tmpdir"]).parent.exists(), "orphan session was not cleaned")
+                pids = map(int, Path(str(record_path) + ".pids").read_text().split())
+                self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in pids))
+
+    def test_POOL_R14_verifier_prompt_matches_candidate_checkout_and_untracked_header(self):
+        candidate = self.git("rev-parse", "HEAD")
+        for family in ("codex", "claude"):
+            for untracked in (False, True):
+                with self.subTest(family=family, untracked=untracked):
+                    forgotten = self.repo / "forgotten file"
+                    if untracked:
+                        forgotten.write_text("left out")
+                    else:
+                        forgotten.unlink(missing_ok=True)
+                    record = self.verifier(family)
+                    header = self.out.read_text().split("\n\n", 1)[0]
+                    expected = [f"Snapshot commit: {candidate}",
+                                "Untracked files left out: " + ("'forgotten file'" if untracked else "none")]
+                    checkout = next(line for line in header.splitlines() if line.startswith("Checkout:"))
+                    self.assertIn("Checkout: pool ", checkout)
+                    for line in [*expected, checkout]:
+                        self.assertIn(line + "\n", record["stdin"])
+                        self.assertIn(line + "\n", header + "\n")
+
     def test_POOL_R13_guard_exits_cleanly_before_starting_agent(self):
         tree = ast.parse((ROOT / "scripts/run.py").read_text())
         guard = next(ast.literal_eval(node.value) for node in tree.body
                      if isinstance(node, ast.Assign) and any(
                          isinstance(target, ast.Name) and target.id == "LEASE_GUARD" for target in node.targets))
-        for early_exit in ("parent", "signal"):
+        for early_exit in ("parent", "signal", "repeated-signal", "missing-proc"):
             with self.subTest(early_exit=early_exit):
                 session = self.base / "guard-session"
                 session.mkdir(exist_ok=True)
                 prefix = ""
-                if early_exit == "signal":
+                if early_exit in ("signal", "repeated-signal"):
                     prefix = ("import os, signal, subprocess\n"
                               "def interrupted_popen(*args, **kwargs):\n"
                               "    os.kill(os.getpid(), signal.SIGTERM)\n"
                               "subprocess.Popen = interrupted_popen\n")
+                if early_exit == "repeated-signal":
+                    # Hit the window before all cleanup handlers become SIG_IGN.
+                    prefix += ("original_signal = signal.signal\n"
+                               "def second_signal(sig, handler):\n"
+                               "    if sig == signal.SIGTERM and handler == signal.SIG_IGN:\n"
+                               "        os.kill(os.getpid(), signal.SIGINT)\n"
+                               "    return original_signal(sig, handler)\n"
+                               "signal.signal = second_signal\n")
+                if early_exit == "missing-proc":
+                    prefix = ("import builtins\n"
+                              "original_open = builtins.open\n"
+                              "def missing_children(path, *args, **kwargs):\n"
+                              "    if str(path).startswith('/proc/') and str(path).endswith('/children'):\n"
+                              "        raise FileNotFoundError('test: proc children unavailable')\n"
+                              "    return original_open(path, *args, **kwargs)\n"
+                              "builtins.open = missing_children\n")
                 result = subprocess.run(
-                    [sys.executable, "-c", prefix + guard, str(ROOT / "scripts/run.py"),
-                     str(self.repo), str(session), str(os.getpid() if prefix else -1),
+                    [sys.executable, "-I", "-c", prefix + guard, str(ROOT / "scripts/run.py"),
+                     str(self.repo), str(session), str(os.getpid() if "signal" in early_exit else -1),
                      sys.executable, "-c", "raise RuntimeError('agent must not start')"],
                     env=self.env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 143, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+                if early_exit == "missing-proc":
+                    self.assertIn("Warning: cannot list lease guard children", result.stderr)
+                    self.assertIn("test: proc children unavailable", result.stderr)
 
     def test_POOL_R12_special_files_are_removed_on_warm_and_deep_resets(self):
         slot = Path(self.verifier()["cwd"])
@@ -3377,6 +3511,10 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                                      f"Read the code through Git: `git show {snapshot}:<path>`, "
                                      f"`git grep <pattern> {snapshot}` and `git diff`.\n")
                     if role == "verifier":
+                        header = self.out.read_text().split("\n\n", 1)[0]
+                        metadata = [next(line for line in header.splitlines() if line.startswith(prefix))
+                                    for prefix in ("Snapshot commit:", "Checkout:", "Untracked files left out:")]
+                        expected += "\n" + "\n".join(metadata) + "\n"
                         evidence = Path(record["tmpdir"]).parent / "evidence"
                         expected += (f"\nEvidence folder: {evidence}; "
                                      "only this folder is kept; nothing else in the session folder is kept.\n")

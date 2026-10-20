@@ -29,7 +29,7 @@ POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
                    "-c", "index.sparse=false", "-c", "core.hooksPath=/dev/null",
-                   "-c", "core.untrackedCache=false")
+                   "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -51,14 +51,19 @@ libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(36, 1, 0, 0, 0):
     raise OSError(ctypes.get_errno(), "cannot become lease subreaper")
 code = 143
+stopping = False
 def interrupted(signum, frame):
-    raise SystemExit(128 + signum)
+    global stopping
+    if not stopping:
+        stopping = True
+        raise SystemExit(128 + signum)
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, interrupted)
 def kill_children(pid):
     try:
         children = open(f"/proc/{pid}/task/{pid}/children").read().split()
-    except FileNotFoundError:
+    except OSError as error:
+        print(f"Warning: cannot list lease guard children for {pid}: {error}", file=sys.stderr, flush=True)
         return
     for child in children:
         kill_children(int(child))
@@ -76,6 +81,7 @@ try:
     process = subprocess.Popen(sys.argv[5:])
     code = process.wait()
 finally:
+    stopping = True
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
     # Reap orphaned descendants too. Repeat because killing a child may adopt
@@ -536,20 +542,14 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     check_checkout_parents(work, gitlinks, missing_ok=True)
     for raw in gitlinks:
         path = work / os.fsdecode(raw)
-        if path.is_dir() and not path.is_symlink():
-            remove_checkout_tree(path)
-        else:
-            path.unlink(missing_ok=True)
+        remove_checkout_tree(path)
         path.mkdir(parents=True)
     mismatches = checkout_mismatches(work, pass_fds)
     if mismatches:
         check_checkout_parents(work, mismatches)
         for raw in mismatches:
             path = work / os.fsdecode(raw)
-            if path.is_dir() and not path.is_symlink():
-                remove_checkout_tree(path)
-            else:
-                path.unlink(missing_ok=True)
+            remove_checkout_tree(path)
         run("checkout-index", "--index", "--force", "-z", "--stdin",
             input=b"\0".join(mismatches) + b"\0", text=False)
         if checkout_mismatches(work, pass_fds):
@@ -836,6 +836,11 @@ def main():
     start, snapshot, code = utc(), "", 1
     skipped = []
     checkout_note, before_note = "", ""
+    untracked_note = ""
+    if args.role == "verifier":
+        untracked_note = "Untracked files left out: " + (", ".join(ascii(path) for path in untracked[:20]) or "none")
+        if len(untracked) > 20:
+            untracked_note += f"; {len(untracked) - 20} more"
     before = None
     leases = []
     root = cache / "am"
@@ -875,6 +880,7 @@ def main():
                 snapshot = candidate
                 work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout, untracked)
                 checkout_note = "Checkout: " + note
+                prompt += f"\nSnapshot commit: {snapshot}\n{checkout_note}\n{untracked_note}\n"
                 if before_commit:
                     before, note = lease_checkout(repo, cache, before_commit, temp / "before", leases,
                                                   args.clean_checkout, untracked)
@@ -1030,7 +1036,7 @@ def main():
             else:
                 print("systemd-run unavailable; running without a scope", file=sys.stderr)
             if leases:
-                command = [sys.executable, "-c", LEASE_GUARD, str(Path(__file__).resolve()),
+                command = [sys.executable, "-I", "-c", LEASE_GUARD, str(Path(__file__).resolve()),
                            str(repo), str(temp), str(os.getpid()), *command]
             with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
@@ -1077,9 +1083,7 @@ def main():
                           + (f"Snapshot commit: {snapshot}\n" if review else "")
                           + (checkout_note + "\n" if checkout_note else "")
                           + (before_note + "\n" if before_note else "")
-                          + ("Untracked files left out: " + ", ".join(ascii(path) for path in untracked[:20])
-                             + (f"; {len(untracked) - 20} more" if len(untracked) > 20 else "") + "\n"
-                             if args.role == "verifier" else "")
+                          + (untracked_note + "\n" if untracked_note else "")
                           + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
                           + f"Write bytes: {writes}\nStart UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 out.parent.mkdir(parents=True, exist_ok=True)
