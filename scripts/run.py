@@ -24,6 +24,8 @@ import tempfile
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 POOL_SLOTS = 3
 POOL_USES = 20
+CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
+                   "-c", "index.sparse=false")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -59,6 +61,12 @@ def kill_children(pid):
         except ProcessLookupError:
             pass
 try:
+    # Arrange this after installing handlers, then close the race where the
+    # launcher died before prctl. Scope membership does not change ancestry.
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0):
+        raise OSError(ctypes.get_errno(), "cannot watch launcher death")
+    if os.getppid() != launcher:
+        raise SystemExit(143)
     process = subprocess.Popen(sys.argv[5:])
     code = process.wait()
 finally:
@@ -278,38 +286,48 @@ def review_leave_out(repo, private, head, snapshot):
 def check_checkout(work, commit):
     if (git(work, "rev-parse", "HEAD") != commit
             or git(work, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
-            or git(work, "status", "--porcelain", "--ignored=no")):
+            or git(work, *CHECKOUT_CONFIG, "-c", "status.showUntrackedFiles=all",
+                   "status", "--porcelain", "--ignored=no", "--untracked-files=all")):
         raise ValueError("checkout is not clean and detached at the candidate")
 
 
 def reset_checkout(work, commit, deep_clean):
     admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
+    # This belongs only to the slot. Previous agents can leave filters, excludes,
+    # hooks or fsmonitor commands here, not just sparse-checkout settings.
+    (admin / "config.worktree").unlink(missing_ok=True)
     worktree_config = git(work, "config", "--type=bool", "--default=false", "--get",
                          "extensions.worktreeConfig") == "true"
     if worktree_config:
         # Only write the slot's config, never the repository's shared config.
         for setting in ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse"):
             git(work, "config", "--worktree", setting, "false")
-    elif ((admin / "config.worktree").exists()
-          or git(work, "config", "--type=bool", "--default=false", "--get",
-                 "core.sparseCheckout") == "true"):
-        raise ValueError("sparse settings cannot be reset in the slot's own config")
     (admin / "info/sparse-checkout").unlink(missing_ok=True)
+    for state in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_AUTOSTASH", "AUTO_MERGE",
+                  "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "SQUASH_MSG",
+                  "rebase-merge", "rebase-apply", "sequencer",
+                  *(path.name for path in admin.glob("BISECT_*"))):
+        path = admin / state
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
     # Rebuild from the OLD committed tree first: even an index deletion of a
     # now-ignored file must be restored so checkout can remove it. A new index
     # also discards skip-worktree, assume-unchanged and staged state.
     index = Path(git(work, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     index.unlink(missing_ok=True)
-    git(work, "-c", "core.ignorestat=false", "read-tree", "HEAD")
+    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", "HEAD")
     # Refresh stat data without writing working files, preserving warm leases'
     # unchanged files. Exit 1 means modified files; checkout below restores them.
     refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
+                              *CHECKOUT_CONFIG,
                               "-c", "core.ignorestat=false", "update-index", "--refresh"],
                              capture_output=True)
     if refresh.returncode not in (0, 1):
         refresh.check_returncode()
-    git(work, "-c", "core.ignorestat=false", "checkout", "--force", "--detach", commit)
-    git(work, "clean", "-ffd" + ("x" if deep_clean else ""))
+    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "checkout", "--force", "--detach", commit)
+    git(work, *CHECKOUT_CONFIG, "clean", "-ffd" + ("x" if deep_clean else ""))
     check_checkout(work, commit)
 
 
@@ -380,18 +398,18 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                 elif slot.exists():
                     shutil.rmtree(slot)
                 cleanup_worktrees(repo, slot)
-                git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(slot), commit)
+                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit)
                 reset_checkout(slot, commit, True)
             except (OSError, ValueError, subprocess.CalledProcessError):
                 cleanup_worktrees(repo, slot)
-                git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(fresh), commit)
+                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
                 check_checkout(fresh, commit)
                 return fresh, "pool slot broken; fresh session worktree"
         metadata.with_suffix(".json.tmp").write_text(json.dumps({
             "uses": 1 if reason else previous["uses"] + 1, "commit": commit}))
         metadata.with_suffix(".json.tmp").replace(metadata)
         return slot, f"pool {slot}; " + (f"deep clean: {reason}" if reason else "warm reset")
-    git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(fresh), commit)
+    git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
     check_checkout(fresh, commit)
     return fresh, "pool busy; fresh session worktree"
 
@@ -458,6 +476,19 @@ def main():
             else:
                 Path(check.name).unlink()
                 git(repo, "read-tree", "--empty", env=env)
+            flagged = []
+            for entry in git(repo, "ls-files", "-v", "-z", env=env, text=False).split(b"\0"):
+                if not entry:
+                    continue
+                flag, path = entry[:1], entry[2:]
+                if (flag == b"S" or flag.islower()) and (
+                        flag.lower() != b"s" or os.path.lexists(repo / os.fsdecode(path))):
+                    flagged.append(path)
+            if flagged:
+                # Clear flags only in the copy. Absent sparse files stay skipped.
+                for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
+                    git(repo, "update-index", flag, "-z", "--stdin", env=env,
+                        input=b"\0".join(flagged) + b"\0", text=False)
             if (git(repo, "diff", "--name-only", candidate, "--", env=env)
                     or git(repo, "diff", "--cached", "--name-only", candidate, "--", env=env)):
                 parser.error("commit first: verifier requires tracked files to match HEAD")
@@ -465,6 +496,9 @@ def main():
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
         if args.before:
             before_commit = git(repo, "rev-parse", "--verify", args.before + "^{commit}")
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    if not cache.is_absolute():
+        cache = Path.home() / ".cache"
     roots = [path.expanduser().resolve() for path in args.writable]
     for path in roots:
         if (path in (Path("/"), Path.home().resolve()) or path.is_relative_to(private)
@@ -472,6 +506,9 @@ def main():
             parser.error(f"unsafe --writable root {path}: must not open home or the private folder")
         if args.role == "verifier" and (path.is_relative_to(repo) or repo.is_relative_to(path)):
             parser.error(f"unsafe --writable root {path}: must not open the verifier's repository")
+        if any(path.is_relative_to(root) or root.is_relative_to(path)
+               for root in ((cache / "am").resolve(), (cache / "am-pool").resolve())):
+            parser.error(f"unsafe --writable root {path}: must not open launcher sessions or checkout pools")
     private_forms = {args.private, str(Path(args.private).expanduser()), str(private)}
     if private.is_relative_to(Path.home()):
         private_forms.add("~/" + str(private.relative_to(Path.home())))
@@ -499,9 +536,6 @@ def main():
     checkout_note, before_note = "", ""
     before = None
     leases = []
-    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    if not cache.is_absolute():
-        cache = Path.home() / ".cache"
     root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)

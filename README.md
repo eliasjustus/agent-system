@@ -123,8 +123,8 @@ files, index, branches and config stay untouched.
 Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
 path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
 $TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
-use the same pool. When all slots are busy, the launcher creates a temporary session worktree
-and says `pool busy` in the header. Session cleanup never removes a pool checkout.
+use the same pool. When all slots are busy, the launcher creates a full temporary checkout in a
+session worktree and says `pool busy` in the header. Session cleanup never removes a pool checkout.
 
 Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
 runs count), when a lockfile or toolchain/build definition changes in either direction, and with
@@ -147,8 +147,9 @@ compile cache (sccache) is configured.
 
 A Linux subreaper supervisor holds the pool locks outside systemd-run, stops and waits for the
 agent's descendants, and releases locks only after they are gone. If the launcher is killed, the
-supervisor keeps its leases, reaps descendants and removes the orphaned session folder. This does
-not rely on systemd-run forwarding file descriptors. Pool supervision requires Linux.
+supervisor stops the agent and its descendants, keeps its leases until they are reaped, and removes
+the orphaned session folder. This does not rely on systemd-run forwarding file descriptors.
+Pool supervision requires Linux.
 
 Codex challengers and reviewers read the snapshot through `git show <snapshot>:<path>`,
 `git grep <pattern> <snapshot>` and `git diff`. Only root `AGENTS.md` and `CLAUDE.md`, if present,
@@ -238,6 +239,12 @@ registration; if it fails, remove only the matching entry under the common Git d
 `worktrees/` whose `gitdir` names that slot. Do not prune unrelated worktrees. Never delete or
 replace a live slot's `.lock` file. Check that the pool registrations are gone before deleting
 its lock and metadata files.
+
+Moved, renamed or deleted repositories leave pools that are never reclaimed automatically.
+Inspect all pool sizes with `du -sh <cache>/am-pool/*`. After stopping their sessions as above,
+delete pools whose repository is gone. If the repository still exists at a new path, remove its
+old pool and run `git -C /path/to/project worktree prune` there to clear the missing slots'
+registrations; check for unrelated stale registrations before pruning.
 
 To roll back, stop current sessions, remove their pool with the procedure above, check out the previous release tag in this clone and rerun setup for each
 project with those same arguments.

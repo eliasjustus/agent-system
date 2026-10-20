@@ -315,6 +315,96 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
     def test_POOL_S1_assume_unchanged_is_rebuilt_on_warm_and_deep_leases(self):
         self.poisoned_flag_checkout("--assume-unchanged")
 
+    def test_POOL_R1_slot_excludes_and_hidden_untracked_config_are_discarded(self):
+        self.git("config", "extensions.worktreeConfig", "true")
+        slot = Path(self.verifier()["cwd"])
+        excludes = self.base / "excludes"
+        excludes.write_text("leftover\n")
+        for key, value in (("core.excludesFile", str(excludes)), ("status.showUntrackedFiles", "no")):
+            subprocess.check_call(["git", "-C", str(slot), "config", "--worktree", key, value], env=self.env)
+        (slot / "leftover").touch()
+        (slot / "ignored").write_text("warm output")
+        common_config = (self.repo / ".git/config").read_bytes()
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse((slot / "leftover").exists())
+        self.assertEqual((slot / "ignored").read_text(), "warm output")
+        self.assertEqual((self.repo / ".git/config").read_bytes(), common_config)
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R1_slot_smudge_filter_cannot_change_candidate_bytes(self):
+        (self.repo / ".gitattributes").write_text("tracked filter=slot\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "filter attribute without a filter")
+        self.git("config", "extensions.worktreeConfig", "true")
+        slot = Path(self.verifier()["cwd"])
+        for kind, content in (("smudge", "poisoned"), ("clean", "original")):
+            command = shlex.join([sys.executable, "-c", f"import sys; sys.stdin.read(); sys.stdout.write({content!r})"])
+            subprocess.check_call(["git", "-C", str(slot), "config", "--worktree",
+                                   f"filter.slot.{kind}", command], env=self.env)
+        (slot / "tracked").unlink()
+        subprocess.check_call(["git", "-C", str(slot), "checkout", "--", "tracked"], env=self.env)
+        self.assertEqual((slot / "tracked").read_text(), "poisoned")
+        self.assertEqual(subprocess.check_output(["git", "-C", str(slot), "status", "--porcelain"],
+                                                env=self.env), b"")
+        record = self.verifier()
+        self.assertEqual(record["cwd"], str(slot))
+        self.assertEqual(record["changed"], "original")
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R1_slot_hooks_and_fsmonitor_do_not_run_during_reset(self):
+        self.git("config", "extensions.worktreeConfig", "true")
+        slot = Path(self.verifier()["cwd"])
+        hooks = self.base / "slot-hooks"
+        hooks.mkdir()
+        marker = self.base / "slot-command-ran"
+        script = f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n'
+        for name in ("post-checkout", "fsmonitor"):
+            (hooks / name).write_text(script)
+            (hooks / name).chmod(0o755)
+        for key, value in (("core.hooksPath", str(hooks)), ("core.fsmonitor", str(hooks / "fsmonitor"))):
+            subprocess.check_call(["git", "-C", str(slot), "config", "--worktree", key, value], env=self.env)
+        record = self.verifier()
+        self.assertEqual(record["cwd"], str(slot))
+        self.assertFalse(marker.exists(), "a command left by the previous slot user ran")
+
+    def test_POOL_R2_operation_state_is_cleared_on_every_reset(self):
+        slot = Path(self.verifier()["cwd"])
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            text=True, env=self.env).strip())
+        states = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "BISECT_START",
+                  "BISECT_TERMS", "rebase-merge", "rebase-apply", "sequencer")
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                for state in states:
+                    path = admin / state
+                    if state in ("rebase-merge", "rebase-apply", "sequencer"):
+                        path.mkdir(exist_ok=True)
+                        (path / "state").write_text("unfinished operation")
+                    else:
+                        path.write_text(self.git("rev-parse", "HEAD") + "\n")
+                (slot / "ignored").write_text("warm output")
+                self.assertEqual(self.verifier("codex", *(["--clean-checkout"] if clean else []))["cwd"], str(slot))
+                for state in states:
+                    self.assertFalse((admin / state).exists(), state)
+                self.assertEqual((slot / "ignored").exists(), not clean)
+
+    def test_POOL_R6_shared_sparse_config_uses_pool_without_recreation(self):
+        self.git("config", "core.sparseCheckout", "true")
+        self.git("config", "core.sparseCheckoutCone", "true")
+        (self.repo / ".git/info/sparse-checkout").write_text("/missing/\n")
+        config = (self.repo / ".git/config").read_bytes()
+        first = self.verifier()
+        slot = Path(first["cwd"])
+        self.assertTrue(slot.is_relative_to(self.pool_root()))
+        self.assertEqual(first["changed"], "original")
+        (slot / "ignored").write_text("warm output")
+        second = self.verifier()
+        self.assertEqual(second["cwd"], str(slot))
+        self.assertEqual(second["changed"], "original")
+        self.assertEqual((slot / "ignored").read_text(), "warm output")
+        self.assertIn("warm reset", self.out.read_text())
+        self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+
     def test_POOL_S1_sparse_checkout_is_disabled_on_warm_and_deep_leases(self):
         slot = Path(self.verifier()["cwd"])
         for clean in (False, True):
@@ -434,6 +524,35 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertIn("commit first", result.stderr)
         (self.repo / "tracked").write_text("original")
         self.verifier("codex", "--repo", sub)
+
+    def test_POOL_R3_flagged_source_edits_refuse_without_changing_source(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                self.git("update-index", flag, "tracked")
+                (self.repo / "tracked").write_text("hidden edit")
+                before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                          for p in self.repo.rglob("*") if p.is_file()}
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("commit first", result.stderr)
+                self.assertFalse(self.record.exists())
+                self.assertFalse((self.home / ".cache/am-pool").exists())
+                self.assertFalse((self.home / ".cache/am").exists())
+                self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns)
+                                  for p in self.repo.rglob("*") if p.is_file()}, before)
+                self.git("update-index", "--no-assume-unchanged", "tracked")
+                self.git("update-index", "--no-skip-worktree", "tracked")
+                (self.repo / "tracked").write_text("original")
+
+    def test_POOL_R3_absent_sparse_source_file_is_allowed_without_changing_index(self):
+        self.git("update-index", "--skip-worktree", "tracked")
+        (self.repo / "tracked").unlink()
+        index = self.repo / ".git/index"
+        before = index.read_bytes(), index.stat().st_mtime_ns
+        record = self.verifier()
+        self.assertEqual(record["changed"], "original")
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+        self.assertFalse((self.repo / "tracked").exists())
 
     def test_POOL_S3_stale_index_timestamps_never_write_source_index(self):
         index = self.repo / ".git/index"
@@ -751,12 +870,12 @@ subprocess.check_output = interrupt
         self.assertFalse((slot / "ignored").exists())
         self.assertIn("missing or corrupt metadata", self.out.read_text())
 
-    def test_POOL_S9_sigkilled_launcher_holds_slot_until_agent_and_detached_children_stop(self):
+    def test_POOL_R4_S9_sigkilled_launcher_stops_hung_agent_and_detached_children(self):
         for scope in (True, False):
             with self.subTest(scope=scope):
                 self.check_killed_launcher(scope)
 
-    def test_POOL_S9_real_systemd_scope_keeps_lease_after_launcher_is_killed(self):
+    def test_POOL_R4_S9_real_systemd_scope_stops_agent_after_launcher_is_killed(self):
         systemctl = shutil.which("systemctl")
         if not systemctl or not shutil.which("systemd-run"):
             self.skipTest("real systemd unavailable")
@@ -775,7 +894,7 @@ subprocess.check_output = interrupt
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
 pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()) + " " + str(child.pid))
 pathlib.Path(os.environ["RECORD"] + ".ready").touch()
-while not pathlib.Path(os.environ["RECORD"] + ".release").exists():
+while True:
     time.sleep(0.02)
 ''')
         self.addCleanup(self.kill_recorded_agents)
@@ -786,24 +905,30 @@ while not pathlib.Path(os.environ["RECORD"] + ".release").exists():
         session = Path(record["tmpdir"]).parent
         process.kill()
         process.wait(timeout=10)
-        with slot.with_suffix(".lock").open("a+b") as lock:
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # A live agent with its launcher gone must force another slot.
-        contender_record = self.base / f"contender-{scope}.json"
-        contender = self.start_launcher(record=contender_record, out=self.base / f"contender-{scope}.md")
-        other = self.wait_agent_ready(contender_record)
-        self.assertNotEqual(other["cwd"], record["cwd"])
-        contender.terminate()
-        contender.communicate(timeout=10)
-        Path(str(original_record) + ".release").touch()
-        process.communicate(timeout=10)
+        pids = list(map(int, Path(str(original_record) + ".pids").read_text().split()))
         deadline = time.monotonic() + 5
-        while session.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
+        released = False
+        with slot.with_suffix(".lock").open("a+b") as lock:
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in pids),
+                                    "lease released before agent and descendants were reaped")
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    if not session.exists():
+                        released = True
+                        break
+                time.sleep(0.02)
+        process.communicate(timeout=10)
         self.assertFalse(session.exists(), "orphan supervisor must clean the session")
-        for pid in map(int, Path(str(original_record) + ".pids").read_text().split()):
+        self.assertTrue(released, "orphan supervisor must release the slot")
+        for pid in pids:
             self.assertFalse(Path(f"/proc/{pid}").exists(), "descendant survived lease release")
+        with slot.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.agent_extra("")
         result = self.verifier()
         self.assertEqual(result["cwd"], record["cwd"])
@@ -1834,6 +1959,13 @@ subprocess.check_output = fail
     def test_LO_S12_readme_documents_list_override_and_hook(self):
         readme = (ROOT / "README.md").read_text()
         for phrase in ("review-leave-out.txt", "--full-checkout", "skips the Git post-checkout hook"):
+            self.assertIn(phrase, readme)
+
+    def test_POOL_R7_readme_documents_orphan_pool_cleanup_and_full_fallback(self):
+        readme = (ROOT / "README.md").read_text()
+        for phrase in ("full temporary checkout", "du -sh <cache>/am-pool/*",
+                       "Moved, renamed or deleted repositories", "never reclaimed automatically",
+                       "git -C /path/to/project worktree prune"):
             self.assertIn(phrase, readme)
 
     def test_S4_old_python_refused_before_writes_or_launch(self):
@@ -3235,6 +3367,29 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
                 self.assertEqual(list(self.scope_state.iterdir()), [])
                 self.assertFalse((self.home / ".cache/am").exists())
         self.assertFalse((self.repo / "cache").exists())
+
+    def test_POOL_R5_writable_roots_cannot_overlap_session_or_pool_caches(self):
+        for setting in (None, "relative-cache", str(self.base / "custom-cache")):
+            if setting is None:
+                self.env.pop("XDG_CACHE_HOME", None)
+            else:
+                self.env["XDG_CACHE_HOME"] = setting
+            cache = Path(setting) if setting and Path(setting).is_absolute() else self.home / ".cache"
+            cache.mkdir(exist_ok=True)
+            alias = self.base / "cache-alias"
+            alias.unlink(missing_ok=True)
+            alias.symlink_to(cache, target_is_directory=True)
+            for name in ("am", "am-pool"):
+                for root in (cache, cache / name, cache / name / "nested", alias / name):
+                    for role in ("builder", "verifier"):
+                        with self.subTest(cache=setting, role=role, root=root):
+                            result = self.launch(role, "codex", "--author-family", "claude", "--writable", root)
+                            self.assertEqual(result.returncode, 2, result.stderr)
+                            self.assertIn("unsafe --writable root " + str(root.resolve()), result.stderr)
+                            self.assertIn("launcher sessions or checkout pools", result.stderr)
+                            self.assertFalse(self.record.exists())
+                            self.assertFalse(self.out.exists())
+                            self.assertFalse((cache / name).exists())
 
     def test_failed_session_prints_only_last_twenty_log_lines(self):
         self.env["SESSION_EXIT"] = "7"
