@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 
@@ -26,7 +27,7 @@ POOL_SLOTS = 3
 POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
-                   "-c", "index.sparse=false", "-c", "core.attributesFile=")
+                   "-c", "index.sparse=false")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -164,12 +165,19 @@ def stop_session(unit, process, guarded=False):
                 cleanup_failed(f"scope {unit}", result.stderr.strip() or f"exit {result.returncode}")
         except OSError as error:
             cleanup_failed(f"scope {unit}", error)
+    if process is not None and guarded and process.poll() is None:
+        try:
+            process.terminate()  # The supervisor stops and reaps all descendants.
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            cleanup_failed(f"lease guard {process.pid}", error)
+        process.wait()
     if process is not None and (not unit or process.poll() is None):
         try:
-            if guarded:
-                process.terminate()  # The supervisor stops and reaps all descendants.
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
+            # A killed guard cannot reap its children. Without a scope, also
+            # stop its process group, even when the guard has already exited.
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except OSError as error:
@@ -288,16 +296,108 @@ def review_leave_out(repo, private, head, snapshot):
 def check_checkout(work, commit):
     if (git(work, "rev-parse", "HEAD") != commit
             or git(work, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
-            or git(work, *CHECKOUT_CONFIG, "-c", "status.showUntrackedFiles=all",
-                   "status", "--porcelain", "--ignored=no", "--untracked-files=all")):
+            or git(work, *CHECKOUT_CONFIG, "status", "--porcelain", "--ignored=no", "--untracked-files=all",
+                   "--ignore-submodules=none")):
         raise ValueError("checkout is not clean and detached at the candidate")
+
+
+def checkout_mismatches(work):
+    """Check raw content and Git modes without refreshing or writing the tree."""
+    entries = []
+    for entry in git(work, "ls-files", "--stage", "-z", text=False).split(b"\0"):
+        if entry:
+            info, path = entry.split(b"\t", 1)
+            mode, blob, stage = info.split()
+            if stage != b"0":
+                raise ValueError("unmerged checkout index")
+            if mode != b"160000":  # Submodules are checked by status, not as blobs.
+                entries.append((path, mode, blob))
+    symlinks = git(work, "config", "--type=bool", "--default=true", "--get", "core.symlinks") == "true"
+    mismatches = []
+    literal = {path for path, mode, _ in entries if mode == b"120000"}
+    regular = []
+    for path, mode, blob in entries:
+        file = work / os.fsdecode(path)
+        try:
+            actual = file.lstat().st_mode
+        except FileNotFoundError:
+            mismatches.append(path)
+            continue
+        if mode == b"120000" and symlinks:
+            if not stat.S_ISLNK(actual) or git(work, "hash-object", "--stdin",
+                    input=os.fsencode(os.readlink(file)), text=False) != blob:
+                mismatches.append(path)
+        elif (not stat.S_ISREG(actual)
+              or bool(actual & 0o111) != (mode == b"100755")):
+            mismatches.append(path)
+        else:
+            regular.append((path, blob))
+    if not regular:
+        return mismatches
+    # --stdin-paths accepts Git's C-quoted filenames, including embedded newlines.
+    quoted = b"".join(b'"' + b"".join(
+        bytes([byte]) if 32 <= byte < 127 and byte not in (34, 92)
+        else f"\\{byte:03o}".encode() for byte in path) + b'"\n' for path, _ in regular)
+    hashes = git(work, "hash-object", "--no-filters", "--stdin-paths",
+                 input=quoted, text=False).splitlines()
+    if len(hashes) != len(regular):
+        raise ValueError("incomplete checkout content check")
+    # Raw bytes equal to a blob can still need checkout conversion after
+    # attributes change. LF output is an identity conversion; CRLF, ident,
+    # encodings and filters may change even those otherwise matching blobs.
+    paths = b"\0".join(path for path, _ in regular) + b"\0"
+    attrs = git(work, "check-attr", "--all", "-z", "--stdin", input=paths, text=False).split(b"\0")
+    attributes = {}
+    for i in range(0, len(attrs) - 2, 3):
+        attributes.setdefault(attrs[i], {})[attrs[i + 1]] = attrs[i + 2]
+    autocrlf = git(work, "config", "--type=bool-or-str", "--default=false", "--get", "core.autocrlf")
+    eol = git(work, "config", "--default=native", "--get", "core.eol").lower()
+    for (path, blob), raw in zip(regular, hashes):
+        if path in literal:  # core.symlinks=false checks out the literal link target.
+            if raw != blob:
+                mismatches.append(path)
+            continue
+        attr = attributes.get(path, {})
+        converts = any(attr.get(name, b"unset") not in (b"unset", b"unspecified")
+                       for name in (b"ident", b"filter", b"working-tree-encoding", b"crlf"))
+        converts |= (attr.get(b"text") != b"unset" and attr.get(b"eol") != b"lf"
+                     and (attr.get(b"eol") == b"crlf" or autocrlf == "true"
+                          or (autocrlf != "input" and eol == "crlf"
+                              and attr.get(b"text", b"unset") != b"unset")))
+        if raw == blob and not converts:
+            continue
+        # Use a single-object response: batch --filters reports the ORIGINAL
+        # blob size, so arbitrary converted binary output cannot be framed by it.
+        content = subprocess.check_output([
+            "git", "--no-optional-locks", "-C", str(work), *GIT_CONFIG,
+            "cat-file", "--filters", "--path=" + os.fsdecode(path), blob.decode()])
+        digest = hashlib.new("sha1" if len(blob) == 40 else "sha256")
+        digest.update(b"blob " + str(len(content)).encode() + b"\0")
+        digest.update(content)
+        if digest.hexdigest().encode() != raw:
+            mismatches.append(path)
+    return mismatches
+
+
+def remove_checkout_tree(path):
+    def writable_retry(function, name, error):
+        if not isinstance(error, PermissionError):
+            raise error
+        # Removing a file needs write permission on its parent; descending into
+        # a directory needs search permission on the directory itself as well.
+        parent = Path(name).parent
+        parent.chmod(parent.stat().st_mode | 0o700)
+        if not Path(name).is_symlink():
+            os.chmod(name, os.stat(name).st_mode | 0o700)
+        if function in (os.open, os.scandir):
+            remove_checkout_tree(Path(name))
+        else:
+            function(name)
+    shutil.rmtree(path, onexc=writable_retry)
 
 
 def reset_checkout(work, commit, deep_clean):
     admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
-    attributes = admin / "info/attributes"
-    rewrite = os.path.lexists(attributes)
-    attributes.unlink(missing_ok=True)
     # This belongs only to the slot. Previous agents can leave filters, excludes,
     # hooks or fsmonitor commands here, not just sparse-checkout settings.
     (admin / "config.worktree").unlink(missing_ok=True)
@@ -323,36 +423,34 @@ def reset_checkout(work, commit, deep_clean):
     index = Path(git(work, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     index.unlink(missing_ok=True)
     git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", "HEAD")
-    # Include ignored attributes, and use the rebuilt index so staged additions
-    # cannot masquerade as committed attributes. Remove them before any refresh.
+    # Ignore rules left by an agent must not shield other untracked files.
+    # Include ignored attributes too, before refresh or checkout reads them.
     for raw in git(work, *CHECKOUT_CONFIG, "ls-files", "--others", "-z", "--",
-                   ".gitattributes", ":(glob)**/.gitattributes", text=False).split(b"\0"):
+                   ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
+                   text=False).split(b"\0"):
         if raw:
             (work / os.fsdecode(raw)).unlink()
-            rewrite = True
-    changed = git(work, *CHECKOUT_CONFIG, "diff", "--no-renames", "--name-only", "-z",
-                  "HEAD", commit, text=False).split(b"\0")
-    rewrite |= any(Path(os.fsdecode(path)).name == ".gitattributes" for path in changed if path)
-    rewrite |= bool(git(work, *CHECKOUT_CONFIG, "diff", "--name-only", "--", ".gitattributes",
-                        ":(glob)**/.gitattributes"))
-    # Refresh stat data without writing working files, preserving warm leases'
-    # unchanged files. Exit 1 means modified files; checkout below restores them.
-    if not rewrite:
-        refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
-                                  *GIT_CONFIG, *CHECKOUT_CONFIG,
-                                  "-c", "core.ignorestat=false", "update-index", "--refresh"],
-                                 capture_output=True)
-        if refresh.returncode not in (0, 1):
-            refresh.check_returncode()
-    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "checkout", "--force", "--detach", commit)
-    if rewrite:
-        # Checkout must use the NEW attributes even for unchanged blobs. Its
-        # transition above also removes paths tracked only by the previous tree.
-        # Discard stat data again: diff/checkout can cache paths as up to date
-        # under the old attributes, and checkout-index --force trusts that data.
-        index.unlink()
-        git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "read-tree", commit)
-        git(work, *CHECKOUT_CONFIG, "checkout-index", "--all", "--force")
+    # Refresh stat data without writing working files. Git's clean filters can
+    # hide raw byte differences; checkout_mismatches checks those separately.
+    refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
+                              *GIT_CONFIG, *CHECKOUT_CONFIG,
+                              "-c", "core.ignorestat=false", "update-index", "--refresh"],
+                             capture_output=True)
+    if refresh.returncode not in (0, 1):
+        refresh.check_returncode()
+    git(work, *CHECKOUT_CONFIG, "-c", "core.ignorestat=false", "checkout", "-q", "--force", "--detach", commit)
+    mismatches = checkout_mismatches(work)
+    if mismatches:
+        for raw in mismatches:
+            path = work / os.fsdecode(raw)
+            if path.is_dir() and not path.is_symlink():
+                remove_checkout_tree(path)
+            else:
+                path.unlink(missing_ok=True)
+        git(work, *CHECKOUT_CONFIG, "checkout-index", "--index", "--force", "-z", "--stdin",
+            input=b"\0".join(mismatches) + b"\0", text=False)
+        if checkout_mismatches(work):
+            raise ValueError("checkout bytes or modes differ from candidate")
     git(work, *CHECKOUT_CONFIG, "-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
     check_checkout(work, commit)
 
@@ -422,15 +520,15 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                 if slot.is_symlink():
                     slot.unlink()
                 elif slot.exists():
-                    shutil.rmtree(slot)
+                    remove_checkout_tree(slot)
                 cleanup_worktrees(repo, slot)
                 git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit)
                 reset_checkout(slot, commit, True)
             except (OSError, ValueError, subprocess.CalledProcessError):
                 cleanup_worktrees(repo, slot)
-                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
-                check_checkout(fresh, commit)
-                return fresh, "pool slot broken; fresh session worktree"
+                leases.remove(lock)
+                lock.close()
+                continue
         metadata.with_suffix(".json.tmp").write_text(json.dumps({
             "uses": 1 if reason else previous["uses"] + 1, "commit": commit}))
         metadata.with_suffix(".json.tmp").replace(metadata)

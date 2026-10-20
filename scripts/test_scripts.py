@@ -369,8 +369,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 
     def assert_slot_bytes_match_fresh(self, slot):
         fresh = self.base / "fresh-checkout"
-        subprocess.check_call(["git", "-C", str(self.repo), "-c", "core.attributesFile=",
-                               "worktree", "add", "--detach", str(fresh), "HEAD"], env=self.env)
+        subprocess.check_call(["git", "-C", str(self.repo), "worktree", "add", "--detach", str(fresh), "HEAD"], env=self.env)
         try:
             paths = subprocess.check_output(["git", "-C", str(fresh), "ls-files", "-z"], env=self.env)
             for raw in paths.split(b"\0"):
@@ -440,7 +439,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertEqual(self.verifier()["cwd"], str(slot))
         self.assert_slot_bytes_match_fresh(slot)
 
-    def test_POOL_R8_slot_private_and_configured_attributes_are_neutralized(self):
+    def test_POOL_R8_slot_private_attributes_are_unused_and_shared_config_is_preserved(self):
         (self.repo / "tracked").write_bytes(b"original\n")
         self.git("add", ".")
         self.git("commit", "-qm", "text fixture")
@@ -460,9 +459,222 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 config = (self.repo / ".git/config").read_bytes()
                 self.assertEqual(self.verifier()["cwd"], str(slot))
                 if kind == "private":
-                    self.assertFalse(attributes.exists())
+                    self.assertTrue(attributes.exists(), "slot-private info/attributes is not read by Git")
                 self.assert_slot_bytes_match_fresh(slot)
                 self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+
+    def test_POOL_R9_raw_eol_bytes_are_checked_on_warm_and_deep_reset(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / ".gitattributes").write_text("tracked text eol=lf\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "LF fixture")
+        slot = Path(self.verifier()["cwd"])
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                (slot / "tracked").write_bytes(b"original\r\n")
+                os.utime(slot / "tracked", (1, 1))
+                self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual((slot / "tracked").read_bytes(), b"original\n")
+
+    def test_POOL_R9_shared_attributes_apply_between_leases(self):
+        (self.repo / "text.txt").write_bytes(b"text\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "text fixture")
+        slot = Path(self.verifier()["cwd"])
+        (self.repo / ".git/info/attributes").write_text("*.txt text eol=crlf\n")
+        self.verifier()
+        self.assertEqual((slot / "text.txt").read_bytes(), b"text\r\n")
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R9_global_attributes_match_fresh_checkout_and_stay_warm(self):
+        (self.repo / "text.txt").write_bytes(b"text\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "text fixture")
+        attributes = self.base / "global-attributes"
+        attributes.write_text("*.txt text eol=crlf\n")
+        global_config = self.base / "global-config"
+        global_config.write_text("[core]\nattributesFile = " + str(attributes) + "\n")
+        self.env["GIT_CONFIG_GLOBAL"] = str(global_config)
+        slot = Path(self.verifier()["cwd"])
+        self.assertEqual((slot / "text.txt").read_bytes(), b"text\r\n")
+        before = (slot / "text.txt").stat()
+        self.verifier()
+        after = (slot / "text.txt").stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R9_ident_expansion_is_verified_and_kept_warm(self):
+        (self.repo / "tracked").write_bytes(b"$Id$\n")
+        (self.repo / ".gitattributes").write_text("tracked ident\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "ident fixture")
+        slot = Path(self.verifier()["cwd"])
+        expected = (slot / "tracked").read_bytes()
+        self.assertIn(self.git("rev-parse", "HEAD:tracked").encode(), expected)
+        before = (slot / "tracked").stat()
+        self.verifier()
+        after = (slot / "tracked").stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        (slot / "tracked").write_bytes(b"$Id: wrong expansion $\n")
+        os.utime(slot / "tracked", (1, 1))
+        self.verifier()
+        self.assertEqual((slot / "tracked").read_bytes(), expected)
+
+    def test_POOL_R9_untracked_ignore_rules_cannot_protect_stale_files(self):
+        slot = Path(self.verifier()["cwd"])
+        (slot / "src").mkdir()
+        (slot / "src/.gitignore").write_text("*\n")
+        (slot / "src/stale").write_text("forgotten source")
+        (slot / "ignored").write_text("warm build")
+        self.verifier()
+        self.assertFalse((slot / "src/stale").exists())
+        self.assertFalse((slot / "src/.gitignore").exists())
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+
+    def test_POOL_R9_recreation_removes_readonly_directories(self):
+        slot = Path(self.verifier()["cwd"])
+        for mode in (0o500, 0o000):
+            with self.subTest(mode=oct(mode)):
+                (slot / "ignored").mkdir()
+                (slot / "ignored/leftover").write_text("old build")
+                (slot / "ignored").chmod(mode)
+                try:
+                    (slot / ".git").write_text("broken")
+                    record = self.verifier()
+                    self.assertEqual(record["cwd"], str(slot))
+                    self.assertFalse((slot / "ignored").exists())
+                    self.assertIn("deep clean: recreated", self.out.read_text())
+                finally:
+                    if (slot / "ignored").exists():
+                        (slot / "ignored").chmod(0o700)
+                        shutil.rmtree(slot / "ignored")
+
+    def test_POOL_R9_unremovable_slot_releases_lock_and_tries_next(self):
+        slot = Path(self.verifier()["cwd"])
+        (slot / ".git").write_text("broken")
+        self.inject_launcher('''
+import shutil
+original = shutil.rmtree
+def cannot_remove(path, *args, **kwargs):
+    if str(path).endswith("/slot-1"):
+        raise PermissionError("simulated inaccessible slot")
+    return original(path, *args, **kwargs)
+shutil.rmtree = cannot_remove
+''')
+        record = self.verifier()
+        self.assertEqual(record["cwd"], str(slot.with_name("slot-2")))
+        with slot.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_POOL_R9_one_file_change_preserves_unchanged_files_and_build_output(self):
+        slot = Path(self.verifier()["cwd"])
+        before = (slot / ".gitignore").stat()
+        (slot / "ignored").write_text("warm build")
+        (self.repo / "tracked").write_text("next candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "one file change")
+        record = self.verifier()
+        after = (slot / ".gitignore").stat()
+        self.assertEqual(record["cwd"], str(slot))
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        self.assertEqual((slot / "tracked").read_text(), "next candidate")
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+
+    def test_POOL_R9_smudge_filter_bytes_are_checked_and_kept_warm(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / ".gitattributes").write_text("tracked filter=fixture\n")
+        clean = shlex.join([sys.executable, "-c",
+                            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().replace(b'SMUDGED:', b''))"])
+        smudge = shlex.join([sys.executable, "-c",
+                             "import sys; sys.stdout.buffer.write(b'SMUDGED:' + sys.stdin.buffer.read())"])
+        self.git("config", "filter.fixture.clean", clean)
+        self.git("config", "filter.fixture.smudge", smudge)
+        self.git("add", ".")
+        self.git("commit", "-qm", "smudge fixture")
+        slot = Path(self.verifier()["cwd"])
+        expected = b"SMUDGED:original\n"
+        self.assertEqual((slot / "tracked").read_bytes(), expected)
+        before = (slot / "tracked").stat()
+        self.verifier()
+        after = (slot / "tracked").stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        (slot / "tracked").write_bytes(b"original\n")
+        os.utime(slot / "tracked", (1, 1))
+        self.verifier()
+        self.assertEqual((slot / "tracked").read_bytes(), expected)
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R9_raw_check_handles_odd_paths_symlinks_and_modes(self):
+        names = ['tab\tname', 'line\nname', 'quote"name', 'slash\\name', 'café']
+        for name in names:
+            (self.repo / name).write_bytes(b"line\n")
+        (self.repo / "link").symlink_to("tracked")
+        (self.repo / "executable").write_text("exit 0\n")
+        (self.repo / "executable").chmod(0o755)
+        (self.repo / ".gitattributes").write_text("* text eol=crlf\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "odd paths and Git modes")
+        slot = Path(self.verifier()["cwd"])
+        self.git("config", "core.filemode", "false")
+        (slot / "executable").chmod(0o644)
+        (slot / "link").unlink()
+        (slot / "link").write_text("tracked")
+        self.verifier()
+        self.assertTrue((slot / "executable").stat().st_mode & 0o111)
+        self.assertTrue((slot / "link").is_symlink())
+        self.assertEqual(os.readlink(slot / "link"), "tracked")
+        for name in names:
+            self.assertEqual((slot / name).read_bytes(), b"line\r\n")
+        self.git("config", "core.symlinks", "false")
+        self.verifier()
+        self.assertFalse((slot / "link").is_symlink())
+        self.assertEqual((slot / "link").read_bytes(), b"tracked")
+
+    def test_POOL_R9_core_eol_and_legacy_crlf_attributes_match_fresh(self):
+        (self.repo / "tracked").write_bytes(b"line\n")
+        (self.repo / ".gitattributes").write_text("tracked crlf\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "legacy attributes")
+        slot = Path(self.verifier()["cwd"])
+        self.git("config", "core.eol", "CRLF")
+        self.verifier()
+        self.assertEqual((slot / "tracked").read_bytes(), b"line\r\n")
+        self.assert_slot_bytes_match_fresh(slot)
+
+    def test_POOL_R9_reset_has_no_head_message_on_stderr(self):
+        self.verifier()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("HEAD is now at", result.stderr)
+
+    def test_POOL_R9_killed_guard_without_systemd_stops_agent_group(self):
+        self.configure_scope(present=False)
+        self.agent_extra('''
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()) + " " + str(child.pid))
+pathlib.Path(os.environ["RECORD"] + ".guard").write_text(str(os.getppid()))
+pathlib.Path(os.environ["RECORD"] + ".ready").touch()
+while True:
+    time.sleep(0.02)
+''')
+        self.addCleanup(self.kill_recorded_agents)
+        process = self.start_launcher()
+        record = self.wait_agent_ready(self.record)
+        guard = int(Path(str(self.record) + ".guard").read_text())
+        os.kill(guard, signal.SIGKILL)
+        process.communicate(timeout=10)
+        deadline = time.monotonic() + 2
+        def alive(pid):
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+            except FileNotFoundError:
+                return False
+        pids = list(map(int, Path(str(self.record) + ".pids").read_text().split()))
+        while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(any(alive(pid) for pid in pids), "agent survived killed guard and lease release")
+        with Path(record["cwd"]).with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_POOL_R8_shared_fsmonitor_and_split_index_do_not_affect_launcher(self):
         slot = Path(self.verifier()["cwd"])
