@@ -279,10 +279,10 @@ def main():
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     if not cache.is_absolute():
         cache = Path.home() / ".cache"
-    root = cache / "agent-method/sessions"
+    root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)
-        session = tempfile.TemporaryDirectory(prefix="agent-session-", dir=root)
+        session = tempfile.TemporaryDirectory(prefix="", dir=root)
     except OSError as error:
         print(f"Cannot create session folder under {root}: {error}", file=sys.stderr)
         return 1
@@ -299,11 +299,16 @@ def main():
         except OSError as error:
             print(f"Cannot create session temporary folder {temporary}: {error}", file=sys.stderr)
             return 1
+        length = len(os.fsencode(temporary))
+        if length > 62:
+            print(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
+                  "to create Unix sockets in it above 62 bytes; starting anyway",
+                  file=sys.stderr)
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
         systemd = shutil.which("systemd-run")
-        unit = f"agent-{args.role}-{temp.name.removeprefix('agent-session-')}.scope" if systemd else ""
+        unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         try:
             cwd = repo
             if review:

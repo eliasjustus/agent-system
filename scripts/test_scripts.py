@@ -22,6 +22,7 @@ cwd = pathlib.Path.cwd()
 if args == ["mcp", "list", "--json"]:
     pathlib.Path(os.environ["RECORD"] + ".discovery").write_text(json.dumps({
         "executable": sys.argv[0], "cwd": str(cwd), "tmpdir": os.environ.get("TMPDIR"),
+        "temporary": {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP")},
         "pid": os.getpid()}))
     if os.environ.get("MCP_STDERR"):
         print(os.environ["MCP_STDERR"], file=sys.stderr, flush=True)
@@ -306,7 +307,7 @@ class ScriptsTest(unittest.TestCase):
                     self.assertIn("--network is", result.stderr)
                     self.assertFalse(self.record.exists())
                     self.assertFalse(Path(str(self.record) + ".discovery").exists())
-                    self.assertFalse((self.home / ".cache/agent-method/sessions").exists())
+                    self.assertFalse((self.home / ".cache/am").exists())
 
     def test_CE_S5_S7_executable_identity_for_path_wrapper_relative_and_symlink(self):
         original = self.base / "fake"
@@ -840,7 +841,7 @@ subprocess.check_output = fail
                     if operation == "worktree":
                         self.assertTrue(marker.exists())
                     self.assertEqual(self.git("worktree", "list", "--porcelain"), registrations)
-                    self.assertEqual(list((self.home / ".cache/agent-method/sessions").iterdir()), [])
+                    self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
 
     def test_LO_S7_concurrent_checkouts_do_not_interfere(self):
         self.leave_out_project()
@@ -1343,11 +1344,13 @@ if "model_reasoning_effort=unsupported-test-value" in args:
         temporary = self.base / "other-temporary-directory"
         temporary.mkdir()
         self.env["TMPDIR"] = str(temporary)
-        self.env.pop("XDG_CACHE_HOME", None)
-        for cache in (self.home / ".cache", self.base / "cache"):
-            with self.subTest(cache=cache):
-                if cache != self.home / ".cache":
-                    self.env["XDG_CACHE_HOME"] = str(cache)
+        for value in (None, "", str(self.base / "cache")):
+            with self.subTest(xdg_cache_home=value):
+                if value is None:
+                    self.env.pop("XDG_CACHE_HOME", None)
+                else:
+                    self.env["XDG_CACHE_HOME"] = value
+                cache = Path(value) if value else self.home / ".cache"
                 self.agent_extra('''
 record["files"] = sorted(str(p.relative_to(cwd.parent)) for p in cwd.parent.iterdir())
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
@@ -1356,7 +1359,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.record.read_text())
                 session = Path(record["cwd"]).parent
-                self.assertEqual(session.parent, cache / "agent-method/sessions")
+                self.assertEqual(session.parent, cache / "am")
                 self.assertIn("index", record["files"])
                 self.assertIn("answer", record["files"])
                 self.assertEqual(Path(record["argv"][record["argv"].index("-o") + 1]).parent, session)
@@ -1365,23 +1368,113 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertEqual(list(temporary.iterdir()), [])
 
     def test_L1_unwritable_session_root_fails_before_agent(self):
-        blocker = self.base / "cache-file"
-        blocker.write_text("not a directory")
-        self.env["XDG_CACHE_HOME"] = str(blocker)
-        result = self.launch()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("session folder", result.stderr.lower())
-        self.assertIn(str(blocker), result.stderr)
-        self.assertFalse(self.record.exists())
+        for cache, blocker in ((self.base / "cache-file", self.base / "cache-file"),
+                               (self.home / ".cache", self.home / ".cache/am")):
+            with self.subTest(blocker=blocker):
+                blocker.parent.mkdir(parents=True, exist_ok=True)
+                blocker.write_text("keep this file")
+                self.env["XDG_CACHE_HOME"] = str(cache)
+                result = self.launch()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"Cannot create session folder under {cache / 'am'}:", result.stderr)
+                self.assertFalse(self.record.exists())
+                self.assertEqual(blocker.read_text(), "keep this file")
 
     def test_L1_relative_xdg_cache_home_uses_home_cache(self):
         self.env["XDG_CACHE_HOME"] = "relative-cache"
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         session = Path(json.loads(self.record.read_text())["cwd"]).parent
-        self.assertEqual(session.parent, self.home / ".cache/agent-method/sessions")
+        self.assertEqual(session.parent, self.home / ".cache/am")
         self.assertFalse((self.repo / "relative-cache").exists())
         self.assertFalse(session.exists())
+
+    def test_SS_S2_short_session_folder_scope_and_discovery_environment(self):
+        for role in ("challenger", "reviewer"):
+            with self.subTest(role=role):
+                result = self.launch(role, "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(self.record.read_text())
+                temporary = Path(record["tmpdir"])
+                session = temporary.parent
+                self.assertEqual(session.parent, self.home / ".cache/am")
+                self.assertRegex(session.name, r"^[a-z0-9_]{8}$")
+                self.assertIn(f"Scope: agent-{role}-{session.name}.scope\n", self.out.read_text())
+                discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
+                self.assertEqual(discovery["temporary"],
+                                 dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(temporary)))
+                self.assertFalse(session.exists())
+
+    def test_SS_preserves_existing_and_legacy_cache_entries(self):
+        cache = self.home / ".cache"
+        roots = (cache / "am", cache / "agent-method/sessions")
+        for root in roots:
+            (root / "unrelated-folder").mkdir(parents=True)
+            (root / "unrelated-file").write_text("keep file")
+            (root / "unrelated-folder/contents").write_text("keep contents")
+            name = "keep1234" if root.name == "am" else "agent-session-existing"
+            (root / name / "tmp").mkdir(parents=True)
+            (root / name / "tmp/scratch").write_text("keep session contents")
+        before = {path: path.read_bytes() if path.is_file() else None
+                  for root in roots for path in root.rglob("*")}
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = {path: path.read_bytes() if path.is_file() else None
+                 for root in roots for path in root.rglob("*")}
+        self.assertEqual(after, before)
+
+    def socket_budget_cache(self, length, component="cache"):
+        # Use a short fixture so both sides of the Linux Chromium limit are reachable.
+        short = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(short.cleanup)
+        stem = Path(short.name).resolve() / component
+        # /am/<8 random characters>/tmp adds 16 bytes to the cache path.
+        cache = stem / ("x" * (length - 16 - len(os.fsencode(stem)) - 1))
+        cache.mkdir(parents=True)
+        return cache
+
+    def test_SS_S3_tmpdir_socket_budget_boundary(self):
+        for length in (62, 63):
+            with self.subTest(length=length):
+                self.env["XDG_CACHE_HOME"] = str(self.socket_budget_cache(length))
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                temporary = Path(json.loads(self.record.read_text())["tmpdir"])
+                self.assertEqual(len(os.fsencode(temporary)), length)
+                if length == 62:
+                    self.assertEqual(result.stderr, "")
+                else:
+                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                    self.assertEqual(result.stderr,
+                                     "Warning: TMPDIR is 63 bytes; programs such as Chromium may fail "
+                                     "to create Unix sockets in it above 62 bytes; starting anyway\n")
+                self.assertFalse(temporary.parent.exists())
+
+    def test_SS_S3_non_ascii_tmpdir_counts_bytes(self):
+        self.env["XDG_CACHE_HOME"] = str(self.socket_budget_cache(63, "é"))
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        temporary = json.loads(self.record.read_text())["tmpdir"]
+        self.assertEqual(len(os.fsencode(temporary)), 63)
+        self.assertLessEqual(len(temporary), 62)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("63 bytes", result.stderr)
+        self.assertIn("above 62 bytes; starting anyway", result.stderr)
+
+    def test_SS_S3_symlink_cache_uses_resolved_length(self):
+        cache = self.socket_budget_cache(63)
+        alias = cache.parents[1] / "alias"
+        alias.symlink_to(cache, target_is_directory=True)
+        self.assertLess(len(os.fsencode(alias)) + 16, 62)
+        self.env["XDG_CACHE_HOME"] = str(alias)
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        temporary = Path(json.loads(self.record.read_text())["tmpdir"])
+        self.assertEqual(temporary.parent.parent.parent, cache)
+        self.assertEqual(len(os.fsencode(temporary)), 63)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("63 bytes", result.stderr)
+        self.assertIn("above 62 bytes; starting anyway", result.stderr)
 
     def test_L2_scope_command_and_header(self):
         result = self.launch()
@@ -1424,7 +1517,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.assertEqual(temporary.name, "tmp")
                     self.assertTrue(temporary.is_absolute())
                     self.assertEqual(temporary.parent.parent,
-                                     self.home / ".cache/agent-method/sessions")
+                                     self.home / ".cache/am")
                     self.assertEqual(record["temporary"],
                                      dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(temporary)))
                     self.assertTrue(record["temporary_exists"])
@@ -1439,7 +1532,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 import pathlib
 mkdir = pathlib.Path.mkdir
 def fail_temporary(self, *args, **kwargs):
-    if self.name == "tmp" and self.parent.name.startswith("agent-session-"):
+    if self.name == "tmp" and self.parent.parent.name == "am":
         raise OSError("forced temporary folder creation failure")
     return mkdir(self, *args, **kwargs)
 pathlib.Path.mkdir = fail_temporary
@@ -1448,7 +1541,7 @@ pathlib.Path.mkdir = fail_temporary
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("forced temporary folder creation failure", result.stderr)
         self.assertFalse(self.record.exists())
-        self.assertEqual(list((self.home / ".cache/agent-method/sessions").iterdir()), [])
+        self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
 
     def test_T1_temporary_files_are_not_evidence(self):
         inherited = self.base / "inherited"
@@ -1645,7 +1738,7 @@ pathlib.Path(os.environ["RECORD"] + ".ready").touch()
             "#!" + sys.executable + "\nimport os, pathlib, sys\n"
             "args = sys.argv[1:]\n"
             "if 'worktree' in args and 'list' in args:\n"
-            "    root = pathlib.Path.home() / '.cache/agent-method/sessions'\n"
+            "    root = pathlib.Path.home() / '.cache/am'\n"
             "    pathlib.Path(os.environ['CLEANUP_STATE']).write_text(str(any(root.iterdir())))\n"
             "    print('forced listing failure', file=sys.stderr)\n    sys.exit(31)\n"
             f"os.execv({real_git!r}, [{real_git!r}, *args])\n")
@@ -1940,7 +2033,7 @@ while not pathlib.Path(os.environ["RECORD"] + ".release").exists():
 import os, pathlib, signal
 resolve = pathlib.Path.resolve
 def interrupt_session_path(self, *args, **kwargs):
-    if self.name.startswith('agent-session-'):
+    if self.parent.name == 'am':
         os.kill(os.getpid(), signal.SIGINT)
     return resolve(self, *args, **kwargs)
 pathlib.Path.resolve = interrupt_session_path
@@ -1951,7 +2044,7 @@ pathlib.Path.resolve = interrupt_session_path
         self.assertEqual(result.returncode, -signal.SIGINT, result.stderr)
         self.assertFalse(self.record.exists())
         self.assertFalse(self.out.exists())
-        self.assertEqual(list((self.home / ".cache/agent-method/sessions").iterdir()), [])
+        self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
 
     def test_L5_evidence_prompt_precreated_folder_and_timeout_retention(self):
         self.agent_extra('''
@@ -2213,7 +2306,7 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
         self.assertFalse(self.record.exists())
         self.assertFalse(self.out.exists())
         self.assertEqual(list(self.scope_state.iterdir()), [])
-        self.assertFalse((self.home / ".cache/agent-method/sessions").exists())
+        self.assertFalse((self.home / ".cache/am").exists())
 
     def test_L7_refuses_filesystem_root(self):
         self.assert_writable_refused(Path("/"))
@@ -2268,7 +2361,7 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
                 self.assertFalse(self.record.exists())
                 self.assertFalse(self.out.exists())
                 self.assertEqual(list(self.scope_state.iterdir()), [])
-                self.assertFalse((self.home / ".cache/agent-method/sessions").exists())
+                self.assertFalse((self.home / ".cache/am").exists())
         self.assertFalse((self.repo / "cache").exists())
 
     def test_failed_session_prints_only_last_twenty_log_lines(self):
@@ -2299,7 +2392,7 @@ for i in range(35):
                 self.assertFalse(self.record.exists())
                 self.assertFalse(self.out.exists())
                 self.assertFalse(self.out.with_suffix(".log").exists())
-                self.assertFalse((self.home / ".cache/agent-method/sessions").exists())
+                self.assertFalse((self.home / ".cache/am").exists())
                 self.assertEqual(list(self.scope_state.iterdir()), [])
                 self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
 
@@ -2319,7 +2412,7 @@ for i in range(35):
             "#!" + sys.executable + "\nimport os, pathlib, shutil, sys\n"
             "args = sys.argv[1:]\n"
             "if 'worktree' in args and 'remove' in args:\n"
-            "    root = pathlib.Path.home() / '.cache/agent-method/sessions'\n"
+            "    root = pathlib.Path.home() / '.cache/am'\n"
             "    pathlib.Path(os.environ['CLEANUP_STATE']).write_text(str(any(root.iterdir())))\n"
             "    shutil.rmtree(args[-1])\n"
             "    print('forced worktree removal failure', file=sys.stderr)\n    sys.exit(31)\n"

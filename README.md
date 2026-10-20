@@ -144,11 +144,18 @@ Uncommitted or untracked candidates go through `run.py` to capture the exact sna
 | `AGENT_CODEX_EFFORT` | Codex reasoning effort; default `high`. Values pass through to the CLI, which rejects unsupported values. |
 | `AGENT_CLAUDE_CMD` | Claude executable name or path; default `claude` |
 | `AGENT_CODEX_CMD` | Codex executable name or path; default `codex` |
-| `XDG_CACHE_HOME` | Session cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `agent-method/sessions/` beneath it. |
+| `XDG_CACHE_HOME` | Session cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `am/<8 random characters>/` beneath it. |
 
 Set the model variable when running setup to change generated Claude builder definitions; rerun
 setup for each project to update its copy. Command variables take a single executable, without
 extra arguments.
+
+Each session sets `TMPDIR`, `TMP` and `TEMP` to its disk-backed `tmp/` folder and removes the
+session folder after the run. With a home folder such as `/home/alice`, the default TMPDIR is 34 bytes. If its
+resolved path exceeds 62 bytes, the launcher warns on stderr and starts anyway. This budget is
+for Chromium's typical socket name on Linux; the warning does not make sockets work. Use a
+shorter absolute `XDG_CACHE_HOME` if needed. After upgrading, `<cache>/agent-method/sessions/`
+can be deleted once no session started by an older version is running.
 
 ## Upgrade, rollback and removal
 
@@ -166,8 +173,9 @@ project with those same arguments.
 
 To remove the method from a project, remove its generated `AGENTS.md` and
 `.claude/agents/builder.md`, the `/.claude/agents/builder.md` line from Git's `info/exclude`, and any
-`@AGENTS.md` line you added. Remove the shared method folder and session cache only after no
-project uses them and no session is running. Private records stay unless you delete them.
+`@AGENTS.md` line you added. Once no project uses the shared method folder and no session is
+running, remove the method folder and delete only the session folder `<cache>/am/` from the
+cache. Private records stay unless you delete them.
 
 ## Platforms
 
