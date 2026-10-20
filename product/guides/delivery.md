@@ -59,6 +59,9 @@ word in the task record with the date. Silence is not acceptance.
 
 - **Accepted:** finish cleanup, add the delivered scenarios to the project's `checks.md` with how to
   run them, close the task record. Reply in at most three sentences.
+- **Cleanup**, when a task is merged or abandoned: remove its worktrees and the build output in them,
+  after keeping anything still needed. A worktree kept for later work holds no generated build output
+  (such as `target/`, `build/` or `node_modules/`) while it waits.
 - **Reported wrong later:** reopen the same task record with a new candidate (and a new pull
   request where the project uses them).
 - **Changes requested:** continue under the same task record and the same pull request or a

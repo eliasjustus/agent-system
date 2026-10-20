@@ -22,7 +22,10 @@ check wrong. Where feasible, the corrected check still rejects the original defe
 
 ## Recheck
 
-Send all open findings together, grouped into one repair plan per cause, not per symptom. After a
+Send all open findings together, grouped into one repair plan per cause, not per symptom. When a
+failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
+cases to the scenarios before the repair, and have the builder exercise them before handing back,
+rather than letting verification find them one at a time. After a
 repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was
 mistaken.
