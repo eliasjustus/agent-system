@@ -210,6 +210,92 @@ class ScriptsTest(unittest.TestCase):
                                "--private", self.private, "--method", self.method,
                                *extra)
 
+    def test_write_bytes_header_for_both_families(self):
+        for family in ("codex", "claude"):
+            for role in ("builder", "investigator", "verifier", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    lines = self.out.read_text().split("\n\n", 1)[0].splitlines()
+                    start = next(i for i, line in enumerate(lines) if line.startswith("Start UTC:"))
+                    self.assertRegex(lines[start - 1],
+                                     r"^Write bytes: (\d+\.\d MiB|unavailable)$")
+                    self.assertEqual(sum(line.startswith("Write bytes:") for line in lines), 1)
+
+    def test_write_bytes_reports_counter_differences_in_mib(self):
+        self.inject_launcher('''
+            from pathlib import Path
+            original = Path.read_text
+            samples = iter(["write_bytes: 10485760\\n",
+                            "write_bytes: 13107200\\n"])
+            def read_text(path, *args, **kwargs):
+                if path == Path("/proc/self/io"):
+                    return next(samples)
+                return original(path, *args, **kwargs)
+            Path.read_text = read_text
+        ''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch(family=family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Write bytes: 2.5 MiB\nStart UTC:",
+                              self.out.read_text())
+
+    def test_write_bytes_unavailable_on_read_or_parse_failure_at_either_sample(self):
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+        good = "write_bytes: 1048576\n"
+        for bad in ("OSError('unreadable')", "UnicodeError('invalid encoding')",
+                    repr("write_bytes: invalid\n"),
+                    repr("read_bytes: 1\n"), repr("malformed")):
+            for sample in (0, 1):
+                for family in ("codex", "claude"):
+                    with self.subTest(bad=bad, sample=sample, family=family):
+                        values = [repr(good), repr(good)]
+                        values[sample] = bad
+                        self.inject_launcher(f'''
+                            from pathlib import Path
+                            original = Path.read_text
+                            samples = iter([{', '.join(values)}])
+                            def read_text(path, *args, **kwargs):
+                                if path == Path("/proc/self/io"):
+                                    value = next(samples)
+                                    if isinstance(value, Exception):
+                                        raise value
+                                    return value
+                                return original(path, *args, **kwargs)
+                            Path.read_text = read_text
+                        ''')
+                        result = self.launch(family=family)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("Write bytes: unavailable\nStart UTC:", self.out.read_text())
+
+    def test_write_bytes_includes_reaped_child_fsynced_writes(self):
+        if sys.platform != "linux" or not shutil.which("stat"):
+            self.skipTest("disk write accounting needs Linux /proc and stat")
+        filesystem = subprocess.check_output(
+            ["stat", "-f", "-c", "%T", str(self.home)], text=True).strip()
+        if filesystem in ("tmpfs", "ramfs"):
+            self.skipTest(f"session cache is on {filesystem}; writes do not reach a real disk")
+        self.agent_extra('''
+subprocess.run([sys.executable, "-c",
+                "import os; "
+                "f = open('child-writes.bin', 'wb'); "
+                "f.write(b'x' * (4 * 1024 * 1024)); f.flush(); os.fsync(f.fileno()); f.close()"],
+               check=True)
+''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch(family=family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = self.out.read_text().split("\n\n", 1)[0].splitlines()
+                writes = [line for line in lines if line.startswith("Write bytes:")]
+                self.assertEqual(len(writes), 1)
+                if writes[0] == "Write bytes: unavailable":
+                    self.skipTest("/proc/self/io write accounting is unavailable")
+                self.assertRegex(writes[0], r"^Write bytes: \d+\.\d MiB$")
+                self.assertGreaterEqual(float(writes[0].split()[2]), 4.0)
+
     def test_CE_S1_restricted_roles_disable_extensions_and_enabled_servers(self):
         names = ['plain', 'node_repl', 'dash-name', 'A0', '123']
         self.env["MCP_JSON"] = json.dumps(
