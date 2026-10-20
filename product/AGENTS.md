@@ -50,7 +50,8 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    configured check is not a pass.
 5. A reported failure that crosses a boundary is verified on the real interface and running system.
 6. Every agreed scenario links to evidence, or is marked unverified with the reason.
-7. The user's request, or a merge their commit policy allows, is their sign-off on verified work.
+7. The user's request, or their merge where the project leaves merging to them, is their sign-off
+   on verified work.
    Ask for their verdict only when a change breaks something they use, changes what they see, or
    touches their data: one plain question, never a list; until they answer, that change waits.
 

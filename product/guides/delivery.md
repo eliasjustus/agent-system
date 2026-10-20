@@ -37,8 +37,8 @@ One message, at most about 250 words, in plain language:
 3. **How it was checked:** one or two lines.
 4. **Limits.**
 5. Only if the change breaks something the user uses, changes what they see, or touches their
-   data: one question, is the behavior right? Otherwise ask nothing: the request, or the merge the
-   commit policy allows, is the user's sign-off.
+   data: one question, is the behavior right? Otherwise ask nothing: the request, or the user's
+   merge where the project leaves merging to them, is the sign-off.
 
 Claim only what happened. Never promise future behavior. Settle interpretation before building, or
 state it as a limit the user can correct. Leave out internal bookkeeping.
@@ -50,15 +50,17 @@ is recorded, do not commit and say so.
 
 ## On the verdict
 
-Work that needed no question is signed off by its request once merged: record that, then finish
-as for accepted work. Where you asked, keep only that change waiting (a draft pull request, the
+Work that needed no question is signed off by its request once it is verified and delivered, or by
+the user's merge where the project leaves merging to them: record that, then finish as for accepted
+work. Where you asked, keep only that change waiting (a draft pull request, the
 question in the task record's `Open for user`) and carry on with the rest; ask it in the next
 conversation with the user, one question, never a list of pending items. Record the reply word for
 word in the task record with the date. Silence is not acceptance.
 
 - **Accepted:** finish cleanup, add the delivered scenarios to the project's `checks.md` with how to
   run them, close the task record. Reply in at most three sentences.
-- **Reported wrong later:** reopen the same task record, with a new candidate and pull request.
+- **Reported wrong later:** reopen the same task record with a new candidate (and a new pull
+  request where the project uses them).
 - **Changes requested:** continue under the same task record and the same pull request or a
   follow-up under the same number.
 
