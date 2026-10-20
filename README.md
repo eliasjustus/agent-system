@@ -129,13 +129,18 @@ and says `pool busy` in the header. Session cleanup never removes a pool checkou
 Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
 runs count), when a lockfile or toolchain/build definition changes in either direction, and with
 verifier-only `--clean-checkout`. The fixed list covers npm/yarn/pnpm, Cargo, Gradle (including
-wrapper properties and lockfiles), Go, Python requirements/uv/poetry and toolchain pins. Counts
+wrapper properties and lockfiles), Go, Python requirements/uv/poetry, Gemfile.lock, composer.lock,
+flake.lock, bun.lock/bun.lockb and toolchain pins (including .java-version). Changes to any
+Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files and files under
+any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. Counts
 survive restarts. Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
 are recreated, with a fresh session worktree as a fallback. The header says whether a reset was
 warm or deep and why. Pool reset writes count in `Write bytes:`.
 
 Gradle and Cargo incremental builds must notice deleted source files; the tests exercise this with
-a still-referenced deleted Java class and Rust module. Custom build scripts may reuse stale ignored
+a still-referenced deleted Java class and Rust module, plus a removed Cargo executable. The Cargo
+manifest and executable-source deep-clean rules prevent obsolete binaries from passing a check.
+Custom output paths, other build systems and custom build scripts may still reuse stale ignored
 output incorrectly. Retry with `--clean-checkout` after an environment-looking failure and report
 both results; a warm pass alone cannot establish that a custom build is correct. No shared Rust
 compile cache (sccache) is configured.

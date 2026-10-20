@@ -293,6 +293,68 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertIn("warm reset", self.out.read_text())
         self.assert_session_cleaned(second)
 
+    def poisoned_flag_checkout(self, flag):
+        slot = Path(self.verifier()["cwd"])
+        for clean in (False, True):
+            with self.subTest(flag=flag, deep_clean=clean):
+                subprocess.check_call(["git", "-C", str(slot), "update-index", flag, "tracked"],
+                                      env=self.env)
+                (slot / "tracked").write_text("poisoned content")
+                (slot / "ignored").write_text("warm output")
+                record = self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual(record["cwd"], str(slot))
+                self.assertEqual((slot / "tracked").read_text(), "original")
+                self.assertEqual(subprocess.check_output(
+                    ["git", "-C", str(slot), "ls-files", "-v", "tracked"],
+                    env=self.env, text=True), "H tracked\n")
+                self.assertEqual((slot / "ignored").exists(), not clean)
+
+    def test_POOL_S1_skip_worktree_is_rebuilt_on_warm_and_deep_leases(self):
+        self.poisoned_flag_checkout("--skip-worktree")
+
+    def test_POOL_S1_assume_unchanged_is_rebuilt_on_warm_and_deep_leases(self):
+        self.poisoned_flag_checkout("--assume-unchanged")
+
+    def test_POOL_S1_sparse_checkout_is_disabled_on_warm_and_deep_leases(self):
+        slot = Path(self.verifier()["cwd"])
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                subprocess.check_call(["git", "-C", str(slot), "sparse-checkout", "set",
+                                       "--no-cone", "/missing/"], env=self.env)
+                self.assertFalse((slot / "tracked").exists())
+                common_config = (self.repo / ".git/config").read_bytes()
+                record = self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertEqual(record["cwd"], str(slot))
+                self.assertTrue((slot / "tracked").exists())
+                self.assertEqual((slot / "tracked").read_text(), "original")
+                self.assertEqual(subprocess.check_output(
+                    ["git", "-C", str(slot), "config", "--type=bool", "--default=false", "--get",
+                     "core.sparseCheckout"], env=self.env, text=True).strip(), "false")
+                self.assertEqual(subprocess.check_output(
+                    ["git", "-C", str(slot), "ls-files", "-v", "tracked"],
+                    env=self.env, text=True), "H tracked\n")
+                self.assertEqual((self.repo / ".git/config").read_bytes(), common_config)
+
+    def test_POOL_S1_cached_removal_of_now_ignored_file_is_removed_on_both_paths(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "ignored-later").write_text("old tracked content")
+        self.git("add", ".")
+        self.git("commit", "-qm", "tracked before ignored")
+        old = self.git("rev-parse", "HEAD")
+        for clean in (False, True):
+            with self.subTest(deep_clean=clean):
+                self.git("reset", "--hard", old)
+                slot = Path(self.verifier()["cwd"])
+                subprocess.check_call(["git", "-C", str(slot), "rm", "--cached", "--quiet",
+                                       "ignored-later"], env=self.env)
+                (self.repo / "ignored-later").unlink()
+                (self.repo / ".gitignore").write_text("ignored\nignored-later\n")
+                self.git("add", "-A")
+                self.git("commit", "-qm", "delete and ignore")
+                self.verifier("codex", *(["--clean-checkout"] if clean else []))
+                self.assertFalse((slot / "ignored-later").exists())
+        self.git("reset", "--hard", baseline)
+
     def test_POOL_S2_repository_identity_for_linked_symlink_subdirectory_and_same_name(self):
         main = self.repo
         first = self.verifier()
@@ -372,6 +434,34 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertIn("commit first", result.stderr)
         (self.repo / "tracked").write_text("original")
         self.verifier("codex", "--repo", sub)
+
+    def test_POOL_S3_stale_index_timestamps_never_write_source_index(self):
+        index = self.repo / ".git/index"
+        tracked = self.repo / "tracked"
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty):
+                # Touch an unchanged tracked file after committing so diff must
+                # refresh its stat entry. The index file itself also has stale times.
+                tracked.write_text("original")
+                self.git("add", "tracked")
+                os.utime(tracked, ns=(1_000_000_000, 1_000_000_000))
+                os.utime(index, ns=(2_000_000_000, 2_000_000_000))
+                if dirty:
+                    (self.repo / "dirty").write_text("committed")
+                    self.git("add", "dirty")
+                    self.git("commit", "-qm", "second tracked file")
+                    (self.repo / "dirty").write_text("uncommitted")
+                    os.utime(tracked, ns=(3_000_000_000, 3_000_000_000))
+                    os.utime(index, ns=(2_000_000_000, 2_000_000_000))
+                before, mtime = index.read_bytes(), index.stat().st_mtime_ns
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assertEqual(index.read_bytes(), before)
+                self.assertEqual(index.stat().st_mtime_ns, mtime)
+                if dirty:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("commit first", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_POOL_S3_candidate_is_pinned_when_builder_commits_again(self):
         self.pool_probe()
@@ -516,6 +606,87 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.verifier()
                     self.assertFalse((slot / "ignored").exists())
                     self.assertIn("deep clean: lockfile or toolchain changed", self.out.read_text())
+
+    def test_POOL_S7_additional_lockfiles_and_java_pin_clean_in_both_directions(self):
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        for name in ("Gemfile.lock", "composer.lock", "flake.lock", "bun.lock", "bun.lockb", ".java-version"):
+            with self.subTest(name=name):
+                target = self.repo / "nested" / name
+                target.parent.mkdir(exist_ok=True)
+                target.write_text("changed build input")
+                self.git("add", ".")
+                self.git("commit", "-qm", "build input")
+                for reverse in (False, True):
+                    (slot / "ignored").write_text("stale output")
+                    if reverse:
+                        self.git("reset", "--hard", baseline)
+                    self.verifier()
+                    self.assertFalse((slot / "ignored").exists())
+                    self.assertIn("deep clean: lockfile or toolchain changed", self.out.read_text())
+
+    def test_POOL_S12_cargo_manifest_changes_clean_in_both_directions(self):
+        manifest = self.repo / "workspace/crate/Cargo.toml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("old manifest")
+        self.git("add", ".")
+        self.git("commit", "-qm", "manifest")
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        manifest.write_text("changed manifest")
+        self.git("add", ".")
+        self.git("commit", "-qm", "change manifest")
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                (slot / "ignored").write_text("stale binary")
+                if reverse:
+                    self.git("reset", "--hard", baseline)
+                self.verifier()
+                self.assertFalse((slot / "ignored").exists())
+                self.assertIn("deep clean: Cargo manifest changed", self.out.read_text())
+
+    def test_POOL_S12_cargo_source_edits_and_unrelated_deletion_stay_warm(self):
+        paths = ("src/main.rs", "src/bin/tool.rs", "crate/not-src/bin/data.txt")
+        for name in paths:
+            target = self.repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("initial source")
+        self.git("add", ".")
+        self.git("commit", "-qm", "ordinary source files")
+        slot = Path(self.verifier()["cwd"])
+        for name in paths[:2]:
+            (self.repo / name).write_text("edited source")
+        (self.repo / paths[2]).unlink()
+        self.git("add", "-A")
+        self.git("commit", "-qm", "ordinary source edits")
+        (slot / "ignored").write_text("warm output")
+        self.verifier()
+        self.assertTrue((slot / "ignored").exists())
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_S12_cargo_executable_removal_and_rename_clean(self):
+        baseline = self.git("rev-parse", "HEAD")
+        for path in ("main.rs", "crate/src/main.rs", "src/bin/tool.rs", "crate/src/bin/tool/main.rs",
+                     "crate/src/bin/tool/helper.rs"):
+            for rename in (False, True):
+                with self.subTest(path=path, rename=rename):
+                    self.git("reset", "--hard", baseline)
+                    target = self.repo / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("fn main() {}")
+                    self.git("add", ".")
+                    self.git("commit", "-qm", "executable source")
+                    slot = Path(self.verifier()["cwd"])
+                    (slot / "ignored").write_text("stale binary")
+                    if rename:
+                        self.git("mv", path, "renamed.rs")
+                    else:
+                        target.unlink()
+                    self.git("add", "-A")
+                    self.git("commit", "-qm", "remove executable source")
+                    self.verifier()
+                    self.assertFalse((slot / "ignored").exists())
+                    self.assertIn("deep clean: Cargo executable source removed", self.out.read_text())
 
     def test_POOL_S8_broken_slots_recover_without_consuming_capacity(self):
         record = self.verifier()
@@ -746,6 +917,62 @@ sys.exit(result.returncode)
             "CARGO_HOME": str(self.base / "cargo-home"),
             "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
         }, "file not found for module `removed`", "target/warm-marker")
+
+    def test_POOL_S12_cargo_deleted_binary_cannot_run_from_stale_target(self):
+        cargo, rustc = shutil.which("cargo"), shutil.which("rustc")
+        if not cargo or not rustc:
+            self.skipTest("Cargo/Rust unavailable")
+        files = {
+            ".gitignore": "target/\n",
+            "Cargo.toml": '[package]\nname = "binary_check"\nversion = "0.1.0"\nedition = "2021"\n',
+            "Cargo.lock": 'version = 4\n[[package]]\nname = "binary_check"\nversion = "0.1.0"\n',
+            "src/main.rs": "fn main() {}\n",
+            "src/bin/tool.rs": 'fn main() { println!("old executable runs"); }\n',
+        }
+        for name, content in files.items():
+            target = self.repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        self.git("add", ".")
+        self.git("commit", "-qm", "Cargo binary fixture")
+        self.env["BUILD_COMMAND"] = json.dumps([cargo, "build", "--bins", "--offline"])
+        self.env["BUILD_ENV"] = json.dumps({
+            "PATH": os.environ["PATH"], "RUSTC": rustc,
+            "CARGO_HOME": str(self.base / "cargo-home"),
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+        })
+        self.agent_extra('''
+result = subprocess.run(json.loads(os.environ["BUILD_COMMAND"]),
+                        env=dict(os.environ, **json.loads(os.environ["BUILD_ENV"])), capture_output=True)
+output = result.stdout + result.stderr
+if result.returncode == 0:
+    try:
+        result = subprocess.run([str(cwd / "target/debug/tool")], capture_output=True)
+        output += result.stdout + result.stderr
+        code = result.returncode
+    except FileNotFoundError:
+        output += b"removed executable absent"
+        code = 9
+else:
+    code = result.returncode
+(evidence / "build.txt").write_bytes(output)
+sys.exit(code)
+''')
+        first = self.launch("verifier", "codex", "--author-family", "claude")
+        proof = self.out.parent / "answer-evidence/build.txt"
+        self.assertEqual(first.returncode, 0, proof.read_text() + first.stderr)
+        self.assertIn("old executable runs", proof.read_text())
+        slot = Path(json.loads(self.record.read_text())["cwd"])
+        self.assertTrue((slot / "target/debug/tool").is_file())
+        (self.repo / "src/bin/tool.rs").unlink()
+        self.git("add", "-u")
+        self.git("commit", "-qm", "delete executable source")
+        second = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(second.returncode, 9, proof.read_text() + second.stderr)
+        self.assertIn("removed executable absent", proof.read_text())
+        self.assertFalse((slot / "target/debug/tool").exists())
+        self.assertEqual(json.loads(self.record.read_text())["cwd"], str(slot))
+        self.assertIn("deep clean: Cargo executable source removed", self.out.read_text())
 
     def test_POOL_S12_gradle_deleted_class_cannot_pass_using_warm_output(self):
         gradle = shutil.which("gradle")

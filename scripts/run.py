@@ -26,7 +26,8 @@ POOL_SLOTS = 3
 POOL_USES = 20
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
-    "Cargo.lock", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
+    "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
+    "bun.lock", "bun.lockb", ".java-version", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
     "pdm.lock", "pylock.toml", "gradle.lockfile", "gradle-wrapper.properties",
     "gradle.properties", "settings.gradle", "settings.gradle.kts",
     "build.gradle", "build.gradle.kts", "libs.versions.toml",
@@ -281,6 +282,37 @@ def check_checkout(work, commit):
         raise ValueError("checkout is not clean and detached at the candidate")
 
 
+def reset_checkout(work, commit, deep_clean):
+    admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
+    worktree_config = git(work, "config", "--type=bool", "--default=false", "--get",
+                         "extensions.worktreeConfig") == "true"
+    if worktree_config:
+        # Only write the slot's config, never the repository's shared config.
+        for setting in ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse"):
+            git(work, "config", "--worktree", setting, "false")
+    elif ((admin / "config.worktree").exists()
+          or git(work, "config", "--type=bool", "--default=false", "--get",
+                 "core.sparseCheckout") == "true"):
+        raise ValueError("sparse settings cannot be reset in the slot's own config")
+    (admin / "info/sparse-checkout").unlink(missing_ok=True)
+    # Rebuild from the OLD committed tree first: even an index deletion of a
+    # now-ignored file must be restored so checkout can remove it. A new index
+    # also discards skip-worktree, assume-unchanged and staged state.
+    index = Path(git(work, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    index.unlink(missing_ok=True)
+    git(work, "-c", "core.ignorestat=false", "read-tree", "HEAD")
+    # Refresh stat data without writing working files, preserving warm leases'
+    # unchanged files. Exit 1 means modified files; checkout below restores them.
+    refresh = subprocess.run(["git", "--no-optional-locks", "-C", str(work),
+                              "-c", "core.ignorestat=false", "update-index", "--refresh"],
+                             capture_output=True)
+    if refresh.returncode not in (0, 1):
+        refresh.check_returncode()
+    git(work, "-c", "core.ignorestat=false", "checkout", "--force", "--detach", commit)
+    git(work, "clean", "-ffd" + ("x" if deep_clean else ""))
+    check_checkout(work, commit)
+
+
 def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     main = os.fsdecode(git(repo, "worktree", "list", "--porcelain", "-z",
@@ -319,6 +351,13 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                        or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
                        or os.fsdecode(path).endswith(".lockfile") for path in changed if path):
                     reason = "lockfile or toolchain changed"
+                if any(Path(os.fsdecode(path)).name == "Cargo.toml" for path in changed if path):
+                    reason = (reason + "; " if reason else "") + "Cargo manifest changed"
+                removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
+                              previous["commit"], commit, text=False).split(b"\0")
+                if any(Path(os.fsdecode(path)).name == "main.rs"
+                       or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
+                    reason = (reason + "; " if reason else "") + "Cargo executable source removed"
             except subprocess.CalledProcessError:
                 reason = "missing previous commit"
         # Absence is an interrupted-reset marker, including when checkout hooks fail.
@@ -331,9 +370,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                 raise ValueError("missing checkout or registration")
             if previous["commit"] != git(slot, "rev-parse", "HEAD"):
                 reason = reason or "checkout differs from metadata"
-            git(slot, "-c", "core.sparseCheckout=false", "checkout", "--force", "--detach", commit)
-            git(slot, "clean", "-ffd" + ("x" if reason else ""))
-            check_checkout(slot, commit)
+            reset_checkout(slot, commit, bool(reason))
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             reason = (reason + "; " if reason else "") + f"recreated ({error})"
             try:
@@ -344,7 +381,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean):
                     shutil.rmtree(slot)
                 cleanup_worktrees(repo, slot)
                 git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(slot), commit)
-                check_checkout(slot, commit)
+                reset_checkout(slot, commit, True)
             except (OSError, ValueError, subprocess.CalledProcessError):
                 cleanup_worktrees(repo, slot)
                 git(repo, "-c", "core.sparseCheckout=false", "worktree", "add", "--detach", str(fresh), commit)
@@ -411,10 +448,19 @@ def main():
         except subprocess.CalledProcessError:
             parser.error("commit first: verifier requires a committed candidate")
         # Check both paths: the index may differ even if the worktree matches HEAD.
-        # --no-optional-locks prevents an index refresh in the source repository.
-        if (git(repo, "diff", "--name-only", candidate, "--")
-                or git(repo, "diff", "--cached", "--name-only", candidate, "--")):
-            parser.error("commit first: verifier requires tracked files to match HEAD")
+        # diff can refresh the index even with --no-optional-locks. Use a copy
+        # outside the source tree, including for refusal before leasing a slot.
+        with tempfile.NamedTemporaryFile(prefix="agent-index-") as check:
+            index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+            env = dict(os.environ, GIT_INDEX_FILE=check.name)
+            if index.exists():
+                shutil.copyfile(index, env["GIT_INDEX_FILE"])
+            else:
+                Path(check.name).unlink()
+                git(repo, "read-tree", "--empty", env=env)
+            if (git(repo, "diff", "--name-only", candidate, "--", env=env)
+                    or git(repo, "diff", "--cached", "--name-only", candidate, "--", env=env)):
+                parser.error("commit first: verifier requires tracked files to match HEAD")
         untracked = [os.fsdecode(path) for path in git(
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
         if args.before:
