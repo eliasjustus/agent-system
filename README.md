@@ -97,11 +97,12 @@ and `Requested environment:`. The requested environment is `restricted` (with an
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
 
-The header's `Write bytes:` line reports, in MiB, the bytes the launcher and its reaped children
-sent toward disk-backed storage, including data deleted before it reached the disk, or `unavailable`
-when `/proc/self/io` cannot be read or parsed. Writes to tmpfs are not counted, so a session folder
-on tmpfs shows about 0. It misses daemons and processes that were re-parented, killed by an
-interrupt or still running when the session was stopped.
+The header's `Write bytes:` line reports, in MiB, the bytes sent toward disk-backed storage from
+just before the session folder is created until the agent has been stopped and waited for, by the
+launcher and the children it waited for (and theirs, in turn). It includes data deleted before it
+reached the disk, and is `unavailable` when `/proc/self/io` cannot be read or parsed. Writes inside a
+tmpfs folder add nothing; writes elsewhere, such as Git objects in the repository, still count. It
+misses daemons, descendants that no parent waited for, and saving the answer and cleanup.
 
 To reduce checkout writes for challengers and reviewers, keep an optional
 `<private>/projects/<id>/review-leave-out.txt` beside the project's private records. The launcher
