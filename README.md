@@ -154,7 +154,8 @@ Each session sets `TMPDIR`, `TMP` and `TEMP` to its disk-backed `tmp/` folder an
 session folder after the run. With a home folder such as `/home/alice`, the default TMPDIR is 34 bytes. If its
 resolved path exceeds 62 bytes, the launcher warns on stderr and starts anyway. This budget is
 for Chromium's typical socket name on Linux; the warning does not make sockets work. Use a
-shorter absolute `XDG_CACHE_HOME` if needed. The old `agent-method/sessions/` cache is left untouched.
+shorter absolute `XDG_CACHE_HOME` if needed. After upgrading, `<cache>/agent-method/sessions/`
+can be deleted once no session started by an older version is running.
 
 ## Upgrade, rollback and removal
 
@@ -172,8 +173,9 @@ project with those same arguments.
 
 To remove the method from a project, remove its generated `AGENTS.md` and
 `.claude/agents/builder.md`, the `/.claude/agents/builder.md` line from Git's `info/exclude`, and any
-`@AGENTS.md` line you added. Remove the shared method folder and session cache only after no
-project uses them and no session is running. Private records stay unless you delete them.
+`@AGENTS.md` line you added. Once no project uses the shared method folder and no session is
+running, remove the method folder and delete only the session folder `<cache>/am/` from the
+cache. Private records stay unless you delete them.
 
 ## Platforms
 

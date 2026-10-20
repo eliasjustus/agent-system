@@ -301,8 +301,8 @@ def main():
             return 1
         length = len(os.fsencode(temporary))
         if length > 62:
-            print(f"Warning: resolved TMPDIR is {length} bytes; exceeds the 62-byte limit "
-                  "for typical Unix socket names (Chromium on Linux); starting anyway",
+            print(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
+                  "to create Unix sockets in it above 62 bytes; starting anyway",
                   file=sys.stderr)
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"

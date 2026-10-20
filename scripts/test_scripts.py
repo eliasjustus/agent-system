@@ -1344,11 +1344,13 @@ if "model_reasoning_effort=unsupported-test-value" in args:
         temporary = self.base / "other-temporary-directory"
         temporary.mkdir()
         self.env["TMPDIR"] = str(temporary)
-        self.env.pop("XDG_CACHE_HOME", None)
-        for cache in (self.home / ".cache", self.base / "cache"):
-            with self.subTest(cache=cache):
-                if cache != self.home / ".cache":
-                    self.env["XDG_CACHE_HOME"] = str(cache)
+        for value in (None, "", str(self.base / "cache")):
+            with self.subTest(xdg_cache_home=value):
+                if value is None:
+                    self.env.pop("XDG_CACHE_HOME", None)
+                else:
+                    self.env["XDG_CACHE_HOME"] = value
+                cache = Path(value) if value else self.home / ".cache"
                 self.agent_extra('''
 record["files"] = sorted(str(p.relative_to(cwd.parent)) for p in cwd.parent.iterdir())
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
@@ -1366,14 +1368,17 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertEqual(list(temporary.iterdir()), [])
 
     def test_L1_unwritable_session_root_fails_before_agent(self):
-        blocker = self.base / "cache-file"
-        blocker.write_text("not a directory")
-        self.env["XDG_CACHE_HOME"] = str(blocker)
-        result = self.launch()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("session folder", result.stderr.lower())
-        self.assertIn(str(blocker), result.stderr)
-        self.assertFalse(self.record.exists())
+        for cache, blocker in ((self.base / "cache-file", self.base / "cache-file"),
+                               (self.home / ".cache", self.home / ".cache/am")):
+            with self.subTest(blocker=blocker):
+                blocker.parent.mkdir(parents=True, exist_ok=True)
+                blocker.write_text("keep this file")
+                self.env["XDG_CACHE_HOME"] = str(cache)
+                result = self.launch()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"Cannot create session folder under {cache / 'am'}:", result.stderr)
+                self.assertFalse(self.record.exists())
+                self.assertEqual(blocker.read_text(), "keep this file")
 
     def test_L1_relative_xdg_cache_home_uses_home_cache(self):
         self.env["XDG_CACHE_HOME"] = "relative-cache"
@@ -1400,16 +1405,6 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                                  dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(temporary)))
                 self.assertFalse(session.exists())
 
-    def test_SS_S2_session_root_file_fails_before_agent(self):
-        root = self.home / ".cache/am"
-        root.parent.mkdir()
-        root.write_text("keep this file")
-        result = self.launch()
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(f"Cannot create session folder under {root}:", result.stderr)
-        self.assertFalse(self.record.exists())
-        self.assertEqual(root.read_text(), "keep this file")
-
     def test_SS_preserves_existing_and_legacy_cache_entries(self):
         cache = self.home / ".cache"
         roots = (cache / "am", cache / "agent-method/sessions")
@@ -1427,20 +1422,6 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         after = {path: path.read_bytes() if path.is_file() else None
                  for root in roots for path in root.rglob("*")}
         self.assertEqual(after, before)
-
-    def test_SS_preserves_empty_and_unset_xdg_cache_home_rules(self):
-        for value in (None, "", "relative-cache"):
-            with self.subTest(value=value):
-                if value is None:
-                    self.env.pop("XDG_CACHE_HOME", None)
-                else:
-                    self.env["XDG_CACHE_HOME"] = value
-                result = self.launch()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                temporary = Path(json.loads(self.record.read_text())["tmpdir"])
-                self.assertTrue(temporary.is_relative_to(self.home / ".cache"))
-                self.assertFalse(temporary.parent.exists())
-                self.assertFalse((self.repo / "relative-cache").exists())
 
     def socket_budget_cache(self, length, component="cache"):
         # Use a short fixture so both sides of the Linux Chromium limit are reachable.
@@ -1464,10 +1445,9 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.assertEqual(result.stderr, "")
                 else:
                     self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-                    self.assertIn("Warning:", result.stderr)
-                    self.assertIn("63 bytes", result.stderr)
-                    self.assertIn("62-byte limit", result.stderr)
-                    self.assertIn("typical Unix socket names", result.stderr)
+                    self.assertEqual(result.stderr,
+                                     "Warning: TMPDIR is 63 bytes; programs such as Chromium may fail "
+                                     "to create Unix sockets in it above 62 bytes; starting anyway\n")
                 self.assertFalse(temporary.parent.exists())
 
     def test_SS_S3_non_ascii_tmpdir_counts_bytes(self):
@@ -1479,7 +1459,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertLessEqual(len(temporary), 62)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
         self.assertIn("63 bytes", result.stderr)
-        self.assertIn("62-byte limit", result.stderr)
+        self.assertIn("above 62 bytes; starting anyway", result.stderr)
 
     def test_SS_S3_symlink_cache_uses_resolved_length(self):
         cache = self.socket_budget_cache(63)
@@ -1494,7 +1474,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertEqual(len(os.fsencode(temporary)), 63)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
         self.assertIn("63 bytes", result.stderr)
-        self.assertIn("62-byte limit", result.stderr)
+        self.assertIn("above 62 bytes; starting anyway", result.stderr)
 
     def test_L2_scope_command_and_header(self):
         result = self.launch()
