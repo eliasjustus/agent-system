@@ -1433,6 +1433,168 @@ subprocess.check_output = broken_status
         self.assertEqual((self.repo / "forgotten").read_text(), "needed source")
         self.assertIn("untracked source file was previously tracked", self.out.read_text())
 
+    def test_POOL_R11_forgotten_source_from_earlier_lease_cleans_stale_output(self):
+        (self.repo / "forgotten.c").write_text("needed source")
+        self.git("add", "forgotten.c")
+        self.git("commit", "-qm", "A tracks source")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("A's stale output")
+        self.git("rm", "forgotten.c")
+        self.git("commit", "-qm", "X has no source")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertEqual((slot / "ignored").read_text(), "A's stale output")
+        (self.repo / "tracked").write_text("unrelated candidate B")
+        self.git("add", "tracked")
+        self.git("commit", "-qm", "B forgets source")
+        (self.repo / "forgotten.c").write_text("needed source")
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse((slot / "ignored").exists())
+        self.assertFalse((slot / "forgotten.c").exists())
+        self.assertEqual((self.repo / "forgotten.c").read_text(), "needed source")
+        self.assertIn("untracked source file was previously tracked", self.out.read_text())
+        state = json.loads(slot.with_suffix(".json").read_text())
+        self.assertEqual(state["commits"], [self.git("rev-parse", "HEAD")])
+        self.assertEqual(state["uses"], 1)
+
+    def test_POOL_R11_history_is_persistent_bounded_and_cleared_by_deep_clean(self):
+        slot = Path(self.verifier()["cwd"])
+        commit = self.git("rev-parse", "HEAD")
+        metadata = slot.with_suffix(".json")
+        for uses in range(2, 21):
+            self.assertEqual(self.verifier()["cwd"], str(slot))
+            state = json.loads(metadata.read_text())
+            self.assertEqual(state["uses"], uses)
+            self.assertEqual(state["commits"], [commit] * uses)
+        self.verifier()
+        self.assertEqual(json.loads(metadata.read_text())["commits"], [commit])
+        self.assertIn("deep clean: 20 uses", self.out.read_text())
+        self.verifier()
+        self.verifier("codex", "--clean-checkout")
+        self.assertEqual(json.loads(metadata.read_text())["commits"], [commit])
+
+    def test_POOL_R11_history_batch_handles_newlines_and_missing_paths(self):
+        name = "forgotten\nsource.c"
+        (self.repo / name).write_text("source")
+        self.git("add", name)
+        self.git("commit", "-qm", "source with newline in name")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("warm output")
+        # A missing path's response must not look like a successful object.
+        (self.repo / ("never-tracked\n" + "a" * 40 + "\nfile")).touch()
+        self.verifier()
+        self.assertEqual((slot / "ignored").read_text(), "warm output")
+        self.assertIn("warm reset", self.out.read_text())
+        self.git("rm", name)
+        self.git("commit", "-qm", "unrelated candidate")
+        self.verifier()
+        self.assertTrue((slot / "ignored").exists())
+        (self.repo / name).write_text("forgotten source")
+        self.verifier()
+        self.assertFalse((slot / "ignored").exists())
+        self.assertFalse((slot / name).exists())
+
+    def test_POOL_R11_missing_or_corrupt_commit_history_forces_deep_clean(self):
+        slot = Path(self.verifier()["cwd"])
+        metadata = slot.with_suffix(".json")
+        for history in (None, [], "not a list", [None], ["bad commit"], ["1" * 40]):
+            with self.subTest(history=history):
+                state = json.loads(metadata.read_text())
+                if history is None:
+                    del state["commits"]
+                else:
+                    state["commits"] = history
+                metadata.write_text(json.dumps(state))
+                (slot / "ignored").write_text("old build")
+                self.assertEqual(self.verifier()["cwd"], str(slot))
+                self.assertFalse((slot / "ignored").exists())
+                self.assertIn("deep clean: missing or corrupt metadata", self.out.read_text())
+                self.assertEqual(json.loads(metadata.read_text())["commits"], [self.git("rev-parse", "HEAD")])
+
+    def test_POOL_R11_tracked_directory_modes_match_fresh_checkout(self):
+        (self.repo / "dir/nested").mkdir(parents=True)
+        (self.repo / "dir/nested/file").write_text("unchanged")
+        self.git("add", ".")
+        self.git("commit", "-qm", "nested tracked file")
+        slot = Path(self.verifier()["cwd"])
+        for mask in dict.fromkeys((self.current_umask(), 0o027)):
+            previous_umask = os.umask(mask)
+            try:
+                fresh = self.base / f"fresh-{mask}"
+                self.git("worktree", "add", "--detach", str(fresh), "HEAD")
+                # Changing umask also repairs file modes, which can recreate a
+                # read-only tree on the baseline. Set up warmth after that reset.
+                self.verifier()
+                (slot / "ignored").write_text("warm build")
+                for mode in (0o555, 0o700, 0o777, 0o2775):
+                    with self.subTest(umask=oct(mask), mode=oct(mode)):
+                        for name in ("dir/nested", "dir", "."):
+                            (slot / name).chmod(mode)
+                        self.assertEqual(self.verifier()["cwd"], str(slot))
+                        for name in (".", "dir", "dir/nested"):
+                            self.assertEqual((slot / name).stat().st_mode & 0o7777,
+                                             (fresh / name).stat().st_mode & 0o7777)
+                        self.assertEqual((slot / "ignored").read_text(), "warm build")
+                        self.assertIn("warm reset", self.out.read_text())
+            finally:
+                os.umask(previous_umask)
+
+    def test_POOL_R11_reset_and_check_disable_untracked_cache(self):
+        self.git("config", "core.untrackedCache", "true")
+        slot = Path(self.verifier()["cwd"])
+        subprocess.check_call(["git", "-C", str(slot), "update-index", "--untracked-cache"], env=self.env)
+        subprocess.check_call(["git", "-C", str(slot), "status", "--porcelain"], env=self.env,
+                              stdout=subprocess.DEVNULL)
+        (slot / "leftover").write_text("must not be hidden")
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def check_cache_config(command, *args, **kwargs):
+    if any("/slot-" in str(arg) for arg in command) and any(
+            action in command for action in ("read-tree", "checkout", "clean", "status")):
+        assert "core.untrackedCache=false" in command, command
+    return original(command, *args, **kwargs)
+subprocess.check_output = check_cache_config
+''')
+        self.assertEqual(self.verifier()["cwd"], str(slot))
+        self.assertFalse((slot / "leftover").exists())
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R11_fresh_fallback_checks_status_without_content_recheck(self):
+        self.busy_pool()
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def no_content_recheck(command, *args, **kwargs):
+    assert not any(action in command for action in ("hash-object", "check-attr", "cat-file")), command
+    return original(command, *args, **kwargs)
+subprocess.check_output = no_content_recheck
+''')
+        record = self.verifier()
+        self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
+        self.assertIn("pool busy", self.out.read_text())
+
+    def test_POOL_R11_refusal_hashes_only_changed_source_paths(self):
+        (self.repo / "unchanged").write_text("must not be hashed")
+        self.git("add", "unchanged")
+        self.git("commit", "-qm", "unchanged source")
+        (self.repo / "tracked").write_text("dirty source")
+        self.inject_launcher('''
+import os, pathlib, subprocess
+original = subprocess.check_output
+def changed_paths_only(command, *args, **kwargs):
+    if "hash-object" in command and "--stdin-paths" in command:
+        paths = kwargs["input"]
+        assert paths == b'"tracked"\\n', paths
+        pathlib.Path(os.environ["RECORD"] + ".hashed").write_bytes(paths)
+    return original(command, *args, **kwargs)
+subprocess.check_output = changed_paths_only
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("commit first", result.stderr)
+        self.assertEqual(Path(str(self.record) + ".hashed").read_bytes(), b'"tracked"\n')
+        self.assertFalse(self.pool_root().exists())
+
     def test_POOL_R10_09_unchanged_index_stat_data_survives_reset(self):
         self.verifier()
         self.inject_launcher('''

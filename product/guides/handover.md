@@ -57,7 +57,7 @@ For a committed candidate, you can instead create a detached worktree at the exa
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family
 there, give it the role contract and the brief (and `guides/verification.md` for a verifier), and
 save its full answer unedited in the task folder's `results/`. Give a verifier an evidence folder
-and keep its evidence too. Remove the worktree when checking is finished. Commit before verifying. Uncommitted or untracked candidates may go through `run.py` for
+and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
 challenger or reviewer snapshots.
 
 Investigations, research and analyses that change nothing run the same way with `--role

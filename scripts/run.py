@@ -28,7 +28,8 @@ POOL_SLOTS = 3
 POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
-                   "-c", "index.sparse=false", "-c", "core.hooksPath=/dev/null")
+                   "-c", "index.sparse=false", "-c", "core.hooksPath=/dev/null",
+                   "-c", "core.untrackedCache=false")
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
@@ -297,8 +298,9 @@ def review_leave_out(repo, private, head, snapshot):
 def check_checkout(work, commit, pass_fds=()):
     run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
     # Status can report tracked files modified even immediately after a fresh
-    # checkout (e.g. committed CRLF under eol=lf). Raw content is checked below
-    # by checkout_mismatches; status judges only untracked files and submodules.
+    # checkout (e.g. committed CRLF under eol=lf). Reused slots have their raw
+    # content checked by checkout_mismatches; status judges only untracked files
+    # and submodules.
     status = run("status", "--porcelain=v2", "-z", "--ignored=no", "--untracked-files=all",
                  "--ignore-submodules=none", text=False).split(b"\0")
     dirty = any(entry.startswith(b"? ") or (
@@ -309,13 +311,15 @@ def check_checkout(work, commit, pass_fds=()):
         raise ValueError("checkout is not clean and detached at the candidate")
 
 
-def checkout_mismatches(work, pass_fds=()):
+def checkout_mismatches(work, pass_fds=(), paths=None):
     """Check raw content and Git modes without refreshing or writing the tree."""
     run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
     entries = []
     for entry in run("ls-files", "--stage", "-z", text=False).split(b"\0"):
         if entry:
             info, path = entry.split(b"\t", 1)
+            if paths is not None and path not in paths:
+                continue
             mode, blob, stage = info.split()
             if stage != b"0":
                 raise ValueError("unmerged checkout index")
@@ -410,7 +414,9 @@ def remove_checkout_tree(path):
     shutil.rmtree(path, onexc=writable_retry)
 
 
-def check_checkout_parents(work, paths, missing_ok=False):
+def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
+    if directory_mode is not None:
+        work.chmod(directory_mode)
     checked = {work}
     for raw in paths:
         parent = work
@@ -426,12 +432,13 @@ def check_checkout_parents(work, paths, missing_ok=False):
                 raise
             if not stat.S_ISDIR(mode):
                 raise ValueError("checkout path has a non-directory parent")
+            if directory_mode is not None and stat.S_IMODE(mode) != directory_mode:
+                parent.chmod(directory_mode)
             checked.add(parent)
 
 
-def reset_checkout(work, commit, deep_clean, pass_fds=()):
+def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
-    common = Path(run("rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     admin = Path(run("rev-parse", "--absolute-git-dir"))
     # Check both directions before touching any Git state. A slot's .git can
     # have been replaced with a pointer to the user's main Git directory.
@@ -460,19 +467,25 @@ def reset_checkout(work, commit, deep_clean, pass_fds=()):
         for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
             run("update-index", flag, "-z", "--stdin", input=b"\0".join(flagged) + b"\0", text=False)
     run("-c", "core.ignorestat=false", "read-tree", "--reset", "HEAD")
+    umask = os.umask(0)
+    os.umask(umask)
+    directory_mode = 0o777 & ~umask
+    # Git does not restore directory modes. Restore old tracked parents before
+    # unlink/checkout, rejecting symlinks before Git can write through them.
+    # Then restore the new tree's parents after checkout creates them.
+    paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
+    check_checkout_parents(work, paths, missing_ok=True, directory_mode=directory_mode)
     # Ignore rules left by an agent must not shield other untracked files.
     # Include ignored attributes too, before refresh or checkout reads them.
     leftovers = [raw for raw in run("ls-files", "--others", "-z", "--",
                  ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
                  text=False).split(b"\0") if raw]
-    check_checkout_parents(work, leftovers)
+    check_checkout_parents(work, leftovers, directory_mode=directory_mode)
     for raw in leftovers:
         (work / os.fsdecode(raw)).unlink()
-    # Reject symlinked parents before Git or a repair can write through them.
-    # Missing directories are safe for checkout to create.
-    paths = run("ls-files", "-z", text=False).split(b"\0")
-    check_checkout_parents(work, [raw for raw in paths if raw], missing_ok=True)
     run("-c", "core.ignorestat=false", "checkout", "-q", "--force", "--detach", commit)
+    paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
+    check_checkout_parents(work, paths, directory_mode=directory_mode)
     # Fresh worktrees have empty gitlink directories. Empty populated modules
     # directly: submodule deinit would change the shared repository config.
     gitlinks = [entry.split(b"\t", 1)[1] for entry in
@@ -524,10 +537,14 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
         try:
             previous = json.loads(metadata.read_text())
             if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
-                    or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])):
+                    or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
+                    or not isinstance(previous["commits"], list)
+                    or not 1 <= len(previous["commits"]) <= previous["uses"]
+                    or previous["commits"][-1] != previous["commit"]
+                    or any(not re.fullmatch(r"[0-9a-f]{40,64}", item) for item in previous["commits"])):
                 raise ValueError("invalid metadata")
         except (OSError, ValueError, KeyError, TypeError):
-            previous = {"uses": 0, "commit": ""}
+            previous = {"uses": 0, "commit": "", "commits": []}
             reason = "missing or corrupt metadata"
         if force_clean:
             reason = "--clean-checkout"
@@ -545,7 +562,15 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                     reason = (reason + "; " if reason else "") + "Cargo manifest changed"
                 removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
                               previous["commit"], commit, text=False).split(b"\0")
-                if set(removed) & {os.fsencode(path) for path in untracked}:
+                # Ignored output can survive several unrelated candidates.
+                # Check every commit that could have produced that output.
+                objects = [os.fsencode(revision + ":" + path)
+                           for revision in previous["commits"] for path in untracked]
+                # Compare the entire all-missing response: missing paths can
+                # contain newlines that look like successful object responses.
+                if objects and git(repo, "cat-file", "--batch-check=%(objectname)", "-z",
+                        input=b"\0".join(objects) + b"\0", text=False) != b"\n".join(
+                            item + b" missing" for item in objects):
                     reason = (reason + "; " if reason else "") + "untracked source file was previously tracked"
                 if any(Path(os.fsdecode(path)).name == "main.rs"
                        or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
@@ -563,7 +588,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                 raise ValueError("missing checkout or registration")
             if previous["commit"] != git(slot, "rev-parse", "HEAD"):
                 reason = reason or "checkout differs from metadata"
-            reset_checkout(slot, commit, bool(reason), pass_fds)
+            reset_checkout(slot, common, commit, bool(reason), pass_fds)
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             reason = (reason + "; " if reason else "") + f"recreated ({error})"
             try:
@@ -574,20 +599,19 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                     remove_checkout_tree(slot)
                 cleanup_worktrees(repo, slot)
                 git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit, pass_fds=pass_fds)
-                reset_checkout(slot, commit, True, pass_fds)
+                reset_checkout(slot, common, commit, True, pass_fds)
             except (OSError, ValueError, subprocess.CalledProcessError):
                 cleanup_worktrees(repo, slot)
                 leases.remove(lock)
                 lock.close()
                 continue
         metadata.with_suffix(".json.tmp").write_text(json.dumps({
-            "uses": 1 if reason else previous["uses"] + 1, "commit": commit}))
+            "uses": 1 if reason else previous["uses"] + 1, "commit": commit,
+            "commits": [commit] if reason else previous["commits"] + [commit]}))
         metadata.with_suffix(".json.tmp").replace(metadata)
         return slot, f"pool {slot}; " + (f"deep clean: {reason}" if reason else "warm reset")
     git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
     check_checkout(fresh, commit)
-    if checkout_mismatches(fresh):
-        raise ValueError("fresh checkout bytes or modes differ from candidate")
     return fresh, "pool busy or slots unusable; fresh session worktree"
 
 
@@ -671,7 +695,7 @@ def main():
                               text=False).split(b"\0")) - {b""}
             # Some committed blobs look dirty even in a fresh checkout. Accept
             # those only when their bytes and modes match checkout conversion.
-            if staged or (changed and changed.intersection(checkout_mismatches(repo))):
+            if staged or (changed and checkout_mismatches(repo, paths=changed)):
                 parser.error("commit first: verifier requires tracked files to match HEAD")
         untracked = [os.fsdecode(path) for path in git(
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]

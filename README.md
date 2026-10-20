@@ -137,9 +137,10 @@ Gemfile.lock, composer.lock,
 flake.lock, bun.lock/bun.lockb and toolchain pins (including .java-version). Changes to any
 Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files and files under
 any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. A source file
-left untracked that was tracked in the slot's previous commit but is absent from the candidate also
+left untracked that was tracked in any commit held by the slot since its last deep clean also
 forces a deep clean, so stale output from another lane cannot hide that forgotten file. Counts
-survive restarts. Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
+and commit history survive restarts; metadata without that history forces a deep clean on upgrade.
+Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
 are recreated, with a fresh session worktree as a fallback. The header says whether a reset was
 warm or deep and why. Pool reset writes count in `Write bytes:`.
 
@@ -157,6 +158,11 @@ agent's descendants, and releases locks only after they are gone. If the launche
 supervisor stops the agent and its descendants, keeps its leases until they are reaped, and removes
 the orphaned session folder. A launcher killed before its lease guard starts can leave its session
 folder under `<cache>/am`; reset Git children inherit its locks and hold them until they exit.
+Sessions without a lease guard (builders, investigators, challengers, reviewers, and verifiers
+using only fresh fallback checkouts) killed outright can also leave their folder and worktree
+registrations. After confirming their processes have stopped, delete the specific session folder,
+then run `git -C /path/to/project worktree prune` in its repository. Check for unrelated stale
+registrations before pruning.
 This does not rely on systemd-run forwarding file descriptors. Pool supervision requires Linux.
 
 Codex challengers and reviewers read the snapshot through `git show <snapshot>:<path>`,
@@ -236,7 +242,7 @@ python3 scripts/setup.py --project /path/to/project --id my-project
 
 Include your custom `--private` and `--method` on both commands if you used them. Private records
 are kept. Upgrading creates pool slots lazily; existing session caches need no migration.
-To inspect a pool, read its `slot-*.json` files (commit and use count), run
+To inspect a pool, read its `slot-*.json` files (commit, use count and commit history), run
 `git -C /path/to/project worktree list`, and inspect its size with
 `du -sh <cache>/am-pool/<name>-<hash>`. To remove a repository's pool safely, first stop its launcher
 sessions and wait for their agents and supervisors to finish, including orphaned sessions. Then
