@@ -6,7 +6,7 @@
 
 <!-- At most 150 words. Rewrite in place. -->
 - Request: "{{REQUEST}}" ({{DATE}}, from the user)
-- State: active  <!-- active | awaiting verdict | paused: <reason>; resume when <condition> | closed: <accepted | abandoned | superseded by <id>> -->
+- State: active  <!-- active | awaiting verdict | paused: <reason>; resume when <condition> | closed: <signed off by the request | accepted | abandoned | superseded by <id>> -->
 - Depth: undecided  <!-- above | below, with the three answers below -->
 - Owner: <session, date>
 - Estimate: <time range>; started <time>; stop at <start + 2x upper end>  <!-- only a stop message moves it; actual effort is added at close -->
@@ -59,7 +59,7 @@ cases adopted or rejected. -->
 - Scenarios: <ID: pass | fail | unverified: reason>, ...
 - Limits:
 - Cost: estimate <range>, actual <time>
-- Verdict: pending  <!-- the user's words and date -->
+- Verdict: signed off by the request  <!-- or, where you asked: pending, then the user's words and date -->
 
 ## Log
 
