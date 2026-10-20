@@ -633,8 +633,13 @@ def cannot_remove(path, *args, **kwargs):
     return original(path, *args, **kwargs)
 shutil.rmtree = cannot_remove
 ''')
-        record = self.verifier()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
         self.assertEqual(record["cwd"], str(slot.with_name("slot-2")))
+        for message in (str(slot), "simulated inaccessible slot"):
+            self.assertIn(message, result.stderr)
+            self.assertIn(message, self.out.read_text())
         with slot.with_suffix(".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -1617,8 +1622,213 @@ subprocess.check_output = changed_paths_only
                     self.assertFalse(os.path.lexists(slot / name), name)
                 self.assertEqual(list(outside.iterdir()), [outside / "keep"])
                 self.assertEqual((outside / "keep").read_text(), "untouched")
-                self.assertEqual((slot / "ignored/warm").exists(), not clean)
+                self.assertFalse((slot / "ignored").exists())
                 self.assertIn("--clean-checkout" if clean else "warm reset", self.out.read_text())
+
+    def test_POOL_R13_internal_dependency_symlinks_survive_warm_reset(self):
+        (self.repo / ".gitignore").write_text("node_modules\n.venv\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "dependency trees")
+        slot = Path(self.verifier()["cwd"])
+        package = slot / "node_modules/.pnpm/tool@1/node_modules/tool"
+        package.mkdir(parents=True)
+        script = package / "cli"
+        script.write_text("#!/bin/sh\nprintf 'works\\n'\n")
+        script.chmod(0o755)
+        (slot / "node_modules/tool").symlink_to(".pnpm/tool@1/node_modules/tool")
+        (slot / "node_modules/.bin").mkdir()
+        (slot / "node_modules/.bin/tool").symlink_to("../tool/cli")
+        (slot / "node_modules/.bin/future").symlink_to("../future/cli")
+        (slot / ".venv/bin").mkdir(parents=True)
+        (slot / ".venv/python").write_text("internal interpreter")
+        (slot / ".venv/bin/python").symlink_to(slot / ".venv/python")
+        record = self.verifier()
+        self.assertEqual(record["cwd"], str(slot))
+        self.assertIn("warm reset", self.out.read_text())
+        self.assertEqual(subprocess.check_output([str(slot / "node_modules/.bin/tool")], text=True), "works\n")
+        self.assertEqual((slot / "node_modules/tool").resolve(), package)
+        self.assertTrue((slot / "node_modules/.bin/future").is_symlink())
+        self.assertEqual((slot / ".venv/bin/python").read_text(), "internal interpreter")
+
+    def test_POOL_R13_external_dependency_link_removes_whole_ignored_tree(self):
+        (self.repo / ".gitignore").write_text("node_modules\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "dependency tree")
+        slot = Path(self.verifier()["cwd"])
+        outside = self.base / "external-package"
+        outside.mkdir()
+        (outside / "keep").write_text("untouched")
+        (slot / "node_modules/package").mkdir(parents=True)
+        (slot / "node_modules/installed").write_text("otherwise looks installed")
+        (slot / "node_modules/package/link").symlink_to(os.path.relpath(outside, slot / "node_modules/package"))
+        self.verifier()
+        self.assertFalse((slot / "node_modules").exists())
+        self.assertEqual((outside / "keep").read_text(), "untouched")
+        self.assertEqual(list(outside.iterdir()), [outside / "keep"])
+
+    def test_POOL_R13_ignored_rule_files_stay_warm(self):
+        folders = (".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache")
+        (self.repo / ".gitignore").write_text("\n".join(folders) + "\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignored tool caches")
+        slot = Path(self.verifier()["cwd"])
+        for folder in folders:
+            (slot / folder).mkdir()
+            for name in (".gitignore", ".gitattributes", "warm"):
+                (slot / folder / name).write_text("*\n")
+        (slot / "src").mkdir()
+        (slot / "src/.gitignore").write_text("*\n")
+        (slot / "src/.gitattributes").write_text("* -text\n")
+        (slot / "src/stale").touch()
+        self.verifier()
+        for folder in folders:
+            for name in (".gitignore", ".gitattributes", "warm"):
+                self.assertEqual((slot / folder / name).read_text(), "*\n")
+        self.assertFalse((slot / "src").exists())
+
+    def test_POOL_R13_nondirectory_slot_is_recreated(self):
+        slot = Path(self.verifier()["cwd"])
+        for kind in ("file", "fifo"):
+            with self.subTest(kind=kind):
+                if slot.is_dir():
+                    shutil.rmtree(slot)
+                else:
+                    slot.unlink()
+                if kind == "file":
+                    slot.write_text("broken slot")
+                else:
+                    os.mkfifo(slot)
+                record = self.verifier()
+                self.assertEqual(record["cwd"], str(slot))
+                self.assertTrue(slot.is_dir())
+                self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 2)
+                self.assertIn("recreated", self.out.read_text())
+
+    def test_POOL_R13_rulefiles_cannot_outlive_candidate_ignore_rules(self):
+        for case in ("local-ignore-edit", "committed-ignore-removal"):
+            with self.subTest(case=case):
+                if case == "committed-ignore-removal":
+                    (self.repo / ".gitignore").write_text("ignored\nstale\n")
+                    self.git("commit", "-qam", "ignore stale")
+                slot = Path(self.verifier()["cwd"])
+                if case == "local-ignore-edit":
+                    (slot / ".gitignore").write_text("ignored\nstale\n")
+                else:
+                    (self.repo / ".gitignore").write_text("ignored\n")
+                    self.git("commit", "-qam", "stop ignoring stale")
+                (slot / "stale").mkdir(exist_ok=True)
+                (slot / "stale/.gitignore").write_text("*\n")
+                (slot / "stale/.gitattributes").write_text("* -text\n")
+                (slot / "stale/forgotten").touch()
+                (slot / "ignored").write_text("warm build")
+                self.verifier()
+                self.assertFalse((slot / "stale").exists())
+                self.assertEqual((slot / "ignored").read_text(), "warm build")
+
+    def test_POOL_R13_relative_worktree_paths_stay_warm(self):
+        probe = subprocess.run(["git", "worktree", "add", "-h"], env=self.env,
+                               text=True, capture_output=True)
+        if "relative-paths" not in probe.stdout + probe.stderr:
+            self.skipTest("Git does not support relative worktree paths")
+        self.git("config", "worktree.useRelativePaths", "true")
+        slot = Path(self.verifier()["cwd"])
+        self.assertTrue(slot.is_relative_to(self.pool_root()), "relative path config must permit a pool lease")
+        admin = Path(subprocess.check_output(["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"],
+                                            env=self.env, text=True).strip())
+        self.assertTrue(Path((admin / "gitdir").read_text().strip()).is_absolute())
+        # Accept registrations created by an older launcher or Git command too.
+        (admin / "gitdir").write_text(os.path.relpath(slot / ".git", admin) + "\n")
+        (slot / "ignored").write_text("warm build")
+        self.verifier()
+        self.assertEqual((slot / "ignored").read_text(), "warm build")
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R13_relative_registration_cleanup_fallback(self):
+        probe = subprocess.run(["git", "worktree", "add", "-h"], env=self.env,
+                               text=True, capture_output=True)
+        if "relative-paths" not in probe.stdout + probe.stderr:
+            self.skipTest("Git does not support relative worktree paths")
+        self.git("config", "worktree.useRelativePaths", "true")
+        self.agent_extra('''
+import shutil
+temporary = pathlib.Path(os.environ["TMPDIR"]) / "extra"
+subprocess.check_call(["git", "worktree", "add", "--detach", str(temporary), "HEAD"])
+shutil.rmtree(temporary)
+''')
+        self.inject_launcher('''
+import subprocess
+original = subprocess.check_output
+def fail_remove(command, *args, **kwargs):
+    if "worktree" in command and "remove" in command:
+        raise subprocess.CalledProcessError(31, command)
+    return original(command, *args, **kwargs)
+subprocess.check_output = fail_remove
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_POOL_R13_submodule_untracked_allowed_tracked_edits_refused(self):
+        self.env["PATH"] += os.pathsep + os.environ["PATH"]
+        module = self.base / "module"
+        subprocess.check_call(["git", "init", "-q", str(module)], env=self.env)
+        (module / "file").write_text("committed")
+        for args in (("add", "."), ("commit", "-qm", "module")):
+            subprocess.check_call(["git", "-C", str(module), *args], env=self.env)
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(module), "vendor/module")
+        self.git("commit", "-qam", "submodule")
+        sub = self.repo / "vendor/module"
+        (sub / "forgotten").write_text("untracked")
+        index = (self.repo / ".git/index").read_bytes()
+        slot = Path(self.verifier()["cwd"])
+        self.assertFalse((slot / "vendor/module/forgotten").exists())
+        self.assertEqual((sub / "forgotten").read_text(), "untracked")
+        (sub / "file").write_text("edited")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("commit first", result.stderr)
+        self.assertIn("vendor/module", result.stderr)
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+
+    def test_POOL_R13_removal_retry_preserves_external_hardlink_mode(self):
+        slot = Path(self.verifier()["cwd"])
+        external = self.base / "external-file"
+        external.write_text("untouched")
+        external.chmod(0o640)
+        (slot / "ignored").mkdir()
+        (slot / "ignored/hardlink").hardlink_to(external)
+        (slot / "ignored").chmod(0o500)
+        (slot / ".git").write_text("broken")
+        try:
+            self.verifier()
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o640)
+            self.assertEqual(external.read_text(), "untouched")
+        finally:
+            if (slot / "ignored").exists():
+                (slot / "ignored").chmod(0o700)
+
+    def test_POOL_R13_guard_exits_cleanly_before_starting_agent(self):
+        tree = ast.parse((ROOT / "scripts/run.py").read_text())
+        guard = next(ast.literal_eval(node.value) for node in tree.body
+                     if isinstance(node, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == "LEASE_GUARD" for target in node.targets))
+        for early_exit in ("parent", "signal"):
+            with self.subTest(early_exit=early_exit):
+                session = self.base / "guard-session"
+                session.mkdir(exist_ok=True)
+                prefix = ""
+                if early_exit == "signal":
+                    prefix = ("import os, signal, subprocess\n"
+                              "def interrupted_popen(*args, **kwargs):\n"
+                              "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                              "subprocess.Popen = interrupted_popen\n")
+                result = subprocess.run(
+                    [sys.executable, "-c", prefix + guard, str(ROOT / "scripts/run.py"),
+                     str(self.repo), str(session), str(os.getpid() if prefix else -1),
+                     sys.executable, "-c", "raise RuntimeError('agent must not start')"],
+                    env=self.env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 143, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_POOL_R12_special_files_are_removed_on_warm_and_deep_resets(self):
         slot = Path(self.verifier()["cwd"])

@@ -123,6 +123,12 @@ Before each use, a slot is reset to the detached candidate and cleaned of tracke
 untracked files, including nested repositories. Slot resets and content checks run with Git hooks
 disabled, including relative `core.hooksPath` hooks. Ignored build output remains warm. Source working
 files, index, branches and config stay untouched.
+Every reset removes FIFO/socket files and ignored symlinks whose resolved target is outside the
+slot, together with the top-level ignored folder containing such a link (a top-level link is
+removed itself). Targets are never removed. Internal dependency links, including dangling ones,
+stay warm. Files ignored only through the user's global `core.excludesFile` are removed every time;
+projects should ignore build folders in their own `.gitignore` to keep them warm. A default ACL
+on a tracked directory is not reset; this is a known limit of checkout reuse.
 
 Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
 path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside

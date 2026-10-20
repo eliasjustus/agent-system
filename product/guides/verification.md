@@ -9,6 +9,11 @@ the committed HEAD captured when it starts. Untracked files stay out of the chec
 in the header: a forgotten file must fail. When the header names untracked source files left out
 and your checks pass, say so in your answer. Check `Snapshot commit:` against the brief's candidate.
 Pool checkouts are reset before use; ignored build output remains warm.
+Every reset removes FIFO/socket files and ignored symlinks pointing outside the slot, together
+with their top-level ignored folder; a top-level link is removed itself, and its target is untouched.
+Internal dependency links, including dangling ones, remain. Files ignored only through the user's
+global `core.excludesFile` are removed every time: projects should ignore build folders in their own
+`.gitignore` to keep them warm. A default ACL on a tracked directory is not reset (a known limit).
 Ignored files may come from earlier sessions; if a check depends on one other than build output the
 check itself produces, ask the orchestrator for a rerun with `--clean-checkout`.
 After an environment-looking failure, the verifier reports it and recommends an orchestrator rerun

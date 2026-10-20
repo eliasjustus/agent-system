@@ -50,6 +50,7 @@ launcher = int(sys.argv[4])
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(36, 1, 0, 0, 0):
     raise OSError(ctypes.get_errno(), "cannot become lease subreaper")
+code = 143
 def interrupted(signum, frame):
     raise SystemExit(128 + signum)
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -116,6 +117,11 @@ def cleanup_failed(what, error):
     print(f"Cleanup failed: {what}: {error}", file=sys.stderr)
 
 
+def registered_gitfile(admin):
+    path = Path(os.fsdecode((admin / "gitdir").read_bytes().removesuffix(b"\n")))
+    return Path(os.path.normpath(admin / path))
+
+
 def cleanup_worktrees(repo, session):
     try:
         probe = subprocess.run(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
@@ -144,8 +150,7 @@ def cleanup_worktrees(repo, session):
                         common = repo / common
                     for admin in (common / "worktrees").iterdir():
                         try:
-                            registered = Path(os.path.normpath(os.fsdecode(
-                                (admin / "gitdir").read_bytes().removesuffix(b"\n"))))
+                            registered = registered_gitfile(admin)
                             if registered == path / ".git":
                                 shutil.rmtree(admin)
                                 break
@@ -406,13 +411,19 @@ def remove_checkout_tree(path):
         # a directory needs search permission on the directory itself as well.
         parent = Path(name).parent
         parent.chmod(parent.stat().st_mode | 0o700)
-        if not Path(name).is_symlink():
-            os.chmod(name, os.stat(name).st_mode | 0o700)
         if function in (os.open, os.scandir):
+            if stat.S_ISDIR(Path(name).lstat().st_mode):
+                os.chmod(name, os.stat(name).st_mode | 0o700)
             remove_checkout_tree(Path(name))
         else:
             function(name)
-    shutil.rmtree(path, onexc=writable_retry)
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, onexc=writable_retry)
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError as error:
+            writable_retry(os.unlink, path, error)
 
 
 def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
@@ -438,6 +449,40 @@ def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
             checked.add(parent)
 
 
+def clean_checkout_rules(work, paths, directory_mode, pass_fds):
+    run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
+    # Ignore rules left by an agent must not shield other untracked files.
+    # Rule files within an already ignored directory affect only ignored paths
+    # and belong to the warm build tree. Check parents without a trailing slash:
+    # a directory's own .gitignore must not make that directory look ignored.
+    leftovers = [raw for raw in run("ls-files", "--others", "-z", "--",
+                 ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
+                 text=False).split(b"\0") if raw]
+    # A directory containing tracked files is not wholly ignored: its rules
+    # can still alter the committed checkout's bytes.
+    ignored_dirs = set()
+    checked_dirs = {parent for raw in paths for parent in Path(os.fsdecode(raw)).parents}
+    for raw in sorted(leftovers, key=lambda path: len(Path(os.fsdecode(path)).parts)):
+        relative = Path(os.fsdecode(raw))
+        for parent in reversed(relative.parents):
+            if parent in ignored_dirs:
+                break
+            if parent == Path(".") or parent in checked_dirs:
+                continue
+            try:
+                run("check-ignore", "-q", "--", str(parent))
+            except subprocess.CalledProcessError as error:
+                if error.returncode != 1:
+                    raise
+                checked_dirs.add(parent)
+            else:
+                ignored_dirs.add(parent)
+                break
+        else:
+            check_checkout_parents(work, [raw], directory_mode=directory_mode)
+            (work / os.fsdecode(raw)).unlink()
+
+
 def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     run = partial(git, work, *CHECKOUT_CONFIG, pass_fds=pass_fds)
     admin = Path(run("rev-parse", "--absolute-git-dir"))
@@ -445,7 +490,7 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     # have been replaced with a pointer to the user's main Git directory.
     if (admin.parent != common / "worktrees" or admin.is_symlink()
             or admin.resolve() != admin
-            or (admin / "gitdir").read_bytes().removesuffix(b"\n") != os.fsencode(work / ".git")):
+            or registered_gitfile(admin) != work / ".git"):
         raise ValueError("checkout Git directory is not its own worktree registration")
     # Everything else is private state from a previous session: operation
     # state, config, attributes, refs, reflogs and locks. Keep the index's stat
@@ -476,17 +521,13 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     # Then restore the new tree's parents after checkout creates them.
     paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
     check_checkout_parents(work, paths, missing_ok=True, directory_mode=directory_mode)
-    # Ignore rules left by an agent must not shield other untracked files.
-    # Include ignored attributes too, before refresh or checkout reads them.
-    leftovers = [raw for raw in run("ls-files", "--others", "-z", "--",
-                 ".gitattributes", ":(glob)**/.gitattributes", ".gitignore", ":(glob)**/.gitignore",
-                 text=False).split(b"\0") if raw]
-    check_checkout_parents(work, leftovers, directory_mode=directory_mode)
-    for raw in leftovers:
-        (work / os.fsdecode(raw)).unlink()
+    clean_checkout_rules(work, paths, directory_mode, pass_fds)
     run("-c", "core.ignorestat=false", "checkout", "-q", "--force", "--detach", commit)
     paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
     check_checkout_parents(work, paths, directory_mode=directory_mode)
+    # Recheck against the candidate: old or locally edited ignore rules may
+    # have shielded a directory that the candidate no longer ignores.
+    clean_checkout_rules(work, paths, directory_mode, pass_fds)
     # Fresh worktrees have empty gitlink directories. Empty populated modules
     # directly: submodule deinit would change the shared repository config.
     gitlinks = [entry.split(b"\t", 1)[1] for entry in
@@ -513,16 +554,18 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
             input=b"\0".join(mismatches) + b"\0", text=False)
         if checkout_mismatches(work, pass_fds):
             raise ValueError("checkout bytes or modes differ from candidate")
-    # Git clean leaves ignored symlinks and special files behind. Never retain
-    # links into another tree, and never let a FIFO/socket survive as input.
+    # Keep internal dependency links, including dangling ones. An external link
+    # invalidates its whole ignored tree, so tools cannot mistake it for an
+    # installed dependency tree. Never let a FIFO/socket survive as input.
     ignored = {Path(os.fsdecode(raw.rstrip(b"/"))) for raw in run(
         "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
         text=False).split(b"\0") if raw}
     ignored_parents = {parent for path in ignored for parent in (path, *path.parents)}
     tracked = set(paths)
-    pending = [(work, False)]
+    pending = [(work, None)]
+    unsafe = set()
     while pending:
-        directory, inside_ignored = pending.pop()
+        directory, ignored_root = pending.pop()
         # scandir reuses directory-entry type information without statting each
         # build file. Errors must propagate so an unreadable tree is recreated.
         with os.scandir(directory) as entries:
@@ -531,12 +574,21 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
                 if path == work / ".git":
                     continue
                 relative = path.relative_to(work)
+                root = ignored_root or (path if relative in ignored else None)
                 if entry.is_dir(follow_symlinks=False):
-                    pending.append((path, inside_ignored or relative in ignored))
-                elif os.fsencode(relative) not in tracked and (
-                        (entry.is_symlink() and (inside_ignored or relative in ignored_parents))
-                        or (not entry.is_symlink() and not entry.is_file(follow_symlinks=False))):
-                    path.unlink()
+                    pending.append((path, root))
+                elif os.fsencode(relative) not in tracked:
+                    if entry.is_symlink() and (root or relative in ignored_parents):
+                        try:
+                            internal = path.resolve().is_relative_to(work)
+                        except (OSError, RuntimeError):
+                            internal = False
+                        if not internal:
+                            unsafe.add(root or path)
+                    elif not entry.is_symlink() and not entry.is_file(follow_symlinks=False):
+                        path.unlink()
+    for path in unsafe:
+        remove_checkout_tree(path)
     run("-c", "core.excludesFile=", "clean", "-ffd" + ("x" if deep_clean else ""))
     check_checkout(work, commit, pass_fds)
 
@@ -554,6 +606,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     key = hashlib.sha256(os.fsencode(common)).hexdigest()[:12]
     pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
     pool.mkdir(parents=True, exist_ok=True)
+    failures = []
     for number in range(1, POOL_SLOTS + 1):
         slot = pool / f"slot-{number}"
         lock = (pool / f"slot-{number}.lock").open("a+b")
@@ -624,14 +677,15 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
             reason = (reason + "; " if reason else "") + f"recreated ({error})"
             try:
                 cleanup_worktrees(repo, slot)
-                if slot.is_symlink():
-                    slot.unlink()
-                elif slot.exists():
-                    remove_checkout_tree(slot)
+                remove_checkout_tree(slot)
                 cleanup_worktrees(repo, slot)
-                git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(slot), commit, pass_fds=pass_fds)
+                git(repo, *CHECKOUT_CONFIG, "-c", "worktree.useRelativePaths=false",
+                    "worktree", "add", "--detach", str(slot), commit, pass_fds=pass_fds)
                 reset_checkout(slot, common, commit, True, pass_fds)
-            except (OSError, ValueError, subprocess.CalledProcessError):
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                failure = f"pool slot {slot} unusable: {error}"
+                print(failure, file=sys.stderr)
+                failures.append(failure)
                 cleanup_worktrees(repo, slot)
                 leases.remove(lock)
                 lock.close()
@@ -640,10 +694,11 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
             "uses": 1 if reason else previous["uses"] + 1, "commit": commit,
             "commits": [commit] if reason else previous["commits"] + [commit]}))
         metadata.with_suffix(".json.tmp").replace(metadata)
-        return slot, f"pool {slot}; " + (f"deep clean: {reason}" if reason else "warm reset")
+        return slot, "; ".join([*failures, f"pool {slot}",
+                               f"deep clean: {reason}" if reason else "warm reset"])
     git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
     check_checkout(fresh, commit)
-    return fresh, "pool busy or slots unusable; fresh session worktree"
+    return fresh, "; ".join([*failures, "pool busy or slots unusable; fresh session worktree"])
 
 
 def main():
@@ -721,9 +776,9 @@ def main():
                 for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
                     git(repo, "update-index", flag, "-z", "--stdin", env=env,
                         input=b"\0".join(flagged) + b"\0", text=False)
-            staged = set(git(repo, "diff", "--cached", "--ignore-submodules=none", "--name-only", "-z", candidate, "--",
+            staged = set(git(repo, "diff", "--cached", "--ignore-submodules=untracked", "--name-only", "-z", candidate, "--",
                              env=env, text=False).split(b"\0")) - {b""}
-            changes = git(repo, "diff", "--raw", "--no-renames", "--ignore-submodules=none", "-z",
+            changes = git(repo, "diff", "--raw", "--no-renames", "--ignore-submodules=untracked", "-z",
                           candidate, "--", env=env, text=False).split(b"\0")
             changed, structural = set(), set()
             for header, path in zip(changes[::2], changes[1::2]):
