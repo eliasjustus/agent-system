@@ -60,6 +60,7 @@ save its full answer unedited in the task folder's `results/`. Give a verifier a
 and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
 challenger or reviewer snapshots.
 
+Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
 Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
 (for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
 refused (and then the file says so) or the destination cannot be claimed (the file is unchanged;
@@ -74,8 +75,8 @@ A handled signal exits with 128 plus its signal number, including after the answ
 The result file decides what completed: a late signal never replaces a saved answer.
 `Result: running` means the launcher is running or was killed. Check liveness with
 `flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
-an existing directory, or a name containing `.saving-`, `.attempt-` or `.unsaved-` is refused
-before claiming or archiving anything.
+an existing directory, a stem ending in `-evidence`, or a name containing `.saving-`, `.attempt-` or
+`.unsaved-` is refused before claiming or archiving anything.
 
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the

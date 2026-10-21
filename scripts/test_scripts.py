@@ -6152,6 +6152,95 @@ subprocess.Popen = spawn
                         except ProcessLookupError:
                             pass
 
+    def test_RESULTS_R4_non_utf8_tracked_filename_refusal_is_recorded(self):
+        path = self.repo / os.fsdecode(b"modified-\xff")
+        path.write_bytes(b"committed")
+        self.git("add", "--", str(path))
+        self.git("commit", "-qm", "non-UTF-8 filename")
+        path.write_bytes(b"modified")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "commit first: verifier requires tracked files to match HEAD")
+        output = self.out.read_text()
+        self.assertIn("modified-\\udcff", output)
+        self.assertNotIn("Result: running", output)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(output.count("End UTC:"), 1)
+        self.assertEqual(path.read_bytes(), b"modified")
+
+    def test_RESULTS_R4_non_utf8_initial_header_is_recorded(self):
+        result = self.launch("builder", "codex", "--same-family-reason", os.fsdecode(b"reason-\xff"),
+                             "--before", "HEAD")
+        self.assert_launch_refused(result, "allowed only for verifiers")
+        self.assertIn("Same-family reason: reason-\\udcff\n", self.out.read_text())
+
+    def test_RESULTS_R4_non_utf8_skipped_filename_in_terminal_headers(self):
+        path = self.repo / os.fsdecode(b"oversized-\xff")
+        with path.open("wb") as stream:
+            stream.truncate(5 * 1024 * 1024 + 1)
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                self.inject_launcher(f'''
+import os, signal, subprocess
+original = subprocess.Popen
+def spawn(command, *args, **kwargs):
+    if "--scope" in command:
+        if {interrupted!r}:
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise KeyboardInterrupt(signal.SIGTERM)
+        raise RuntimeError("forced spawn failure")
+    return original(command, *args, **kwargs)
+subprocess.Popen = spawn
+''')
+                result = self.launch("reviewer", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 143 if interrupted else 2, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("Result: interrupted\n" if interrupted else "Result: launch refused\n", output)
+                self.assertIn("Skipped untracked (>5 MB): oversized-\\udcff\n", output)
+                self.assertEqual(output.count("End UTC:"), 1)
+                self.assertNotIn("Result: running", output)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.record.exists())
+
+    def test_RESULTS_R4_terminal_write_exceptions_do_not_leave_running(self):
+        for fallback_fails in (False, True):
+            with self.subTest(fallback_fails=fallback_fails):
+                self.inject_launcher(f'''
+import os, pathlib
+original_replace, original_open = os.replace, pathlib.Path.open
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        raise RuntimeError("forced terminal replace failure")
+    return original_replace(source, destination, *args, **kwargs)
+def open(self, mode="r", *args, **kwargs):
+    if {fallback_fails!r} and self == pathlib.Path({str(self.out)!r}) and mode == "wb":
+        raise RuntimeError("forced terminal fallback failure")
+    return original_open(self, mode, *args, **kwargs)
+os.replace, pathlib.Path.open = replace, open
+''')
+                result = self.launch("builder", "codex", "--before", "HEAD")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                if fallback_fails:
+                    self.assertFalse(self.out.exists())
+                    self.assertIn("Cannot record result", result.stderr)
+                    self.assertIn("Result: launch refused\n", result.stderr)
+                else:
+                    self.assert_launch_refused(result, "allowed only for verifiers")
+
+    def test_RESULTS_R4_evidence_destination_stems_are_refused(self):
+        for name in ("answer-evidence", "answer-evidence.md", "answer-evidence.txt"):
+            with self.subTest(name=name):
+                self.out = self.base / name
+                self.out.write_bytes(b"keep existing evidence")
+                result = self.launch()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--out stem must not end in -evidence", result.stderr)
+                self.assertEqual(self.out.read_bytes(), b"keep existing evidence")
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.out.with_suffix(".lock").exists())
+                self.assertEqual(list(self.base.glob("answer-evidence.attempt-*")), [])
+
     def test_RESULTS_R3_double_signal_during_refusal_write_finishes_refusal(self):
         self.inject_launcher(f'''
 import os, pathlib, signal

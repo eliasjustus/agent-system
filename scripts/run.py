@@ -155,6 +155,8 @@ class ResultDestination:
             raise ValueError("--out must differ from its sibling .log path")
         if any(part in self.out.name for part in (".saving-", ".attempt-", ".unsaved-")):
             raise ValueError("--out name must not contain .saving-, .attempt- or .unsaved-")
+        if self.out.stem.endswith("-evidence"):
+            raise ValueError("--out stem must not end in -evidence")
         if self.out.is_dir():
             raise ValueError("--out must not be an existing directory")
         self.out.parent.mkdir(parents=True, exist_ok=True)
@@ -197,7 +199,7 @@ class ResultDestination:
                         if os.path.lexists(path):
                             path.rename(target)
                     break
-            self.write(self.header.encode() + b"Result: running\n")
+            self.write(self.header.encode("utf-8", errors="backslashreplace") + b"Result: running\n")
             self.claimed = True
         except BaseException:
             self.lock.close()
@@ -223,7 +225,7 @@ class ResultDestination:
         if self.saved is not None:
             return 2
         self.write_terminal((self.header + f"Result: launch refused\nReason: {reason}\n"
-                             f"End UTC: {utc()}\nExit code: 2\n").encode())
+                             f"End UTC: {utc()}\nExit code: 2\n").encode("utf-8", errors="backslashreplace"))
         print(reason, file=sys.stderr)
         return 2
 
@@ -231,12 +233,17 @@ class ResultDestination:
         self.finalizing = True
         try:
             self.write(contents)
-        except OSError:
+        except Exception:
             try:
                 # Replacement may fail while the already claimed file is writable.
                 with self.out.open("wb") as stream:
                     stream.write(contents)
-            except OSError as report_error:
+            except Exception as report_error:
+                # Remove a stale running marker if neither write succeeds.
+                try:
+                    self.out.unlink(missing_ok=True)
+                except OSError as remove_error:
+                    print(f"Cannot remove stale result {self.out}: {remove_error}", file=sys.stderr)
                 print(f"Cannot record result in {self.out}: {report_error}", file=sys.stderr)
                 sys.stderr.buffer.write(contents)
                 sys.stderr.buffer.flush()
@@ -1072,7 +1079,7 @@ def main():
         code = 128 + (error.args[0] if error.args else signal.SIGINT)
         if result.saved is None and result.claimed:
             result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
-                                   f"Exit code: {code}\n").encode())
+                                   f"Exit code: {code}\n").encode("utf-8", errors="backslashreplace"))
     finally:
         if result.lock is not None:
             result.lock.close()

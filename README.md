@@ -93,6 +93,7 @@ the answer's header. Check that list before trusting a review. The answer and it
 at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
+Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
 Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
 (for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
 refused (and then the file says so) or the destination cannot be claimed (the file is unchanged;
@@ -107,8 +108,8 @@ A handled signal exits with 128 plus its signal number, including after the answ
 The result file decides what completed: a late signal never replaces a saved answer.
 `Result: running` means the launcher is running or was killed. Check liveness with
 `flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
-an existing directory, or a name containing `.saving-`, `.attempt-` or `.unsaved-` is refused
-before claiming or archiving anything.
+an existing directory, a stem ending in `-evidence`, or a name containing `.saving-`, `.attempt-` or
+`.unsaved-` is refused before claiming or archiving anything.
 The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
