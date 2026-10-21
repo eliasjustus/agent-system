@@ -60,6 +60,10 @@ save its full answer unedited in the task folder's `results/`. Give a verifier a
 and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
 challenger or reviewer snapshots.
 
+Earlier results, logs and evidence are kept as `.attempt-N` siblings; `Result: running` means the
+launcher is running or was killed. `Result: launch refused` with exit 2 means no agent started;
+exit 3 means the answer was saved but cleanup failed (see `Cleanup:` in the header).
+
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the
 private records when the brief needs them.

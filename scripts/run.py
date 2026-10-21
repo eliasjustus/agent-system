@@ -117,8 +117,115 @@ def write_bytes():
         return None
 
 
+CLEANUP_FAILURES = None
+
+
 def cleanup_failed(what, error):
+    if CLEANUP_FAILURES is not None:
+        CLEANUP_FAILURES.append(f"{what}: {error}".replace("\n", "\\n"))
     print(f"Cleanup failed: {what}: {error}", file=sys.stderr)
+
+
+def cleanup_step(what, action, *args, **kwargs):
+    try:
+        action(*args, **kwargs)
+    except Exception as error:
+        cleanup_failed(what, error)
+
+
+class ResultDestination:
+    def __init__(self, args):
+        requested = args.out.expanduser()
+        self.out = requested.parent.resolve() / requested.name
+        self.out.parent.mkdir(parents=True, exist_ok=True)
+        lockpath = self.out.with_name(self.out.stem + ".lock")
+        self.lock = os.fdopen(os.open(lockpath, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+                                      | os.O_NONBLOCK, 0o666), "a")
+        try:
+            if not stat.S_ISREG(os.fstat(self.lock.fileno()).st_mode):
+                raise OSError(f"non-regular result lock: {lockpath}")
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BlockingIOError(f"another launcher owns {self.out}") from None
+            if not os.path.samestat(os.fstat(self.lock.fileno()), lockpath.lstat()):
+                raise OSError(f"result lock changed: {lockpath}")
+            self.start = utc()
+            self.header = (f"Role: {args.role}\nFamily: {args.family}\n"
+                           f"Author family: {args.author_family or ''}\n"
+                           f"Same-family reason: {args.same_family_reason or ''}\n"
+                           f"Start UTC: {self.start}\n")
+            self.saved = None
+            paths = (self.out, self.out.with_suffix(".log"),
+                     self.out.with_name(self.out.stem + "-evidence"))
+            # All launchers sharing these siblings hold the same stem lock.
+            if any(os.path.lexists(path) for path in paths):
+                number = 1
+                while True:
+                    stem = self.out.stem + f".attempt-{number}"
+                    targets = tuple(self.out.with_name(stem + suffix)
+                                    for suffix in (".md", ".log", "-evidence"))
+                    claim = self.out.with_name(stem + ".lock")
+                    try:
+                        reservation = claim.open("x")
+                    except FileExistsError:
+                        number += 1
+                        continue
+                    with reservation:
+                        try:
+                            fcntl.flock(reservation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            number += 1
+                            continue
+                        if any(os.path.lexists(path) for path in targets):
+                            number += 1
+                            continue
+                        for path, target in zip(paths, targets):
+                            if os.path.lexists(path):
+                                path.rename(target)
+                    break
+            self.write(self.header.encode() + b"Result: running\n")
+        except BaseException:
+            self.lock.close()
+            raise
+
+    def write(self, contents):
+        # A sibling temporary file keeps replacement on the same filesystem.
+        name = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.out.parent,
+                                             prefix=self.out.stem + ".saving-", delete=False) as stream:
+                name = stream.name
+                stream.write(contents)
+            os.replace(name, self.out)
+            name = None
+        finally:
+            if name is not None:
+                Path(name).unlink(missing_ok=True)
+
+    def refused(self, reason):
+        self.write((self.header + f"Result: launch refused\nReason: {reason}\n"
+                    f"End UTC: {utc()}\nExit code: 2\n").encode())
+        print(reason, file=sys.stderr)
+        return 2
+
+    def artifact(self, path):
+        if not path.is_relative_to(self.out.parent):
+            return False
+        name = path.relative_to(self.out.parent).parts[0]
+        return (name in (self.out.name, self.out.with_suffix(".log").name,
+                         self.out.stem + "-evidence", self.out.stem + ".lock")
+                or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-")))
+
+    def save(self, header, answer):
+        self.saved = (header, answer)
+        self.finish()
+
+    def finish(self):
+        if self.saved is not None:
+            header, answer = self.saved
+            cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
+            self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
 
 
 def registered_gitfile(admin):
@@ -142,7 +249,7 @@ def cleanup_worktrees(repo, session):
                 continue
             try:
                 git(repo, "worktree", "remove", "--force", "--force", str(path))
-            except (OSError, subprocess.CalledProcessError) as error:
+            except Exception as error:
                 cleanup_failed(f"worktree remove {path}", error)
                 if path.exists():
                     continue
@@ -158,11 +265,11 @@ def cleanup_worktrees(repo, session):
                             if registered == path / ".git":
                                 shutil.rmtree(admin)
                                 break
-                        except (OSError, UnicodeError) as error:
+                        except Exception as error:
                             cleanup_failed(f"worktree registration {admin / 'gitdir'}", error)
-                except (OSError, subprocess.CalledProcessError) as error:
+                except Exception as error:
                     cleanup_failed(f"worktree registration for {path}", error)
-    except (OSError, subprocess.CalledProcessError) as error:
+    except Exception as error:
         cleanup_failed(f"session worktrees under {session}", error)
 
 
@@ -174,16 +281,16 @@ def stop_session(unit, process, guarded=False):
             gone = f"unit {unit} not loaded" in result.stderr.lower()
             if result.returncode and not gone:
                 cleanup_failed(f"scope {unit}", result.stderr.strip() or f"exit {result.returncode}")
-        except OSError as error:
+        except Exception as error:
             cleanup_failed(f"scope {unit}", error)
     if process is not None and guarded and process.poll() is None:
         try:
             process.terminate()  # The supervisor stops and reaps all descendants.
         except ProcessLookupError:
             pass
-        except OSError as error:
+        except Exception as error:
             cleanup_failed(f"lease guard {process.pid}", error)
-        process.wait()
+        cleanup_step(f"wait for process {process.pid}", process.wait)
     if process is not None and (not unit or process.poll() is None):
         try:
             # A killed guard cannot reap its children. Without a scope, also
@@ -191,10 +298,10 @@ def stop_session(unit, process, guarded=False):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        except OSError as error:
+        except Exception as error:
             cleanup_failed(f"process group {process.pid}", error)
     if process is not None:
-        process.wait()
+        cleanup_step(f"wait for process {process.pid}", process.wait)
 
 
 def interrupted(signum, frame):
@@ -794,6 +901,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
 
 
 def main():
+    global CLEANUP_FAILURES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True, choices=("builder", "investigator", "verifier", "challenger", "reviewer"))
     parser.add_argument("--family", required=True, choices=("claude", "codex"))
@@ -815,6 +923,32 @@ def main():
     parser.add_argument("--method", default=local if (local / "roles").is_dir()
                         else Path("~/.local/share/agent-method"), type=Path)
     args = parser.parse_args()
+    try:
+        result = ResultDestination(args)
+    except OSError as error:
+        print(f"Cannot prepare result destination {args.out}: {error}", file=sys.stderr)
+        return 2
+    def refuse(reason):
+        raise SystemExit(result.refused(reason))
+    parser.error = refuse
+    CLEANUP_FAILURES = None
+    try:
+        return launch(parser, args, result)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        if result.saved is not None:
+            print(f"Cannot save result {result.out}: {error}", file=sys.stderr)
+            return 1
+        return result.refused(str(error))
+    except KeyboardInterrupt as error:
+        code = 128 + (error.args[0] if error.args else signal.SIGINT)
+        result.write((result.header + f"Result: interrupted\nExit code: {code}\n").encode())
+        return code
+    finally:
+        result.lock.close()
+
+
+def launch(parser, args, result):
+    global CLEANUP_FAILURES
     if (args.before or args.clean_checkout) and args.role != "verifier":
         parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
@@ -836,7 +970,7 @@ def main():
         parser.error("--timeout must be positive")
     brief = args.brief.expanduser().read_text()
     private = Path(args.private).expanduser().resolve()
-    repo, out = args.repo.expanduser().resolve(), args.out.expanduser().resolve()
+    repo, out = args.repo.expanduser().resolve(), result.out
     candidate, before_commit, untracked = "", "", []
     if args.role == "verifier":
         try:
@@ -887,7 +1021,7 @@ def main():
                 parser.error("commit first: verifier requires tracked files to match HEAD: "
                              + ", ".join(os.fsdecode(path) for path in sorted(dirty)))
         untracked = [os.fsdecode(path) for path in git(
-            repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path]
+            repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path and not result.artifact(repo / os.fsdecode(path))]
         if args.before:
             before_commit = git(repo, "rev-parse", "--verify", args.before + "^{commit}")
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -919,13 +1053,12 @@ def main():
     executable = os.environ.get(f"AGENT_{args.family.upper()}_CMD") or args.family
     found = shutil.which(executable)
     if found is None:
-        print(f"Cannot find agent executable: {executable}", file=sys.stderr)
-        return 127
+        return result.refused(f"Cannot find agent executable: {executable}")
     executable = os.path.abspath(found)
     restricted = args.family == "codex" and args.role in ("challenger", "reviewer")
     environment = ("restricted; discovery did not run"
                    if restricted else "user configuration")
-    start, snapshot, code = utc(), "", 1
+    start, snapshot, code = result.start, "", 1
     skipped = []
     checkout_note, before_note = "", ""
     untracked_note = ""
@@ -941,8 +1074,7 @@ def main():
         initial_io = write_bytes()
         session = tempfile.TemporaryDirectory(prefix="", dir=root)
     except OSError as error:
-        print(f"Cannot create session folder under {root}: {error}", file=sys.stderr)
-        return 1
+        return result.refused(f"Cannot create session folder under {root}: {error}")
     previous_sigterm = signal.signal(signal.SIGTERM, interrupted)
     previous_sighup = signal.getsignal(signal.SIGHUP)
     if previous_sighup != signal.SIG_IGN:
@@ -954,8 +1086,7 @@ def main():
         try:
             temporary.mkdir()
         except OSError as error:
-            print(f"Cannot create session temporary folder {temporary}: {error}", file=sys.stderr)
-            return 1
+            return result.refused(f"Cannot create session temporary folder {temporary}: {error}")
         length = len(os.fsencode(temporary))
         if length > 62:
             print(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
@@ -993,6 +1124,11 @@ def main():
                 else:
                     git(repo, "read-tree", head or "--empty", env=env)
                 git(repo, "add", "-u", env=env)
+                artifacts = [raw for raw in git(repo, "ls-files", "-z", env=env, text=False).split(b"\0")
+                             if raw and result.artifact(repo / os.fsdecode(raw))]
+                if artifacts:
+                    git(repo, "update-index", "--force-remove", "-z", "--stdin", env=env,
+                        input=b"\0".join(artifacts) + b"\0", text=False)
                 untracked = subprocess.check_output(
                     ["git", "-C", str(repo), *GIT_CONFIG, "ls-files", "--others", "--exclude-standard", "-z"],
                     env=env)
@@ -1001,6 +1137,8 @@ def main():
                     if not raw:
                         continue
                     path = os.fsdecode(raw)
+                    if result.artifact(repo / path):
+                        continue
                     if (repo / path).lstat().st_size > 5 * 1024 * 1024:
                         skipped.append(path)
                     else:
@@ -1062,6 +1200,7 @@ def main():
                     prompt += (f"These paths are absent from the file system but present in Git{hint}. "
                                "If your check needs them, say so in your answer.\n")
                 cwd = work
+            CLEANUP_FAILURES = []
             if args.role == "verifier":
                 source.mkdir()
                 prompt += (f"\nEvidence folder: {source}; only this folder is kept; "
@@ -1143,7 +1282,7 @@ def main():
                     code = 124
         except KeyboardInterrupt as error:
             code = 128 + (error.args[0] if error.args else signal.SIGINT)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
             print(f"Session failed: {error}", file=sys.stderr)
             code = 127 if isinstance(error, FileNotFoundError) else 1
         finally:
@@ -1151,7 +1290,9 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
-            stop_session(unit, process, guarded=bool(leases))
+            if CLEANUP_FAILURES is None:
+                CLEANUP_FAILURES = []
+            cleanup_step("stop session", stop_session, unit, process, guarded=bool(leases))
             try:
                 answer_bytes = answer.read_bytes() if answer.exists() else b""
                 if not answer_bytes.decode("utf-8", errors="replace").strip():
@@ -1179,30 +1320,26 @@ def main():
                           + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
                           + f"Write bytes: {writes}\nStart UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes(header.encode() + answer_bytes)
+                result.save(header, answer_bytes)
                 evidence = out.with_name(out.stem + "-evidence")
                 try:
-                    if evidence.is_symlink() or evidence.is_file():
-                        evidence.unlink()
-                    elif evidence.exists():
-                        shutil.rmtree(evidence)
                     if args.role == "verifier" and source.is_dir() and any(source.iterdir()):
                         shutil.copytree(source, evidence, symlinks=True)
                 except OSError as error:
                     print(f"Evidence failed: {evidence}: {error}", file=sys.stderr)
             finally:
-                cleanup_worktrees(repo, temp)
+                cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
     finally:
+        if CLEANUP_FAILURES is None:
+            CLEANUP_FAILURES = []
         for lock in leases:
-            lock.close()
-        try:
-            session.cleanup()
-        except OSError as error:
-            cleanup_failed(f"temporary folder {session.name}", error)
+            cleanup_step("lease close", lock.close)
+        cleanup_step(f"temporary folder {session.name}", session.cleanup)
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGHUP, previous_sighup)
         signal.signal(signal.SIGINT, previous_sigint)
-    return code
+        result.finish()
+    return 3 if result.saved is not None and CLEANUP_FAILURES else code
 
 
 if __name__ == "__main__":

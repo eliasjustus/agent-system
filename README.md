@@ -93,6 +93,9 @@ the answer's header. Check that list before trusting a review. The answer and it
 at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
+Earlier results, logs and evidence are kept as `.attempt-N` siblings; `Result: running` means the
+launcher is running or was killed. `Result: launch refused` with exit 2 means no agent started;
+exit 3 means the answer was saved but cleanup failed (see `Cleanup:` in the header).
 The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
