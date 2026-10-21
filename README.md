@@ -137,8 +137,9 @@ Use verifier-only `--before <commit>` to lease a second writable slot at a basel
 path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
 $TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
 use the same pool. Slots are ranked without locking: those needing no deep clean first, then
-the fewest changed paths from their last commit to the requested commit, then the lowest slot
-number. Slots without usable metadata come last. Each lease tries that order without waiting,
+new slots before existing slots needing a deep clean. Within each group, the fewest changed
+paths from the last commit to the requested commit wins, then the lowest slot number. Slots
+without usable metadata come last. Each lease tries that order without waiting,
 skipping busy or unusable slots, and recomputes cleaning after taking its lock.
 When all slots are busy, the launcher creates a full temporary checkout in a
 session worktree and says `pool busy or slots unusable` in the header. Session cleanup never removes
@@ -151,9 +152,11 @@ properties, Go, Python requirements/uv/poetry and pyproject.toml/setup.py/setup.
 Gemfile.lock, composer.lock,
 flake.lock, bun.lock/bun.lockb and toolchain pins (except .java-version). Gradle build/settings
 files, gradle.properties, version catalogs, *.lockfile files and .java-version do not trigger
-pool cleaning; Gradle handles its own change tracking. Changes to any Cargo.toml also trigger a
-deep clean, as do deleted or renamed-away main.rs files and files under
-any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. A source file
+pool cleaning. Gradle can retain stale output when a removed task no longer produces generated
+sources still referenced by a `srcDir`, or copy/package output that another task reads. When a
+candidate removes Gradle tasks or generated source folders, verify with `--clean-checkout`.
+Changes to any Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files
+and files under any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. A source file
 left untracked that was tracked in any commit held by the slot since its last deep clean also
 forces a deep clean, so stale output from another lane cannot hide that forgotten file. Counts
 and commit history survive restarts; metadata without that history forces a deep clean on upgrade.

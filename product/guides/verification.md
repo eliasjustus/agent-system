@@ -18,7 +18,9 @@ Ignored files may come from earlier sessions; if a check depends on one other th
 check itself produces, ask the orchestrator for a rerun with `--clean-checkout`.
 After an environment-looking failure, the verifier reports it and recommends an orchestrator rerun
 with `--clean-checkout`, keeping both results. Custom build scripts may reuse stale ignored output,
-so establish which build actually ran.
+so establish which build actually ran. Gradle can also retain stale output from removed tasks,
+such as generated sources still referenced by a `srcDir` or copy/package output another task reads.
+When a candidate removes Gradle tasks or generated source folders, verify with `--clean-checkout`.
 
 Use the cheapest real environment that exercises the behavior: the running service over its real
 interface, a real browser for a component, a real repository or filesystem. A narrower environment
