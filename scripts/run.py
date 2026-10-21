@@ -24,7 +24,7 @@ import tempfile
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
-POOL_SLOTS = 3
+POOL_SLOTS = 5
 POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
@@ -33,10 +33,8 @@ CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckout
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
-    "bun.lock", "bun.lockb", ".java-version", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
-    "pdm.lock", "pylock.toml", "gradle.lockfile", "gradle-wrapper.properties",
-    "gradle.properties", "settings.gradle", "settings.gradle.kts",
-    "build.gradle", "build.gradle.kts", "libs.versions.toml",
+    "bun.lock", "bun.lockb", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
+    "pdm.lock", "pylock.toml", "gradle-wrapper.properties",
     ".nvmrc", ".node-version", ".tool-versions", ".python-version",
     "pyproject.toml", "setup.py", "setup.cfg",
 }
@@ -594,6 +592,73 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     check_checkout(work, commit, pass_fds)
 
 
+def nonregular_metadata_paths(metadata, temporary):
+    return [path for path in (metadata, temporary)
+            if os.path.lexists(path) and not stat.S_ISREG(path.lstat().st_mode)]
+
+
+def checkout_metadata(metadata):
+    # Ranking reads without a lease. Never follow a symlink or wait on a FIFO,
+    # including if the path changes between inspection and opening it.
+    with os.fdopen(os.open(metadata, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("non-regular metadata path")
+        previous = json.load(source)
+    if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
+            or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
+            or not isinstance(previous["commits"], list)
+            or not 1 <= len(previous["commits"]) <= previous["uses"]
+            or previous["commits"][-1] != previous["commit"]
+            or any(not re.fullmatch(r"[0-9a-f]{40,64}", item) for item in previous["commits"])):
+        raise ValueError("invalid metadata")
+    return previous
+
+
+def checkout_changes(repo, previous, commit, force_clean, untracked=None):
+    reasons = []
+    if force_clean:
+        reasons.append("--clean-checkout")
+    if previous["uses"] >= POOL_USES:
+        reasons.append(f"{POOL_USES} uses")
+    distance = float("inf")
+    if previous["commit"]:
+        try:
+            changes = [] if previous["commit"] == commit else git(
+                repo, "diff", "--no-renames", "--name-status", "-z",
+                previous["commit"], commit, text=False).split(b"\0")[:-1]
+            changed = changes[1::2]
+            distance = len(changed)
+            if any(Path(os.fsdecode(path)).name in BUILD_INPUTS
+                   or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
+                   for path in changed):
+                reasons.append("lockfile or toolchain changed")
+            if any(Path(os.fsdecode(path)).name == "Cargo.toml" for path in changed):
+                reasons.append("Cargo manifest changed")
+            if any(Path(os.fsdecode(path)).name == "main.rs"
+                   or "/src/bin/" in "/" + os.fsdecode(path)
+                   for status, path in zip(changes[::2], changed) if status == b"D"):
+                reasons.append("Cargo executable source removed")
+            # Ranking is only a preference. History and untracked-file checks
+            # belong to the authoritative decision after acquiring the lease.
+            if untracked is not None:
+                if previous["commits"] and git(
+                        repo, "cat-file", "--batch-check=%(objecttype)", "-z",
+                        input=b"\0".join(os.fsencode(revision) for revision in previous["commits"]) + b"\0",
+                        text=False) != b"\n".join(b"commit" for _ in previous["commits"]):
+                    reasons.append("missing previous commit")
+                objects = [os.fsencode(revision + ":" + path)
+                           for revision in previous["commits"] for path in untracked]
+                # Compare the entire all-missing response: missing paths can
+                # contain newlines that look like successful object responses.
+                if objects and git(repo, "cat-file", "--batch-check=%(objectname)", "-z",
+                        input=b"\0".join(objects) + b"\0", text=False) != b"\n".join(
+                            item + b" missing" for item in objects):
+                    reasons.append("untracked source file was previously tracked")
+        except (ValueError, subprocess.CalledProcessError):
+            reasons.append("missing previous commit")
+    return "; ".join(reasons), distance
+
+
 def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()):
     # Reftable keeps per-worktree refs in admin/reftable, which the pool's
     # admin-state reset cannot discard. Bypass it before creating any slots.
@@ -608,8 +673,37 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
     pool.mkdir(parents=True, exist_ok=True)
     failures = []
-    for number in range(1, POOL_SLOTS + 1):
-        slot = pool / f"slot-{number}"
+
+    def candidates():
+        ranked = []
+        for number in range(1, POOL_SLOTS + 1):
+            slot = pool / f"slot-{number}"
+            metadata = slot.with_suffix(".json")
+            temporary = metadata.with_suffix(".json.tmp")
+            paths = (slot, metadata, temporary)
+            if not any(os.path.lexists(path) for path in paths):
+                rank, distance = 1, 0
+            else:
+                try:
+                    if nonregular_metadata_paths(metadata, temporary):
+                        raise ValueError("non-regular metadata path")
+                    previous = checkout_metadata(metadata)
+                    reason, distance = checkout_changes(repo, previous, commit, force_clean)
+                    rank = 2 if reason else 0
+                except (OSError, ValueError, KeyError, TypeError):
+                    rank, distance = 3, 0
+            if rank == 0 and distance == 0:
+                # No later slot can improve this preference. Resume ranking
+                # only if this exact match is busy or unusable.
+                yield number, paths
+            else:
+                ranked.append((rank, distance, number, paths))
+        for _, _, number, paths in sorted(ranked):
+            yield number, paths
+
+    # This is only a preference: metadata may change before the non-blocking
+    # lease succeeds. Re-read it and recompute cleaning under that lease.
+    for number, (slot, metadata, temporary) in candidates():
         lockpath = pool / f"slot-{number}.lock"
         lock = None
         try:
@@ -637,56 +731,27 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
             failures.append(failure)
             continue
         leases.append(lock)
-        metadata = pool / f"slot-{number}.json"
-        temporary = metadata.with_suffix(".json.tmp")
-        reason = ""
+        new_slot = not any(os.path.lexists(path) for path in (slot, metadata, temporary))
+        reasons = ["new slot"] if new_slot else []
         try:
-            for path in (metadata, temporary):
-                if os.path.lexists(path) and not stat.S_ISREG(path.lstat().st_mode):
-                    remove_checkout_tree(path)
-                    reason = "non-regular metadata path"
-            previous = json.loads(metadata.read_text())
-            if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
-                    or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
-                    or not isinstance(previous["commits"], list)
-                    or not 1 <= len(previous["commits"]) <= previous["uses"]
-                    or previous["commits"][-1] != previous["commit"]
-                    or any(not re.fullmatch(r"[0-9a-f]{40,64}", item) for item in previous["commits"])):
-                raise ValueError("invalid metadata")
+            nonregular = nonregular_metadata_paths(metadata, temporary)
+            for path in nonregular:
+                remove_checkout_tree(path)
+            if nonregular:
+                reasons.append("non-regular metadata path")
+            previous = checkout_metadata(metadata)
         except (OSError, ValueError, KeyError, TypeError):
             previous = {"uses": 0, "commit": "", "commits": []}
-            reason = reason or "missing or corrupt metadata"
-        if force_clean:
-            reason = "--clean-checkout"
-        elif previous["uses"] >= POOL_USES:
-            reason = f"{POOL_USES} uses"
-        elif previous["commit"]:
-            try:
-                changed = git(repo, "diff", "--no-renames", "--name-only", "-z",
-                              previous["commit"], commit, text=False).split(b"\0")
-                if any(Path(os.fsdecode(path)).name in BUILD_INPUTS
-                       or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
-                       or os.fsdecode(path).endswith(".lockfile") for path in changed if path):
-                    reason = "lockfile or toolchain changed"
-                if any(Path(os.fsdecode(path)).name == "Cargo.toml" for path in changed if path):
-                    reason = (reason + "; " if reason else "") + "Cargo manifest changed"
-                removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
-                              previous["commit"], commit, text=False).split(b"\0")
-                # Ignored output can survive several unrelated candidates.
-                # Check every commit that could have produced that output.
-                objects = [os.fsencode(revision + ":" + path)
-                           for revision in previous["commits"] for path in untracked]
-                # Compare the entire all-missing response: missing paths can
-                # contain newlines that look like successful object responses.
-                if objects and git(repo, "cat-file", "--batch-check=%(objectname)", "-z",
-                        input=b"\0".join(objects) + b"\0", text=False) != b"\n".join(
-                            item + b" missing" for item in objects):
-                    reason = (reason + "; " if reason else "") + "untracked source file was previously tracked"
-                if any(Path(os.fsdecode(path)).name == "main.rs"
-                       or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
-                    reason = (reason + "; " if reason else "") + "Cargo executable source removed"
-            except subprocess.CalledProcessError:
-                reason = "missing previous commit"
+            if not new_slot:
+                reasons.append("missing or corrupt metadata")
+                # The history is unusable, so cleaning is already mandatory.
+                # Still report changes from the checkout's actual commit.
+                try:
+                    previous["commit"] = git(slot, "rev-parse", "--verify", "HEAD^{commit}")
+                except (OSError, subprocess.CalledProcessError):
+                    pass
+        changed_reason, _ = checkout_changes(repo, previous, commit, force_clean, untracked)
+        reason = "; ".join(filter(None, [changed_reason, *reasons]))
         # Absence is an interrupted-reset marker.
         metadata.unlink(missing_ok=True)
         pass_fds = tuple(lease.fileno() for lease in leases)
@@ -697,10 +762,11 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                     or Path(git(slot, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve() != common):
                 raise ValueError("missing checkout or registration")
             if previous["commit"] != git(slot, "rev-parse", "HEAD"):
-                reason = reason or "checkout differs from metadata"
+                reason = (reason + "; " if reason else "") + "checkout differs from metadata"
             reset_checkout(slot, common, commit, bool(reason), pass_fds)
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
-            reason = (reason + "; " if reason else "") + f"recreated ({error})"
+            if not new_slot or str(error) != "missing checkout or registration":
+                reason = (reason + "; " if reason else "") + f"recreated ({error})"
             try:
                 cleanup_worktrees(repo, slot)
                 remove_checkout_tree(slot)
