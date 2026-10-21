@@ -61,8 +61,8 @@ is recorded, do not commit and say so.
 Work that needed no question is signed off by its request once it is verified and delivered, or by
 the user's merge where the project leaves merging to them: record that, then finish as for accepted
 work. Where you asked, keep only that change waiting (a draft pull request, the
-question in the task record's `Open for user`) and carry on with the rest; ask it in the next
-conversation with the user, one question, never a list of pending items. Ask it once: do not repeat
+question in the task record's `Open for user`) and carry on with the rest; ask it once, in the next
+conversation with the user, one question, never a list of pending items: do not repeat
 it on later turns, such as after a background result; ask again only when the user returns to it or its evidence or
 conditions change. A question several sessions share is asked by the session that owns it. Record the reply word for
 word in the task record with the date. Silence is not acceptance.
