@@ -116,7 +116,8 @@ where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main rep
 from its resolved Git common directory. Main trees, linked worktrees, symlinks and subdirectory
 `--repo` paths share one pool; different repositories with the same name do not. No Agent System
 entry is required. Verifiers require Linux (the lease guard uses `prctl`). Each repository has
-**3 slots**, using up to three built trees of disk space.
+**5 slots**, using up to five built trees of disk space. Existing slots 1–3 and their metadata
+and locks remain reusable after an upgrade; slots 4–5 are created only when needed.
 Repositories using `extensions.refStorage=reftable` bypass the pool and create one fresh session
 worktree per requested checkout, removed at session end; they do not retain warm build output.
 Before each use, a slot is reset to the detached candidate and cleaned of tracked edits and
@@ -135,27 +136,38 @@ on a tracked directory is not reset; this is a known limit of checkout reuse.
 Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
 path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
 $TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
-use the same pool. When all slots are busy, the launcher creates a full temporary checkout in a
+use the same pool. Slots are ranked without locking: those needing no deep clean first, then
+the fewest changed paths from their last commit to the requested commit, then the lowest slot
+number. Slots without usable metadata come last. Each lease tries that order without waiting,
+skipping busy or unusable slots, and recomputes cleaning after taking its lock.
+When all slots are busy, the launcher creates a full temporary checkout in a
 session worktree and says `pool busy or slots unusable` in the header. Session cleanup never removes
 a pool checkout.
 
 Slots are deep-cleaned, including ignored files, after 20 uses since the last deep clean (failed
 runs count), when a lockfile or toolchain/build definition changes in either direction, and with
-verifier-only `--clean-checkout`. The fixed list covers npm/yarn/pnpm, Cargo, Gradle (including
-wrapper properties and lockfiles), Go, Python requirements/uv/poetry and pyproject.toml/setup.py/setup.cfg,
+verifier-only `--clean-checkout`. The fixed list covers npm/yarn/pnpm, Cargo, Gradle wrapper
+properties, Go, Python requirements/uv/poetry and pyproject.toml/setup.py/setup.cfg,
 Gemfile.lock, composer.lock,
-flake.lock, bun.lock/bun.lockb and toolchain pins (including .java-version). Changes to any
-Cargo.toml also trigger a deep clean, as do deleted or renamed-away main.rs files and files under
+flake.lock, bun.lock/bun.lockb and toolchain pins (except .java-version). Gradle build/settings
+files, gradle.properties, version catalogs, *.lockfile files and .java-version do not trigger
+pool cleaning; Gradle handles its own change tracking. Changes to any Cargo.toml also trigger a
+deep clean, as do deleted or renamed-away main.rs files and files under
 any src/bin/ directory: Cargo can otherwise leave an obsolete executable in target/. A source file
 left untracked that was tracked in any commit held by the slot since its last deep clean also
 forces a deep clean, so stale output from another lane cannot hide that forgotten file. Counts
 and commit history survive restarts; metadata without that history forces a deep clean on upgrade.
+If any recorded commit is missing from the repository, the slot is deep-cleaned because its
+forgotten-file history can no longer be checked completely.
 Missing/corrupt metadata or interrupted resets force cleaning; broken checkouts
 are recreated, with a fresh session worktree as a fallback. The header says whether a reset was
-warm or deep and why. Pool reset writes count in `Write bytes:`.
+warm or deep and why; `new slot` means the checkout, metadata and temporary metadata were all absent.
+Pool reset writes count in `Write bytes:`.
 
 Gradle and Cargo incremental builds must notice deleted source files; the tests exercise this with
-a still-referenced deleted Java class and Rust module, plus a removed Cargo executable. The Cargo
+a still-referenced deleted Java class and Rust module, plus a removed Cargo executable. Gradle
+must also reject a removed dependency still used by Java code and a removed settings project
+still referenced by another project, on both warm output and a fresh checkout. The Cargo
 manifest and executable-source deep-clean rules prevent obsolete binaries from passing a check.
 Custom output paths, other build systems and custom build scripts may still reuse stale ignored
 output incorrectly. Changes to package.json alone do not trigger a deep clean; `npm ci` reinstalls
@@ -252,12 +264,13 @@ python3 scripts/setup.py --project /path/to/project --id my-project
 
 Include your custom `--private` and `--method` on both commands if you used them. Private records
 are kept. Upgrading creates pool slots lazily; existing session caches need no migration.
-To inspect a pool, read its `slot-*.json` files (commit, use count and commit history), run
+To inspect a pool, read its `slot-*.json` files for slots 1–5 (commit, use count and commit history), run
 `git -C /path/to/project worktree list`, and inspect its size with
 `du -sh <cache>/am-pool/<name>-<hash>`. To remove a repository's pool safely, first stop its launcher
 sessions and wait for their agents and supervisors to finish, including orphaned sessions. Then
 remove each registered slot while holding its lock, checking it is free:
-`flock -n <pool>/slot-N.lock git -C /path/to/project worktree remove --force --force <pool>/slot-N`.
+`flock -n <pool>/slot-N.lock git -C /path/to/project worktree remove --force --force <pool>/slot-N`
+for each existing slot, with N from 1 to 5.
 If the lock is busy, wait for its session to finish. Before deleting that repository's pool folder,
 ensure no launcher can start. For a deleted slot folder, the same remove command usually clears its
 registration; if it fails, remove only the matching entry under the common Git directory's

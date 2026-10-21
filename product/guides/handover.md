@@ -25,7 +25,7 @@ it in full.
 
 `--before` leases a second writable checkout for the baseline. Without it, the verifier uses a
 shared clone inside $TMPDIR. Pool slots retain ignored build output; retry with `--clean-checkout`
-after an environment-looking failure, keeping both results. The pool has three slots per
+after an environment-looking failure, keeping both results. The pool has five slots per
 repository; a busy pool falls back to a temporary session worktree without waiting.
 
 Challengers and reviewers keep snapshots of uncommitted changes and untracked files up to 5 MB,

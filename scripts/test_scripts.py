@@ -1,4 +1,5 @@
 import ast
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -221,7 +222,7 @@ class ScriptsTest(unittest.TestCase):
     def busy_pool(self):
         pool = self.pool_root()
         pool.mkdir(parents=True, exist_ok=True)
-        for number in range(1, 4):
+        for number in range(1, 6):
             lock = (pool / f"slot-{number}.lock").open("a+b")
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.addCleanup(lock.close)
@@ -250,6 +251,17 @@ class ScriptsTest(unittest.TestCase):
                              "claude" if family == "codex" else "codex", *extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(self.record.read_text())
+
+    def seed_pool(self, commits):
+        slots = []
+        with ExitStack() as held:
+            for commit in commits:
+                self.git("reset", "--hard", commit)
+                slot = Path(self.verifier()["cwd"])
+                slots.append(slot)
+                lock = held.enter_context(slot.with_suffix(".lock").open("a+b"))
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return slots
 
     def pool_probe(self):
         self.agent_extra('''
@@ -1089,34 +1101,37 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertEqual((self.repo / "tracked").read_text(), "candidate")
                 self.assertTrue(Path(record["before"]).is_dir())
 
-    def test_POOL_S6_three_slots_then_fallback_and_before_never_waits(self):
+    def test_POOL_R2_five_slots_then_fallback_and_before_never_waits(self):
         self.env["SLEEP"] = "1"
-        records = [self.base / f"pool-{i}.json" for i in range(4)]
+        records = [self.base / f"pool-{i}.json" for i in range(6)]
         processes = []
         data = []
         for i, record in enumerate(records):
             process = self.start_launcher(record=record, out=self.base / f"pool-{i}.md")
             processes.append(process)
             data.append(self.wait_record(record))
-        self.assertEqual(len({record["cwd"] for record in data}), 4)
-        for record in data[:3]:
+        self.assertEqual(len({record["cwd"] for record in data}), 6)
+        for record in data[:5]:
             self.assertTrue(Path(record["cwd"]).is_relative_to(self.pool_root()))
-        self.assertFalse(Path(data[3]["cwd"]).is_relative_to(self.pool_root()))
+        self.assertFalse(Path(data[5]["cwd"]).is_relative_to(self.pool_root()))
         for process in processes:
             process.terminate()
             process.communicate(timeout=10)
             self.assertEqual(process.returncode, 143)
-        self.assertIn("pool busy", (self.base / "pool-3.md").read_text())
+        self.assertIn("pool busy", (self.base / "pool-5.md").read_text())
         for record in data:
             self.assert_session_cleaned(record)
-        # A candidate and before lease compete for the same three slots.
+        # Candidate and before leases compete for the same five slots.
         first = self.start_launcher("--before", "HEAD", record=self.base / "two-slots.json",
                                     out=self.base / "two-slots.md")
         self.wait_record(self.base / "two-slots.json")
-        second = self.start_launcher("--before", "HEAD", record=self.base / "one-slot.json",
-                                     out=self.base / "one-slot.md")
+        second = self.start_launcher("--before", "HEAD", record=self.base / "two-more.json",
+                                     out=self.base / "two-more.md")
+        self.wait_record(self.base / "two-more.json")
+        third = self.start_launcher("--before", "HEAD", record=self.base / "one-slot.json",
+                                    out=self.base / "one-slot.md")
         self.wait_record(self.base / "one-slot.json")
-        for process in (first, second):
+        for process in (first, second, third):
             process.terminate()
             process.communicate(timeout=10)
         self.assertIn("Before checkout:", (self.base / "one-slot.md").read_text())
@@ -1152,7 +1167,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         for name in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum",
                      "uv.lock", "poetry.lock", "requirements-dev.txt", "rust-toolchain.toml",
                      ".nvmrc", ".node-version", ".tool-versions", ".python-version",
-                     "gradle/wrapper/gradle-wrapper.properties", "module/gradle.lockfile"):
+                     "gradle/wrapper/gradle-wrapper.properties"):
             with self.subTest(name=name):
                 target = self.repo / name
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1167,10 +1182,10 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.assertFalse((slot / "ignored").exists())
                     self.assertIn("deep clean: lockfile or toolchain changed", self.out.read_text())
 
-    def test_POOL_S7_additional_lockfiles_and_java_pin_clean_in_both_directions(self):
+    def test_POOL_S7_additional_lockfiles_clean_in_both_directions(self):
         baseline = self.git("rev-parse", "HEAD")
         slot = Path(self.verifier()["cwd"])
-        for name in ("Gemfile.lock", "composer.lock", "flake.lock", "bun.lock", "bun.lockb", ".java-version"):
+        for name in ("Gemfile.lock", "composer.lock", "flake.lock", "bun.lock", "bun.lockb"):
             with self.subTest(name=name):
                 target = self.repo / "nested" / name
                 target.parent.mkdir(exist_ok=True)
@@ -1184,6 +1199,217 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.verifier()
                     self.assertFalse((slot / "ignored").exists())
                     self.assertIn("deep clean: lockfile or toolchain changed", self.out.read_text())
+
+    def test_POOL_R2_gradle_inputs_stay_warm_in_both_directions(self):
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        for name in ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+                     "gradle.properties", "libs.versions.toml", "gradle.lockfile", "custom.lockfile",
+                     ".java-version"):
+            with self.subTest(name=name):
+                target = self.repo / "nested" / name
+                target.parent.mkdir(exist_ok=True)
+                target.write_text("changed Gradle input")
+                self.git("add", ".")
+                self.git("commit", "-qm", "Gradle input")
+                for reverse in (False, True):
+                    (slot / "ignored").write_text("warm output")
+                    if reverse:
+                        self.git("reset", "--hard", baseline)
+                    self.assertEqual(self.verifier()["cwd"], str(slot))
+                    self.assertTrue((slot / "ignored").exists(), "Gradle input changes must keep output warm")
+                    self.assertEqual((slot / "ignored").read_text(), "warm output")
+                    self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R2_exact_higher_slot_wins_for_candidate_and_before_both_families(self):
+        baseline = self.git("rev-parse", "HEAD")
+        commits = [baseline]
+        for content in ("candidate", "before"):
+            (self.repo / "tracked").write_text(content)
+            self.git("add", ".")
+            self.git("commit", "-qm", content)
+            commits.append(self.git("rev-parse", "HEAD"))
+        slots = self.seed_pool([commits[0], commits[2], commits[1]])
+        for slot in slots:
+            (slot / "ignored").write_text("existing slot output")
+        self.git("reset", "--hard", commits[1])
+        self.agent_extra('''
+import fcntl
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+record["before"] = str(before)
+record["before_head"] = subprocess.check_output(["git", "-C", str(before), "rev-parse", "HEAD"], text=True).strip()
+record["head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+for number in range(1, 6):
+    slot = cwd.parent / f"slot-{number}"
+    with slot.with_suffix(".lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            assert slot in (cwd, before), "only returned checkouts may stay locked"
+        else:
+            assert slot not in (cwd, before), "returned checkouts must stay locked"
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family, "--before", commits[2])
+                self.assertEqual(record["cwd"], str(slots[2]))
+                self.assertEqual(record["head"], commits[1])
+                self.assertEqual(record["before"], str(slots[1]))
+                self.assertEqual(record["before_head"], commits[2])
+                self.assertEqual(self.out.read_text().count("warm reset"), 2)
+                for slot in slots:
+                    self.assertEqual((slot / "ignored").read_text(), "existing slot output")
+
+    def test_POOL_R2_fewest_changed_paths_then_lowest_number(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "odd\npath").touch()
+        self.git("add", ".")
+        self.git("commit", "-qm", "one changed path")
+        closer = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, closer, closer])
+        self.git("reset", "--hard", candidate)
+        self.assertEqual(self.verifier()["cwd"], str(slots[1]))
+        self.assertIn("warm reset", self.out.read_text())
+        self.assertEqual(self.verifier("codex", "--clean-checkout")["cwd"], str(slots[1]))
+        self.assertIn("deep clean: --clean-checkout", self.out.read_text())
+
+    def test_POOL_R2_warm_slot_precedes_exact_match_needing_deep_clean(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([candidate, baseline])
+        metadata = slots[0].with_suffix(".json")
+        state = json.loads(metadata.read_text())
+        state["uses"] = 20
+        metadata.write_text(json.dumps(state))
+        self.git("reset", "--hard", candidate)
+        self.assertEqual(self.verifier()["cwd"], str(slots[1]))
+        self.assertIn("warm reset", self.out.read_text())
+
+    def test_POOL_R2_unusable_metadata_ranks_after_valid_deep_clean_slot(self):
+        commit = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([commit, commit])
+        slots[0].with_suffix(".json").write_text("broken metadata")
+        metadata = slots[1].with_suffix(".json")
+        state = json.loads(metadata.read_text())
+        state["uses"] = 20
+        metadata.write_text(json.dumps(state))
+        self.assertEqual(self.verifier()["cwd"], str(slots[1]))
+        self.assertIn("deep clean: 20 uses", self.out.read_text())
+
+    def test_POOL_R2_preferred_busy_or_unusable_slot_falls_through(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, candidate])
+        self.assertEqual(self.verifier()["cwd"], str(slots[1]))
+        with slots[1].with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.verifier()["cwd"], str(slots[0]))
+        # Restore the lower slot to a less suitable version for the next case.
+        with slots[1].with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.git("reset", "--hard", baseline)
+            self.verifier()
+        self.git("reset", "--hard", candidate)
+        (slots[1] / ".git").write_text("broken")
+        self.inject_launcher('''
+import shutil
+original = shutil.rmtree
+def cannot_remove(path, *args, **kwargs):
+    if str(path).endswith("/slot-2"):
+        raise PermissionError("preferred slot unavailable")
+    return original(path, *args, **kwargs)
+shutil.rmtree = cannot_remove
+''')
+        self.assertEqual(self.verifier()["cwd"], str(slots[0]))
+        self.assertIn("preferred slot unavailable", self.out.read_text())
+        with slots[1].with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_POOL_R2_ranking_is_unlocked_and_cleaning_is_recomputed_under_lock(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, candidate])
+        (slots[1] / "ignored").write_text("must be cleaned after the race")
+        self.inject_launcher('''
+import fcntl, json, os, pathlib, subprocess
+original_flock = fcntl.flock
+original_output = subprocess.check_output
+acquired = False
+def race(fd, operation):
+    global acquired
+    if not acquired:
+        path = pathlib.Path(os.readlink(f"/proc/self/fd/{fd.fileno()}"))
+        assert path.name == "slot-2.lock", "rank the exact match before trying locks"
+        metadata = path.with_suffix(".json")
+        state = json.loads(metadata.read_text())
+        state["uses"] = 20
+        metadata.write_text(json.dumps(state))
+    result = original_flock(fd, operation)
+    acquired = True
+    return result
+def unlocked_ranking(command, *args, **kwargs):
+    if "diff" in command and not acquired:
+        pools = (pathlib.Path.home() / ".cache/am-pool").iterdir()
+        for pool in pools:
+            for path in pool.glob("*.lock"):
+                with path.open("a+b") as lock:
+                    original_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return original_output(command, *args, **kwargs)
+fcntl.flock = race
+subprocess.check_output = unlocked_ranking
+''')
+        self.assertEqual(self.verifier()["cwd"], str(slots[1]))
+        self.assertFalse((slots[1] / "ignored").exists())
+        self.assertIn("deep clean: 20 uses", self.out.read_text())
+
+    def test_POOL_R2_new_slot_label_requires_all_creation_paths_absent(self):
+        slot = Path(self.verifier()["cwd"])
+        self.assertIn("deep clean: new slot", self.out.read_text())
+        metadata = slot.with_suffix(".json")
+        for leftover in ("checkout", "metadata", "temporary"):
+            with self.subTest(leftover=leftover):
+                if leftover != "metadata":
+                    metadata.unlink()
+                if leftover != "checkout":
+                    shutil.rmtree(slot)
+                if leftover == "temporary":
+                    slot.with_suffix(".json.tmp").write_text("interrupted creation")
+                self.assertEqual(self.verifier()["cwd"], str(slot))
+                self.assertNotIn("new slot", self.out.read_text())
+                if leftover != "metadata":
+                    self.assertIn("missing or corrupt metadata", self.out.read_text())
+
+    def test_POOL_R2_missing_older_history_commit_forces_deep_clean(self):
+        slot = Path(self.verifier()["cwd"])
+        metadata = slot.with_suffix(".json")
+        commit = self.git("rev-parse", "HEAD")
+        for history in (["1" * 40, commit], [commit, "1" * 40, commit]):
+            for untracked in (False, True):
+                with self.subTest(history=history, untracked=untracked):
+                    metadata.write_text(json.dumps({"uses": len(history), "commit": commit,
+                                                    "commits": history}))
+                    if untracked:
+                        (self.repo / "forgotten").write_text("untracked source")
+                    (slot / "ignored").write_text("output with lost history")
+                    self.assertEqual(self.verifier()["cwd"], str(slot))
+                    self.assertFalse((slot / "ignored").exists())
+                    self.assertIn("deep clean: missing previous commit", self.out.read_text())
+                    self.assertEqual(json.loads(metadata.read_text())["commits"], [commit])
+                    (self.repo / "forgotten").unlink(missing_ok=True)
 
     def test_POOL_R8_python_build_definitions_clean_in_both_directions(self):
         baseline = self.git("rev-parse", "HEAD")
@@ -2270,9 +2496,9 @@ subprocess.check_output = broken_slot
                         self.assertIn(reason, stderr)
                         self.assertIn(reason, self.out.read_text())
                         self.assertEqual(target.read_text(), "must stay untouched")
-                    with (slot.parent / "slot-2.lock").open("a+b") as second, \
-                            (slot.parent / "slot-3.lock").open("a+b") as third:
-                        for lock in (second, third):
+                    with ExitStack() as held:
+                        for number in range(2, 6):
+                            lock = held.enter_context((slot.parent / f"slot-{number}.lock").open("a+b"))
                             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         record = self.verifier()
                         self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
@@ -2480,6 +2706,79 @@ sys.exit(result.returncode)
         self.assertIn("warm reset", self.out.read_text())
         self.assertFalse((slot / deleted).exists())
 
+    def gradle_executable(self):
+        gradle = shutil.which("gradle")
+        if not gradle:
+            installed = sorted((Path.home() / ".gradle/wrapper/dists").glob("gradle-*-bin/*/gradle-*/bin/gradle"))
+            gradle = str(installed[-1]) if installed else ""
+        if not gradle:
+            self.skipTest("Gradle unavailable")
+        return gradle
+
+    def gradle_configuration_change(self, changed, content, error_text):
+        gradle = self.gradle_executable()
+        files = {
+            ".gitignore": ".gradle/\nbuild/\n",
+            "settings.gradle": "rootProject.name = 'configuration-check'\ninclude 'library', 'app'\n",
+            "library/build.gradle": "plugins { id 'java-library' }\n",
+            "library/src/main/java/fixture/Removed.java": "package fixture; public class Removed {}\n",
+            "app/build.gradle": "plugins { id 'java' }\ndependencies { implementation project(':library') }\n",
+            "app/src/main/java/Main.java": "import fixture.Removed; class Main { Removed value; }\n",
+        }
+        for name, source in files.items():
+            target = self.repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source)
+        self.git("add", ".")
+        self.git("commit", "-qm", "Gradle configuration fixture")
+        command = [gradle, "--offline", "--no-daemon", "--max-workers=1",
+                   "--gradle-user-home", str(self.base / "gradle-home"), ":app:compileJava"]
+        self.env["BUILD_COMMAND"] = json.dumps(command)
+        self.env["BUILD_ENV"] = json.dumps({"PATH": os.environ["PATH"]})
+        self.agent_extra('''
+result = subprocess.run(json.loads(os.environ["BUILD_COMMAND"]),
+                        env=dict(os.environ, **json.loads(os.environ["BUILD_ENV"])), capture_output=True)
+(evidence / "build.txt").write_bytes(result.stdout + result.stderr)
+sys.exit(result.returncode)
+''')
+        first = self.launch("verifier", "codex", "--author-family", "claude")
+        proof = self.out.parent / "answer-evidence/build.txt"
+        output = proof.read_text()
+        if "Could not determine a usable wildcard IP" in output:
+            self.skipTest("Gradle cannot start in this sandbox: no usable wildcard IP")
+        self.assertEqual(first.returncode, 0, output + first.stderr)
+        slot = Path(json.loads(self.record.read_text())["cwd"])
+        marker = slot / "app/build/warm-marker"
+        marker.touch()
+        (self.repo / changed).write_text(content)
+        self.git("add", ".")
+        self.git("commit", "-qm", "remove still referenced Gradle input")
+        warm = self.launch("verifier", "codex", "--author-family", "claude")
+        output = proof.read_text()
+        self.assertNotEqual(warm.returncode, 0, output + warm.stderr)
+        self.assertIn(error_text, output)
+        self.assertEqual(json.loads(self.record.read_text())["cwd"], str(slot))
+        self.assertTrue(marker.exists(), "the check must exercise warm output")
+        self.assertIn("warm reset", self.out.read_text())
+        # A shared clone gives the same committed candidate without any output.
+        fresh = self.base / "fresh"
+        subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(self.repo), str(fresh)],
+                       env=self.env, check=True)
+        subprocess.run(["git", "-C", str(fresh), "checkout", "--quiet", "--detach", self.git("rev-parse", "HEAD")],
+                       env=self.env, check=True)
+        result = subprocess.run(command, cwd=fresh, env=dict(self.env, PATH=os.environ["PATH"]),
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, warm.returncode, result.stdout + result.stderr)
+        self.assertIn(error_text, result.stdout + result.stderr)
+
+    def test_POOL_R2_gradle_removed_dependency_fails_warm_and_fresh(self):
+        self.gradle_configuration_change("app/build.gradle", "plugins { id 'java' }\n", "cannot find symbol")
+
+    def test_POOL_R2_gradle_removed_settings_project_fails_warm_and_fresh(self):
+        self.gradle_configuration_change("settings.gradle",
+                                         "rootProject.name = 'configuration-check'\ninclude 'app'\n",
+                                         "Project with path ':library' could not be found")
+
     def test_POOL_S12_cargo_deleted_module_cannot_pass_using_warm_output(self):
         cargo = shutil.which("cargo")
         rustc = shutil.which("rustc")
@@ -2554,12 +2853,7 @@ sys.exit(code)
         self.assertIn("deep clean: Cargo executable source removed", self.out.read_text())
 
     def test_POOL_S12_gradle_deleted_class_cannot_pass_using_warm_output(self):
-        gradle = shutil.which("gradle")
-        if not gradle:
-            installed = sorted((Path.home() / ".gradle/wrapper/dists").glob("gradle-*-bin/*/gradle-*/bin/gradle"))
-            gradle = str(installed[-1]) if installed else ""
-        if not gradle:
-            self.skipTest("Gradle unavailable")
+        gradle = self.gradle_executable()
         self.deletion_build({
             ".gitignore": ".gradle/\nbuild/\n",
             "settings.gradle": "rootProject.name = 'deletion-check'\n",

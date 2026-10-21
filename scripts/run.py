@@ -24,7 +24,7 @@ import tempfile
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
-POOL_SLOTS = 3
+POOL_SLOTS = 5
 POOL_USES = 20
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
@@ -33,10 +33,8 @@ CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckout
 BUILD_INPUTS = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "Cargo.lock", "Gemfile.lock", "composer.lock", "flake.lock",
-    "bun.lock", "bun.lockb", ".java-version", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
-    "pdm.lock", "pylock.toml", "gradle.lockfile", "gradle-wrapper.properties",
-    "gradle.properties", "settings.gradle", "settings.gradle.kts",
-    "build.gradle", "build.gradle.kts", "libs.versions.toml",
+    "bun.lock", "bun.lockb", "go.mod", "go.sum", "uv.lock", "poetry.lock", "Pipfile.lock",
+    "pdm.lock", "pylock.toml", "gradle-wrapper.properties",
     ".nvmrc", ".node-version", ".tool-versions", ".python-version",
     "pyproject.toml", "setup.py", "setup.cfg",
 }
@@ -594,6 +592,65 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
     check_checkout(work, commit, pass_fds)
 
 
+def checkout_metadata(metadata):
+    # Ranking reads without a lease. Never follow a symlink or wait on a FIFO,
+    # including if the path changes between inspection and opening it.
+    with os.fdopen(os.open(metadata, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("non-regular metadata path")
+        previous = json.load(source)
+    if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
+            or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
+            or not isinstance(previous["commits"], list)
+            or not 1 <= len(previous["commits"]) <= previous["uses"]
+            or previous["commits"][-1] != previous["commit"]
+            or any(not re.fullmatch(r"[0-9a-f]{40,64}", item) for item in previous["commits"])):
+        raise ValueError("invalid metadata")
+    return previous
+
+
+def checkout_changes(repo, previous, commit, force_clean, untracked):
+    reason = ""
+    distance = float("inf")
+    if previous["commit"]:
+        try:
+            changed = [path for path in git(repo, "diff", "--no-renames", "--name-only", "-z",
+                       previous["commit"], commit, text=False).split(b"\0") if path]
+            distance = len(changed)
+            if any(Path(os.fsdecode(path)).name in BUILD_INPUTS
+                   or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
+                   for path in changed):
+                reason = "lockfile or toolchain changed"
+            if any(Path(os.fsdecode(path)).name == "Cargo.toml" for path in changed):
+                reason = (reason + "; " if reason else "") + "Cargo manifest changed"
+            removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
+                          previous["commit"], commit, text=False).split(b"\0")
+            # Ignored output can survive several unrelated candidates. Every
+            # recorded commit must still exist for the forgotten-file check.
+            if git(repo, "cat-file", "--batch-check=%(objecttype)", "-z",
+                   input=b"\0".join(os.fsencode(revision) for revision in previous["commits"]) + b"\0",
+                   text=False) != b"\n".join(b"commit" for _ in previous["commits"]):
+                raise ValueError("missing previous commit")
+            objects = [os.fsencode(revision + ":" + path)
+                       for revision in previous["commits"] for path in untracked]
+            # Compare the entire all-missing response: missing paths can
+            # contain newlines that look like successful object responses.
+            if objects and git(repo, "cat-file", "--batch-check=%(objectname)", "-z",
+                    input=b"\0".join(objects) + b"\0", text=False) != b"\n".join(
+                        item + b" missing" for item in objects):
+                reason = (reason + "; " if reason else "") + "untracked source file was previously tracked"
+            if any(Path(os.fsdecode(path)).name == "main.rs"
+                   or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
+                reason = (reason + "; " if reason else "") + "Cargo executable source removed"
+        except (ValueError, subprocess.CalledProcessError):
+            reason = "missing previous commit"
+    if force_clean:
+        reason = "--clean-checkout"
+    elif previous["uses"] >= POOL_USES:
+        reason = f"{POOL_USES} uses"
+    return reason, distance
+
+
 def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()):
     # Reftable keeps per-worktree refs in admin/reftable, which the pool's
     # admin-state reset cannot discard. Bypass it before creating any slots.
@@ -608,7 +665,21 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
     pool.mkdir(parents=True, exist_ok=True)
     failures = []
+    ranked = []
     for number in range(1, POOL_SLOTS + 1):
+        metadata = pool / f"slot-{number}.json"
+        temporary = metadata.with_suffix(".json.tmp")
+        try:
+            if os.path.lexists(temporary) and not stat.S_ISREG(temporary.lstat().st_mode):
+                raise ValueError("non-regular metadata path")
+            previous = checkout_metadata(metadata)
+            reason, distance = checkout_changes(repo, previous, commit, force_clean, untracked)
+            ranked.append((int(bool(reason)), distance, number))
+        except (OSError, ValueError, KeyError, TypeError):
+            ranked.append((2, 0, number))
+    # This is only a preference: metadata may change before the non-blocking
+    # lease succeeds. Re-read it and recompute cleaning under that lease.
+    for _, _, number in sorted(ranked):
         slot = pool / f"slot-{number}"
         lockpath = pool / f"slot-{number}.lock"
         lock = None
@@ -639,54 +710,18 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
         leases.append(lock)
         metadata = pool / f"slot-{number}.json"
         temporary = metadata.with_suffix(".json.tmp")
-        reason = ""
+        reason = "new slot" if not any(os.path.lexists(path) for path in (slot, metadata, temporary)) else ""
         try:
             for path in (metadata, temporary):
                 if os.path.lexists(path) and not stat.S_ISREG(path.lstat().st_mode):
                     remove_checkout_tree(path)
                     reason = "non-regular metadata path"
-            previous = json.loads(metadata.read_text())
-            if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
-                    or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
-                    or not isinstance(previous["commits"], list)
-                    or not 1 <= len(previous["commits"]) <= previous["uses"]
-                    or previous["commits"][-1] != previous["commit"]
-                    or any(not re.fullmatch(r"[0-9a-f]{40,64}", item) for item in previous["commits"])):
-                raise ValueError("invalid metadata")
+            previous = checkout_metadata(metadata)
         except (OSError, ValueError, KeyError, TypeError):
             previous = {"uses": 0, "commit": "", "commits": []}
             reason = reason or "missing or corrupt metadata"
-        if force_clean:
-            reason = "--clean-checkout"
-        elif previous["uses"] >= POOL_USES:
-            reason = f"{POOL_USES} uses"
-        elif previous["commit"]:
-            try:
-                changed = git(repo, "diff", "--no-renames", "--name-only", "-z",
-                              previous["commit"], commit, text=False).split(b"\0")
-                if any(Path(os.fsdecode(path)).name in BUILD_INPUTS
-                       or Path(os.fsdecode(path)).name.startswith(("rust-toolchain", "requirements"))
-                       or os.fsdecode(path).endswith(".lockfile") for path in changed if path):
-                    reason = "lockfile or toolchain changed"
-                if any(Path(os.fsdecode(path)).name == "Cargo.toml" for path in changed if path):
-                    reason = (reason + "; " if reason else "") + "Cargo manifest changed"
-                removed = git(repo, "diff", "--no-renames", "--diff-filter=D", "--name-only", "-z",
-                              previous["commit"], commit, text=False).split(b"\0")
-                # Ignored output can survive several unrelated candidates.
-                # Check every commit that could have produced that output.
-                objects = [os.fsencode(revision + ":" + path)
-                           for revision in previous["commits"] for path in untracked]
-                # Compare the entire all-missing response: missing paths can
-                # contain newlines that look like successful object responses.
-                if objects and git(repo, "cat-file", "--batch-check=%(objectname)", "-z",
-                        input=b"\0".join(objects) + b"\0", text=False) != b"\n".join(
-                            item + b" missing" for item in objects):
-                    reason = (reason + "; " if reason else "") + "untracked source file was previously tracked"
-                if any(Path(os.fsdecode(path)).name == "main.rs"
-                       or "/src/bin/" in "/" + os.fsdecode(path) for path in removed if path):
-                    reason = (reason + "; " if reason else "") + "Cargo executable source removed"
-            except subprocess.CalledProcessError:
-                reason = "missing previous commit"
+        changed_reason, _ = checkout_changes(repo, previous, commit, force_clean, untracked)
+        reason = changed_reason or reason
         # Absence is an interrupted-reset marker.
         metadata.unlink(missing_ok=True)
         pass_fds = tuple(lease.fileno() for lease in leases)
