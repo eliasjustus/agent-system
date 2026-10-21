@@ -95,14 +95,20 @@ folder. Empty answers fail. Temporary session folders and their worktrees are re
 verifier pool slots remain for reuse.
 Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
 (for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
-refused (and then the file says so) or another launcher holds the same `--out` or the destination
-is unwritable (the file is unchanged; stderr says which); exit 3 means a saved answer with exit 0
-and failed cleanup. The header's `Exit code:` keeps the agent's code, including when cleanup fails.
+refused (and then the file says so) or the destination cannot be claimed (the file is unchanged;
+stderr says why). Exit 1 with `Result: failed: cannot save answer: <error>` means the agent ran
+but saving its answer failed. Answer bytes are kept beside `--out` in
+`<stem>.unsaved-<pid><suffix>`, or printed on stderr if that file cannot be written. Exit 3 means
+a saved answer with exit 0 and failed cleanup. The header's `Exit code:` keeps the agent's code,
+including when cleanup fails.
 `Cleanup: pending` means the answer is saved and cleanup is still running; its final status is
 `Cleanup: ok` or `Cleanup: failed: <what>; …`. A non-zero agent code survives cleanup failures.
+A handled signal exits with 128 plus its signal number, including after the answer was saved.
+The result file decides what completed: a late signal never replaces a saved answer.
 `Result: running` means the launcher is running or was killed. Check liveness with
-`flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` is refused
-because it would coincide with the sibling log.
+`flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
+an existing directory, or a name containing `.saving-`, `.attempt-` or `.unsaved-` is refused
+before claiming or archiving anything.
 The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is

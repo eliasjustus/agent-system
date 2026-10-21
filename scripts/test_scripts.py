@@ -6010,17 +6010,415 @@ os.replace = replace
                     if path.is_file():
                         path.unlink()
 
-    def test_RESULTS_log_output_alias_records_refusal_and_archives_previous(self):
+    def test_RESULTS_log_output_alias_is_refused_before_claim(self):
         self.out = self.base / "answer.log"
         self.out.write_bytes(b"previous log answer")
         result = self.launch()
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--out must differ from its sibling .log path", result.stderr)
-        self.assertIn("Result: launch refused\n", self.out.read_text())
-        self.assertIn("--out must differ from its sibling .log path", self.out.read_text())
-        self.assertEqual((self.base / "answer.attempt-1.log").read_bytes(), b"previous log answer")
+        self.assertEqual(self.out.read_bytes(), b"previous log answer")
         self.assertFalse(self.record.exists())
-        self.assertEqual(list(self.base.glob("answer.attempt-*.lock")), [])
+        self.assertEqual(list(self.base.glob("answer.attempt-*")), [])
+        self.assertFalse(self.out.with_suffix(".lock").exists())
+
+    def assert_unsaved_answer(self, result, reason):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = self.out.read_text()
+        self.assertIn(f"Result: failed: cannot save answer: {reason}", output)
+        self.assertEqual(output.count("End UTC:"), 1)
+        self.assertNotIn("launch refused", output)
+        self.assertIn("Exit code: 1\n", output)
+        self.assertFalse(Path(json.loads(self.record.read_text())["tmpdir"]).parent.exists())
+
+    def test_RESULTS_R3_replace_failure_keeps_binary_answer(self):
+        self.env["SESSION_EXIT"] = "7"
+        self.agent_extra('''
+pathlib.Path(args[args.index("-o") + 1]).write_bytes(b"answer\\x00\\xff\\n")
+''')
+        self.inject_launcher(f'''
+import os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Cleanup: pending\\n" in pathlib.Path(source).read_bytes()):
+        raise OSError("forced answer replace failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch()
+        self.assert_unsaved_answer(result, "forced answer replace failure")
+        fallbacks = list(self.out.parent.glob("answer.unsaved-*.md"))
+        self.assertEqual(len(fallbacks), 1)
+        self.assertRegex(fallbacks[0].name, r"^answer\.unsaved-\d+\.md$")
+        self.assertEqual(fallbacks[0].read_bytes(), b"answer\x00\xff\n")
+        self.assertEqual(list(self.out.parent.glob("answer.saving-*")), [])
+        # A later claim must keep the only saved copy of this failed answer.
+        self.env.pop("PYTHONPATH")
+        self.assertEqual(self.launch().returncode, 7)
+        self.assertEqual(fallbacks[0].read_bytes(), b"answer\x00\xff\n")
+
+    def test_RESULTS_R3_unreadable_answer_is_preserved_after_agent(self):
+        self.agent_extra('''
+pathlib.Path(args[args.index("-o") + 1]).chmod(0)
+''')
+        self.inject_launcher('''
+import pathlib
+original = pathlib.Path.read_bytes
+def read(self):
+    if self.name == "answer" and self.parent.parent.name == "am":
+        raise PermissionError("forced answer read failure")
+    return original(self)
+pathlib.Path.read_bytes = read
+''')
+        result = self.launch()
+        self.assert_unsaved_answer(result, "forced answer read failure")
+        fallbacks = list(self.out.parent.glob("answer.unsaved-*.md"))
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0].read_bytes(), b"answer\n  unchanged\n")
+
+    def test_RESULTS_R3_write_failure_keeps_answer(self):
+        self.inject_launcher('''
+import tempfile
+original = tempfile.NamedTemporaryFile
+class FailingWrite:
+    def __init__(self, stream):
+        self.stream = stream
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return self.stream.__exit__(*args)
+    def write(self, contents):
+        if b"Cleanup: pending\\n" in contents:
+            raise OSError("forced answer write failure: disk full")
+        return self.stream.write(contents)
+def temporary(*args, **kwargs):
+    return FailingWrite(original(*args, **kwargs))
+tempfile.NamedTemporaryFile = temporary
+''')
+        result = self.launch()
+        self.assert_unsaved_answer(result, "forced answer write failure: disk full")
+        fallback, = self.out.parent.glob("answer.unsaved-*.md")
+        self.assertEqual(fallback.read_bytes(), b"answer\n  unchanged\n")
+
+    def test_RESULTS_R3_readonly_destination_keeps_answer_on_stderr(self):
+        self.agent_extra(f'''
+pathlib.Path({str(self.out.parent)!r}).chmod(0o555)
+''')
+        self.addCleanup(self.out.parent.chmod, 0o755)
+        result = self.launch()
+        self.assert_unsaved_answer(result, "[Errno 13] Permission denied")
+        self.assertIn("Unsaved answer follows on stderr:\nanswer\n  unchanged\n", result.stderr)
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+
+    def test_RESULTS_R3_signal_inside_popen_stops_spawned_scope(self):
+        self.env["SLEEP"] = "1"
+        child_pid = self.base / "spawned-pid"
+        self.inject_launcher(f'''
+import os, pathlib, signal, subprocess, time
+original = subprocess.Popen
+def spawn(command, *args, **kwargs):
+    process = original(command, *args, **kwargs)
+    if "--scope" in command:
+        pathlib.Path({str(child_pid)!r}).write_text(str(process.pid))
+        process.stdin.write(b"test prompt")
+        process.stdin.close()
+        deadline = time.monotonic() + 5
+        answer = pathlib.Path(command[command.index("-o") + 1])
+        while (not pathlib.Path({str(self.record)!r}).exists()
+               or not answer.exists() or not answer.stat().st_size) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return process
+subprocess.Popen = spawn
+''')
+        for role in ("builder", "verifier"):
+            with self.subTest(role=role):
+                self.record.unlink(missing_ok=True)
+                previous_stops = set(self.scope_state.glob("*.stop"))
+                result = self.launch(role, "codex", "--author-family", "claude")
+                try:
+                    self.assertEqual(result.returncode, 143, result.stderr)
+                    self.assertEqual(len(set(self.scope_state.glob("*.stop")) - previous_stops), 1, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    self.assertFalse(Path(record["tmpdir"]).parent.exists())
+                    self.assertTrue(self.out.read_bytes().endswith(b"answer\n  unchanged\n"))
+                    self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+                finally:
+                    if child_pid.exists():
+                        try:
+                            os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_RESULTS_R3_double_signal_during_refusal_write_finishes_refusal(self):
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGINT)
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        for extra, reason in ((("--before", "HEAD"), "allowed only for verifiers"),
+                              (("--unknown-option",), "unrecognized arguments")):
+            with self.subTest(extra=extra):
+                result = self.launch("builder", "codex", *extra)
+                self.assertEqual(result.returncode, 143, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("Result: launch refused\n", output)
+                self.assertIn(reason, output)
+                self.assertEqual(output.count("End UTC:"), 1)
+                self.assertNotIn("interrupted", output)
+                self.assertFalse(self.record.exists())
+
+    def test_RESULTS_R3_double_signal_during_failure_write_keeps_failure(self):
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if destination == pathlib.Path({str(self.out)!r}):
+        contents = pathlib.Path(source).read_bytes()
+        if b"Cleanup: pending\\n" in contents:
+            raise OSError("forced answer replace failure")
+        if b"Result: failed: cannot save answer:" in contents:
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGINT)
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertIn("Result: failed: cannot save answer:", self.out.read_text())
+        self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+        fallback, = self.out.parent.glob("answer.unsaved-*.md")
+        self.assertEqual(fallback.read_bytes(), b"answer\n  unchanged\n")
+
+    def test_RESULTS_R3_interrupted_header_and_double_signal_are_complete(self):
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original_read, original_replace = pathlib.Path.read_text, os.replace
+def read(self, *args, **kwargs):
+    if self == pathlib.Path({str(self.brief)!r}):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original_read(self, *args, **kwargs)
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: interrupted\\n" in pathlib.Path(source).read_bytes()):
+        os.kill(os.getpid(), signal.SIGINT)
+        os.kill(os.getpid(), signal.SIGHUP)
+    return original_replace(source, destination, *args, **kwargs)
+pathlib.Path.read_text, os.replace = read, replace
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertIn("Result: interrupted\n", self.out.read_text())
+        self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+        self.assertFalse(self.record.exists())
+
+    def test_RESULTS_R3_stale_temp_removal_preserves_other_destinations(self):
+        self.out.parent.mkdir()
+        own = self.out.parent / "answer.saving-abcdefgh"
+        own.write_bytes(b"stale temporary result")
+        others = [self.out.parent / name for name in (
+            "answer.saving-x.md", "answer.saving-abcdefgh.more", "answer.saving-abcdefgh.lock")]
+        for other in others:
+            other.write_bytes(b"another destination")
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(own.exists())
+        for other in others:
+            self.assertTrue(other.exists(), f"deleted another destination: {other}")
+            self.assertEqual(other.read_bytes(), b"another destination")
+
+    def test_RESULTS_R3_reserved_destination_names_are_refused(self):
+        for name in ("answer.saving-x.md", "answer.attempt-1.md", "answer.unsaved-123.md",
+                     "answer.saving-x", "answer.attempt-1", "answer.unsaved-123"):
+            with self.subTest(name=name):
+                self.out = self.base / name
+                self.out.write_bytes(b"keep existing answer")
+                result = self.launch()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--out name must not contain", result.stderr)
+                self.assertEqual(self.out.read_bytes(), b"keep existing answer")
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.out.with_suffix(".lock").exists())
+
+    def test_RESULTS_R3_directory_and_aliases_leave_existing_files_untouched(self):
+        for kind in ("directory", "log", "lock"):
+            with self.subTest(kind=kind):
+                self.record.unlink(missing_ok=True)
+                self.out = self.base / ("answer.md" if kind == "directory" else "answer." + kind)
+                if kind == "directory":
+                    self.out.mkdir()
+                    (self.out / "keep").write_bytes(b"keep directory contents")
+                else:
+                    self.out.write_bytes(b"keep alias contents")
+                before = set(self.base.iterdir())
+                result = self.launch()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(set(self.base.iterdir()), before)
+                if kind == "directory":
+                    self.assertEqual((self.out / "keep").read_bytes(), b"keep directory contents")
+                else:
+                    self.assertEqual(self.out.read_bytes(), b"keep alias contents")
+                self.assertFalse(self.record.exists())
+
+    def test_RESULTS_R3_refusal_headers_have_one_end_and_parsed_role(self):
+        self.inject_launcher('''
+import subprocess
+original = subprocess.Popen
+def spawn(command, *args, **kwargs):
+    if "--scope" in command:
+        raise OSError("forced spawn failure")
+    return original(command, *args, **kwargs)
+subprocess.Popen = spawn
+''')
+        self.assert_launch_refused(self.launch(), "forced spawn failure")
+        self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+
+    def test_RESULTS_R3_argument_error_role_is_parsed_or_omitted(self):
+        for extra, role in ((("--unknown-option",), "builder"),
+                            (("--timeout", "invalid"), "builder"),
+                            (("--role", "invalid"), "builder")):
+            with self.subTest(extra=extra):
+                result = self.launch("builder", "codex", *extra)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"Role: {role}\n", self.out.read_text())
+                self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+        result = self.run_script("run.py", "--out", self.out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(any(line.startswith("Role:") for line in self.out.read_text().splitlines()))
+        self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+
+    def test_RESULTS_R3_result_modes_follow_umask_at_every_write(self):
+        modes = self.base / "result-modes"
+        self.inject_launcher(f'''
+import os, pathlib, stat
+os.umask(0o027)
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if destination == pathlib.Path({str(self.out)!r}):
+        with open({str(modes)!r}, "a") as record:
+            record.write(oct(stat.S_IMODE(pathlib.Path(source).stat().st_mode)) + "\\n")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.launch("builder", "codex", "--before", "HEAD")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(modes.read_text().splitlines(), ["0o640"] * 5)
+        self.assertEqual(stat.S_IMODE(self.out.stat().st_mode), 0o640)
+
+    def test_RESULTS_R3_signal_inside_discovery_popen_stops_discovery_group(self):
+        self.env["MCP_SLEEP"] = "1"
+        discovery = Path(str(self.record) + ".discovery")
+        child_pid = self.base / "discovery-pid"
+        self.inject_launcher(f'''
+import os, pathlib, signal, subprocess, time
+original = subprocess.Popen
+def spawn(command, *args, **kwargs):
+    process = original(command, *args, **kwargs)
+    if command[1:] == ["mcp", "list", "--json"]:
+        pathlib.Path({str(child_pid)!r}).write_text(str(process.pid))
+        deadline = time.monotonic() + 5
+        while not pathlib.Path({str(self.record) + '.discovery-child'!r}).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return process
+subprocess.Popen = spawn
+''')
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        try:
+            self.assertEqual(result.returncode, 143, result.stderr)
+            self.assertIn("Result: interrupted\n", self.out.read_text())
+            self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+            self.assertTrue(discovery.exists())
+            self.assert_discovery_cleaned()
+        finally:
+            if child_pid.exists():
+                try:
+                    os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_RESULTS_R3_double_signal_after_save_preserves_answer_and_first_signal(self):
+        self.env["SESSION_EXIT"] = "7"
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    pending = b"Cleanup: pending\\n" in pathlib.Path(source).read_bytes()
+    result = original(source, destination, *args, **kwargs)
+    if destination == pathlib.Path({str(self.out)!r}) and pending:
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGINT)
+    return result
+os.replace = replace
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        output = self.out.read_text()
+        self.assertIn("Cleanup: ok\n", output)
+        self.assertIn("Exit code: 7\n", output)
+        self.assertEqual(output.count("End UTC:"), 1)
+        self.assertTrue(output.endswith("answer\n  unchanged\n"))
+        self.assertNotIn("Result: interrupted", output)
+
+    def test_RESULTS_R3_refusal_write_failure_retains_exit_two(self):
+        self.inject_launcher(f'''
+import pathlib
+original = pathlib.Path.read_text
+def read(self, *args, **kwargs):
+    if self == pathlib.Path({str(self.brief)!r}):
+        pathlib.Path({str(self.out.parent)!r}).chmod(0o555)
+        raise PermissionError("forced brief read failure")
+    return original(self, *args, **kwargs)
+pathlib.Path.read_text = read
+''')
+        self.addCleanup(self.out.parent.chmod, 0o755)
+        self.assert_launch_refused(self.launch(), "forced brief read failure")
+        self.assertEqual(self.out.read_text().count("End UTC:"), 1)
+
+    def test_RESULTS_R3_unsaved_answer_is_excluded_from_review_snapshot(self):
+        self.out = self.repo / "results/answer.md"
+        self.out.parent.mkdir()
+        fallback = self.out.with_name("answer.unsaved-123.md")
+        fallback.write_bytes(b"previous unsaved answer")
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = next(line.split(": ", 1)[1] for line in self.out.read_text().splitlines()
+                        if line.startswith("Snapshot commit:"))
+        self.assertEqual(self.git("ls-tree", "-r", snapshot, "--", "results"), "")
+        self.assertEqual(fallback.read_bytes(), b"previous unsaved answer")
+
+    def test_RESULTS_R3_cleanup_status_write_failure_keeps_saved_agent_status(self):
+        self.inject_launcher(f'''
+import os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Cleanup: ok\\n" in pathlib.Path(source).read_bytes()):
+        raise OSError("forced cleanup status failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        for agent_code in (0, 7):
+            with self.subTest(agent_code=agent_code):
+                self.env["SESSION_EXIT"] = str(agent_code)
+                result = self.launch()
+                self.assertEqual(result.returncode, agent_code or 3, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("Cleanup: failed: result finalization: forced cleanup status failure\n", output)
+                self.assertIn(f"Exit code: {agent_code}\n", output)
+                self.assertEqual(output.count("End UTC:"), 1)
+                self.assertTrue(output.endswith("answer\n  unchanged\n"))
+                self.assertNotIn("Result: launch refused", output)
 
     def test_RESULTS_P3_output_in_repository_is_not_snapshot_input(self):
         self.out = self.repo / "results/answer.md"

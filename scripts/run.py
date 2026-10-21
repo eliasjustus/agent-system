@@ -142,10 +142,21 @@ class ResultDestination:
         self.claimed = False
         self.finalizing = False
         self.signal_code = None
+        self.spawning = False
+        self.keep_session = False
+        mask = os.umask(0)
+        os.umask(mask)
+        self.mode = 0o666 & ~mask
 
     def claim(self, args):
         if self.out == self.out.with_name(self.out.stem + ".lock"):
             raise ValueError("--out must differ from its stem lock path")
+        if self.out == self.out.with_suffix(".log"):
+            raise ValueError("--out must differ from its sibling .log path")
+        if any(part in self.out.name for part in (".saving-", ".attempt-", ".unsaved-")):
+            raise ValueError("--out name must not contain .saving-, .attempt- or .unsaved-")
+        if self.out.is_dir():
+            raise ValueError("--out must not be an existing directory")
         self.out.parent.mkdir(parents=True, exist_ok=True)
         lockpath = self.out.with_name(self.out.stem + ".lock")
         self.lock = os.fdopen(os.open(lockpath, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
@@ -160,13 +171,15 @@ class ResultDestination:
             if not os.path.samestat(os.fstat(self.lock.fileno()), lockpath.lstat()):
                 raise OSError(f"result lock changed: {lockpath}")
             self.start = utc()
-            self.header = (f"Role: {args.role}\nFamily: {args.family}\n"
+            self.header = ((f"Role: {args.role}\n" if args.role is not None else "")
+                           + f"Family: {args.family}\n"
                            f"Author family: {args.author_family or ''}\n"
                            f"Same-family reason: {args.same_family_reason or ''}\n"
                            f"Start UTC: {self.start}\n")
             # Under the stem lock, no writer of these temporary files is alive.
             for path in self.out.parent.iterdir():
-                if path.name.startswith(self.out.stem + ".saving-") and not path.is_dir():
+                if (re.fullmatch(re.escape(self.out.stem) + r"\.saving-[a-z0-9_]+", path.name)
+                        and not path.is_dir()):
                     path.unlink()
             paths = (self.out, self.out.with_suffix(".log"),
                      self.out.with_name(self.out.stem + "-evidence"))
@@ -197,6 +210,7 @@ class ResultDestination:
             with tempfile.NamedTemporaryFile(dir=self.out.parent,
                                              prefix=self.out.stem + ".saving-", delete=False) as stream:
                 name = stream.name
+                os.fchmod(stream.fileno(), self.mode)
                 stream.write(contents)
             os.replace(name, self.out)
             name = None
@@ -205,12 +219,70 @@ class ResultDestination:
                 Path(name).unlink(missing_ok=True)
 
     def refused(self, reason):
+        self.finalizing = True
         if self.saved is not None:
             return 2
-        self.write((self.header + f"Result: launch refused\nReason: {reason}\n"
-                    f"End UTC: {utc()}\nExit code: 2\n").encode())
+        self.write_terminal((self.header + f"Result: launch refused\nReason: {reason}\n"
+                             f"End UTC: {utc()}\nExit code: 2\n").encode())
         print(reason, file=sys.stderr)
         return 2
+
+    def write_terminal(self, contents):
+        self.finalizing = True
+        try:
+            self.write(contents)
+        except OSError:
+            try:
+                # Replacement may fail while the already claimed file is writable.
+                with self.out.open("wb") as stream:
+                    stream.write(contents)
+            except OSError as report_error:
+                print(f"Cannot record result in {self.out}: {report_error}", file=sys.stderr)
+                sys.stderr.buffer.write(contents)
+                sys.stderr.buffer.flush()
+
+    def cannot_save(self, error, answer, answer_bytes=None):
+        self.finalizing = True
+        reason = f"failed: cannot save answer: {error}"
+        fallback = self.out.with_name(f"{self.out.stem}.unsaved-{os.getpid()}{self.out.suffix}")
+        preserved = False
+        if answer_bytes is None:
+            try:
+                # A link can preserve unreadable bytes without replacing an older
+                # fallback. Session cleanup only unlinks the original answer.
+                os.link(answer, fallback)
+                preserved = True
+            except OSError:
+                try:
+                    answer.chmod(0o600)
+                    with answer.open("rb") as stream:
+                        answer_bytes = stream.read()
+                except OSError as recovery_error:
+                    # Do not let session cleanup destroy the only remaining copy.
+                    self.keep_session = True
+                    print(f"Cannot recover answer {answer}: {recovery_error}; keeping session folder",
+                          file=sys.stderr)
+            if preserved:
+                try:
+                    fallback.chmod(self.mode)
+                except OSError as mode_error:
+                    print(f"Cannot set answer fallback mode {fallback}: {mode_error}", file=sys.stderr)
+        if answer_bytes is not None:
+            try:
+                with fallback.open("xb") as stream:
+                    stream.write(answer_bytes)
+                preserved = True
+            except OSError:
+                print("Unsaved answer follows on stderr:", file=sys.stderr, flush=True)
+                sys.stderr.buffer.write(answer_bytes)
+                sys.stderr.buffer.flush()
+        contents = (self.header + f"Result: {reason}\nEnd UTC: {utc()}\nExit code: 1\n").encode(
+            "utf-8", errors="backslashreplace")
+        self.write_terminal(contents)
+        print(reason, file=sys.stderr)
+        if preserved:
+            print(f"Answer kept in {fallback}", file=sys.stderr)
+        return 1
 
     def artifact(self, path):
         if not path.is_relative_to(self.out.parent):
@@ -218,7 +290,8 @@ class ResultDestination:
         name = path.relative_to(self.out.parent).parts[0]
         return (name in (self.out.name, self.out.with_suffix(".log").name,
                          self.out.stem + "-evidence", self.out.stem + ".lock")
-                or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-")))
+                or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-",
+                                    self.out.stem + ".unsaved-")))
 
     def save(self, header, answer):
         self.write(header.replace("\nExit code:", "\nCleanup: pending\nExit code:", 1).encode(
@@ -229,7 +302,16 @@ class ResultDestination:
         if self.saved is not None:
             header, answer = self.saved
             cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
-            self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
+            try:
+                self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
+            except Exception as error:
+                cleanup_failed("result finalization", error)
+                cleanup = "failed: " + "; ".join(CLEANUP_FAILURES)
+                try:
+                    self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
+                except Exception as report_error:
+                    # The pending answer remains intact if status cannot be saved.
+                    print(f"Cannot update cleanup status in {self.out}: {report_error}", file=sys.stderr)
 
 
 def registered_gitfile(admin):
@@ -312,12 +394,18 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt(signum)
 
 
-def discover_servers(executable, cwd, env, timeout, log):
+def discover_servers(executable, cwd, env, timeout, log, result):
     process = None
     try:
-        process = subprocess.Popen([executable, "mcp", "list", "--json"], cwd=cwd, env=env,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=log, start_new_session=True)
+        result.spawning = True
+        try:
+            process = subprocess.Popen([executable, "mcp", "list", "--json"], cwd=cwd, env=env,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=log, start_new_session=True)
+        finally:
+            result.spawning = False
+        if result.signal_code is not None:
+            raise KeyboardInterrupt(result.signal_code - 128)
         stdout, _ = process.communicate(timeout=timeout)
         if process.returncode:
             return [], f"discovery exited {process.returncode}"
@@ -949,25 +1037,27 @@ def main():
         print(f"Cannot prepare result destination {args.out}: {error}", file=sys.stderr)
         return 2
     def handle_signal(signum, frame):
+        if result.signal_code is not None:
+            return
         result.signal_code = 128 + signum
-        if result.claimed and not result.finalizing and result.saved is None:
+        if (result.claimed and not result.finalizing and not result.spawning
+                and result.saved is None):
             interrupted(signum, frame)
     previous_handlers = {}
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         previous_handlers[sig] = signal.getsignal(sig)
         if sig != signal.SIGHUP or previous_handlers[sig] != signal.SIG_IGN:
             signal.signal(sig, handle_signal)
-    def refuse(reason):
-        raise SystemExit(result.refused(reason))
-    parser.error = refuse
+    parser.error = argument_error
     CLEANUP_FAILURES = None
     try:
         result.claim(args)
         if result.signal_code is not None:
             raise KeyboardInterrupt(result.signal_code - 128)
         if parse_error is not None:
-            return result.refused(parse_error)
-        code = launch(parser, args, result)
+            code = result.refused(parse_error)
+        else:
+            code = launch(parser, args, result)
     except Exception as error:
         if result.saved is not None:
             print(f"Cannot save result {result.out}: {error}", file=sys.stderr)
@@ -978,9 +1068,11 @@ def main():
         else:
             code = result.refused(str(error) or type(error).__name__)
     except KeyboardInterrupt as error:
+        result.finalizing = True
         code = 128 + (error.args[0] if error.args else signal.SIGINT)
         if result.saved is None and result.claimed:
-            result.write((result.header + f"Result: interrupted\nExit code: {code}\n").encode())
+            result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
+                                   f"Exit code: {code}\n").encode())
     finally:
         if result.lock is not None:
             result.lock.close()
@@ -991,8 +1083,6 @@ def main():
 
 def launch(parser, args, result):
     global CLEANUP_FAILURES
-    if result.out == result.out.with_suffix(".log"):
-        parser.error("--out must differ from its sibling .log path")
     if (args.before or args.clean_checkout) and args.role != "verifier":
         parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
@@ -1272,7 +1362,7 @@ def launch(parser, args, result):
                     with out.with_suffix(".log").open("wb") as log:
                         environment = "restricted with MCP servers not disabled: discovery did not complete"
                         servers, reason = discover_servers(executable, cwd, agent_env,
-                                                           min(30, args.timeout or 30), log)
+                                                           min(30, args.timeout or 30), log, result)
                     environment = "restricted"
                     if reason:
                         environment += f" with MCP servers not disabled: {reason}"
@@ -1312,9 +1402,17 @@ def launch(parser, args, result):
             with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with out.with_suffix(".log").open("ab" if restricted else "wb") as log:
-                    process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
-                                               stderr=log, env=agent_env, start_new_session=True,
-                                               pass_fds=tuple(lock.fileno() for lock in leases))
+                    # Defer signals until Popen returns the identity needed to stop
+                    # the child, including a signal delivered inside Popen itself.
+                    result.spawning = True
+                    try:
+                        process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
+                                                   stderr=log, env=agent_env, start_new_session=True,
+                                                   pass_fds=tuple(lock.fileno() for lock in leases))
+                    finally:
+                        result.spawning = False
+                if result.signal_code is not None:
+                    raise KeyboardInterrupt(result.signal_code - 128)
                 try:
                     process.communicate(prompt.encode(), timeout=args.timeout)
                     code = process.returncode
@@ -1337,6 +1435,7 @@ def launch(parser, args, result):
                 CLEANUP_FAILURES = []
             if process is not None:
                 cleanup_step("stop session", stop_session, unit, process, guarded=bool(leases))
+            answer_bytes = None
             try:
                 answer_bytes = answer.read_bytes() if answer.exists() else b""
                 if process is not None and not answer_bytes.decode("utf-8", errors="replace").strip():
@@ -1373,9 +1472,13 @@ def launch(parser, args, result):
                     except Exception as error:
                         cleanup_failed(f"evidence copy {evidence}", error)
                 else:
-                    result.header = header.rsplit("Exit code:", 1)[0]
+                    result.header = header.rsplit("End UTC:", 1)[0]
                     if launch_error is not None:
                         result.refused(launch_error)
+            except Exception as error:
+                if process is None or result.saved is not None:
+                    raise
+                code = result.cannot_save(error, answer, answer_bytes)
             finally:
                 cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
     finally:
@@ -1383,7 +1486,10 @@ def launch(parser, args, result):
             CLEANUP_FAILURES = []
         for lock in leases:
             cleanup_step("lease close", lock.close)
-        cleanup_step(f"temporary folder {session.name}", session.cleanup)
+        if result.keep_session:
+            session._finalizer.detach()
+        else:
+            cleanup_step(f"temporary folder {session.name}", session.cleanup)
         result.finish()
     return 3 if code == 0 and result.saved is not None and CLEANUP_FAILURES else code
 
