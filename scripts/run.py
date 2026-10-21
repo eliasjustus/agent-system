@@ -510,6 +510,7 @@ def reset_checkout(work, common, commit, deep_clean, pass_fds=()):
             remove_checkout_tree(path)
         else:
             path.unlink()
+    (admin / "refs").mkdir()
     # Restore the OLD committed tree in the index first, including staged
     # deletions of paths that the new candidate ignores. Preserve stat data
     # for unchanged entries, but discard all assume-unchanged/skip-worktree bits.
@@ -609,16 +610,41 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     failures = []
     for number in range(1, POOL_SLOTS + 1):
         slot = pool / f"slot-{number}"
-        lock = (pool / f"slot-{number}.lock").open("a+b")
+        lockpath = pool / f"slot-{number}.lock"
+        lock = None
         try:
+            # Never follow a lock symlink or block while opening a FIFO. Do
+            # not replace malformed lock inodes: another launcher may already
+            # have one open, and replacement would split the exclusive lease.
+            if os.path.lexists(lockpath) and not stat.S_ISREG(lockpath.lstat().st_mode):
+                raise ValueError("non-regular lock path")
+            lock = os.fdopen(os.open(lockpath, os.O_CREAT | os.O_RDWR | os.O_APPEND
+                                    | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666), "a+b")
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                raise ValueError("non-regular lock path")
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not os.path.samestat(os.fstat(lock.fileno()), lockpath.lstat()):
+                raise ValueError("lock path changed while acquiring lease")
         except BlockingIOError:
-            lock.close()
+            if lock is not None:
+                lock.close()
+            continue
+        except (OSError, ValueError) as error:
+            if lock is not None:
+                lock.close()
+            failure = f"pool slot {slot} unusable: {error}"
+            print(failure, file=sys.stderr)
+            failures.append(failure)
             continue
         leases.append(lock)
         metadata = pool / f"slot-{number}.json"
+        temporary = metadata.with_suffix(".json.tmp")
         reason = ""
         try:
+            for path in (metadata, temporary):
+                if os.path.lexists(path) and not stat.S_ISREG(path.lstat().st_mode):
+                    remove_checkout_tree(path)
+                    reason = "non-regular metadata path"
             previous = json.loads(metadata.read_text())
             if (type(previous["uses"]) is not int or not 0 <= previous["uses"] <= POOL_USES
                     or not re.fullmatch(r"[0-9a-f]{40,64}", previous["commit"])
@@ -629,7 +655,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                 raise ValueError("invalid metadata")
         except (OSError, ValueError, KeyError, TypeError):
             previous = {"uses": 0, "commit": "", "commits": []}
-            reason = "missing or corrupt metadata"
+            reason = reason or "missing or corrupt metadata"
         if force_clean:
             reason = "--clean-checkout"
         elif previous["uses"] >= POOL_USES:
@@ -690,10 +716,10 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                 leases.remove(lock)
                 lock.close()
                 continue
-        metadata.with_suffix(".json.tmp").write_text(json.dumps({
+        temporary.write_text(json.dumps({
             "uses": 1 if reason else previous["uses"] + 1, "commit": commit,
             "commits": [commit] if reason else previous["commits"] + [commit]}))
-        metadata.with_suffix(".json.tmp").replace(metadata)
+        temporary.replace(metadata)
         return slot, "; ".join([*failures, f"pool {slot}",
                                f"deep clean: {reason}" if reason else "warm reset"])
     git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)

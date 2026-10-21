@@ -1394,8 +1394,10 @@ subprocess.check_output = broken_status
                             else self.git("rev-parse", "HEAD") + "\n")
         self.assertEqual(self.verifier()["cwd"], str(slot))
         self.assertEqual((slot / "ignored").read_text(), "warm output")
-        for name in ("ORIG_HEAD", "FETCH_HEAD", "index.lock", "logs/old", "refs", "info", "config.worktree"):
+        for name in ("ORIG_HEAD", "FETCH_HEAD", "index.lock", "logs/old", "info", "config.worktree"):
             self.assertFalse((admin / name).exists(), name)
+        self.assertTrue((admin / "refs").is_dir())
+        self.assertEqual(list((admin / "refs").iterdir()), [])
 
     def test_POOL_R10_06_stale_index_lock_is_removed_without_recreation(self):
         slot = Path(self.verifier()["cwd"])
@@ -2188,6 +2190,111 @@ subprocess.check_output = broken_slot
                 self.assertEqual(next_record["head"], self.git("rev-parse", "HEAD"))
                 self.assertFalse((slot / "ignored").exists())
                 self.assertEqual(json.loads(metadata.read_text())["uses"], 1)
+
+    def test_POOL_S8_nonregular_metadata_paths_deep_clean_without_following_links(self):
+        slot = Path(self.verifier()["cwd"])
+        self.pool_probe()
+        target = self.base / "metadata-target"
+        target.write_text("must stay untouched")
+        for suffix in (".json", ".json.tmp"):
+            for kind in ("directory", "symlink", "fifo"):
+                with self.subTest(path=suffix, kind=kind):
+                    self.verifier()
+                    # Valid metadata behind the link must still force a deep
+                    # clean; merely reading it would silently preserve output.
+                    original = slot.with_suffix(".json").read_text()
+                    target.write_text(original)
+                    path = slot.with_suffix(suffix)
+                    path.unlink(missing_ok=True)
+                    if kind == "directory":
+                        path.mkdir()
+                        (path / "nested").mkdir()
+                        (path / "nested/link").symlink_to(target)
+                    elif kind == "symlink":
+                        path.symlink_to(target)
+                    else:
+                        os.mkfifo(path)
+                    (slot / "ignored").write_text("stale build output")
+                    process = self.start_launcher()
+                    try:
+                        try:
+                            _, stderr = process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.terminate()
+                            process.communicate(timeout=10)
+                            self.fail("launcher blocked on non-regular metadata path")
+                        self.assertEqual(process.returncode, 0, stderr)
+                        record = json.loads(self.record.read_text())
+                        self.assertEqual(record["cwd"], str(slot))
+                        self.assertEqual(record["status"], "")
+                        self.assertEqual(target.read_text(), original)
+                        self.assertFalse((slot / "ignored").exists())
+                        self.assertIn("deep clean:", self.out.read_text())
+                        self.assertEqual(json.loads(slot.with_suffix(".json").read_text())["uses"], 1)
+                        self.assertFalse(slot.with_suffix(".json.tmp").exists())
+                    finally:
+                        if path.is_symlink() or (path.exists() and not path.is_file()):
+                            if path.is_dir() and not path.is_symlink():
+                                shutil.rmtree(path)
+                            else:
+                                path.unlink()
+
+    def test_POOL_S8_nonregular_lock_paths_skip_without_following_links(self):
+        slot = Path(self.verifier()["cwd"])
+        path = slot.with_suffix(".lock")
+        target = self.base / "lock-target"
+        target.write_text("must stay untouched")
+        for kind in ("directory", "symlink", "fifo"):
+            with self.subTest(kind=kind):
+                path.unlink(missing_ok=True)
+                if kind == "directory":
+                    path.mkdir()
+                elif kind == "symlink":
+                    path.symlink_to(target)
+                else:
+                    os.mkfifo(path)
+                try:
+                    # A subsequent lease must keep skipping an unsafe lock too.
+                    for _ in range(2):
+                        process = self.start_launcher()
+                        try:
+                            _, stderr = process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.terminate()
+                            process.communicate(timeout=10)
+                            self.fail("launcher blocked on non-regular lock path")
+                        self.assertEqual(process.returncode, 0, stderr)
+                        record = json.loads(self.record.read_text())
+                        self.assertEqual(record["cwd"], str(slot.with_name("slot-2")))
+                        reason = f"pool slot {slot} unusable: non-regular lock path"
+                        self.assertIn(reason, stderr)
+                        self.assertIn(reason, self.out.read_text())
+                        self.assertEqual(target.read_text(), "must stay untouched")
+                    with (slot.parent / "slot-2.lock").open("a+b") as second, \
+                            (slot.parent / "slot-3.lock").open("a+b") as third:
+                        for lock in (second, third):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        record = self.verifier()
+                        self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
+                        self.assertIn("pool busy or slots unusable", self.out.read_text())
+                        self.assertIn(reason, self.out.read_text())
+                        self.assert_session_cleaned(record)
+                finally:
+                    if path.is_dir() and not path.is_symlink():
+                        path.rmdir()
+                    else:
+                        path.unlink(missing_ok=True)
+
+    def test_POOL_S8_reset_restores_empty_admin_refs(self):
+        slot = Path(self.verifier()["cwd"])
+        admin = Path(subprocess.check_output(
+            ["git", "-C", str(slot), "rev-parse", "--absolute-git-dir"], text=True).strip())
+        refs = admin / "refs"
+        refs.mkdir(exist_ok=True)
+        (refs / "leftover").write_text("discard local refs")
+        self.verifier()
+        self.assertTrue(refs.is_dir())
+        self.assertEqual(list(refs.iterdir()), [])
 
     def test_POOL_S8_checkout_hooks_are_disabled_and_interrupted_reset_deep_cleans(self):
         slot = Path(self.verifier()["cwd"])
