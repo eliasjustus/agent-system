@@ -4,12 +4,12 @@
 
 ## Current view
 
-<!-- At most 150 words. Rewrite in place. -->
+<!-- At most 150 words. Rewrite in place when the owner, a blocker or the state changes. -->
 - Request: "{{REQUEST}}" ({{DATE}}, from the user)
 - State: active  <!-- active | awaiting verdict | paused: <reason>; resume when <condition> | closed: <signed off by the request | accepted | abandoned | superseded by <id>> -->
 - Depth: undecided  <!-- above | below, with the three answers below -->
 - Owner: <session, date>
-- Estimate: <time range>; started <time>; stop at <start + 2x upper end>  <!-- only a stop message moves it; actual effort is added at close -->
+- Estimate: <time range>; started <UTC time from date -u>; stop at <absolute UTC time: start + 2x upper end>  <!-- only a stop message moves it; actual effort is added at close -->
 - Plan:
 - Now:
 - Next:

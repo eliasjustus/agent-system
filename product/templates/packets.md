@@ -36,7 +36,8 @@ The user asked, in their words: "<exact words>"
 The relevant code: <paths or entry points>
 ```
 
-Nothing else: no design, no draft scenarios, no proposed fix.
+Prefer nothing else: no design, no draft scenarios, no proposed fix. If you include any, say so in
+the task record with the reason.
 
 ## Challenger, pass 2
 

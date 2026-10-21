@@ -8,7 +8,8 @@ everything you need is in your brief.
 
 ## Pass 1: from the user's words and the code alone
 
-You receive the user's exact words and where the relevant code lives, and no scenario list. Read the
+You receive the user's exact words and where the relevant code lives, normally without a scenario
+list; if your brief includes draft scenarios or a design, still derive your own cases first. Read the
 code that produces and consumes the affected behavior. List the situations a correct change must
 handle:
 

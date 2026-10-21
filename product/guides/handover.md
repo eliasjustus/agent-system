@@ -76,6 +76,11 @@ appears in the loop's own command line matches the loop itself, and the loop nev
 
 - Save the agent's answer in the task folder's `results/`, unedited.
 - Read the answer before acting on it. A later cleanup error does not erase a completed answer.
+- A prerequisite a check proved (an environment variable, a path limit, a lock, a launch option)
+  goes into every later brief of the task.
+- A plan or synthesis you write from agents' answers is itself a candidate: before delivering it,
+  have its consequential transformations (units, identities, arithmetic, rankings, dropped
+  constraints) checked against those answers.
 - Builders come back when the work contradicts the design or scenarios, the scope changes, a check
   fails for a reason that is not plainly an implementation defect, or the same failure repeats after
   two attempts. Weaker models judge their limits poorly: review at checkpoints.
