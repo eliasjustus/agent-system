@@ -29,5 +29,6 @@ choice to continue in the current session wins. Never continue orchestrating on 
 
 ## Current view
 
-At most 150 words, rewritten in place. Lines: Request, State, Depth, Owner, Estimate, Plan, Now,
+At most 150 words, rewritten in place whenever the owner, a blocker or the state changes; the log
+never goes into it. Lines: Request, State, Depth, Owner, Estimate, Plan, Now,
 Next, Open for user.

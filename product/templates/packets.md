@@ -2,7 +2,8 @@
 
 Save each brief in the task folder as `briefs/<role>-<n>.md`. A brief never names the private folder
 or anything in it, except an investigator's brief that needs the records. Each role also receives its contract from `roles/`. Include the user's decisions that bear on the work, word for
-word with their conditions, within what each role may receive.
+word with their conditions, and the prerequisites earlier checks of the task proved, within what
+each role may receive.
 
 ## Investigator
 
@@ -36,7 +37,8 @@ The user asked, in their words: "<exact words>"
 The relevant code: <paths or entry points>
 ```
 
-Nothing else: no design, no draft scenarios, no proposed fix.
+Prefer nothing else: no design, no draft scenarios, no proposed fix. If you include any, say so in
+the task record with the reason.
 
 ## Challenger, pass 2
 

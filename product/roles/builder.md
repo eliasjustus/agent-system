@@ -17,7 +17,10 @@ judge of your work: a verifier checks it independently.
   as a shared clone inside $TMPDIR, never by stashing or reverting:
   `git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`.
   Put known-good and other temporary checkouts there too, using shared clones that write nothing
-  into the source repository.
+  into the source repository. Build each tree into its own build folder.
+- Checks use their own temporary resources: never use another session's running service or write
+  into a dependency tree other checkouts use. Name in your report any shared resource your checks
+  touched (the owner's running apps, a dev stack, a GPU).
 - Stop only the processes you started, by their recorded identity.
 
 ## Do not

@@ -27,7 +27,10 @@ check wrong. Where feasible, the corrected check still rejects the original defe
 Send all open findings together, grouped into one repair plan per cause, not per symptom. When a
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios before the repair, and have the builder exercise them before handing back,
-rather than letting verification find them one at a time. After a
+rather than letting verification find them one at a time. When a second case of the same failure class
+appears (cases one repair should cover, such as one race, one reset path or one reader; not every
+state of the system), first write down the expected result for each case of that class, including what must keep working, as a table or an executable reference the
+verifier may challenge; then repair. After a
 repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was
 mistaken.
@@ -44,4 +47,5 @@ estimate and tell the user.
 Ordinary technical recovery needs no approval. If recovery cannot finish now, write down the blocker
 and what would let it resume, and offer the user a reviewable candidate or a verified subset with its
 known gaps. Reducing scope or accepting a risk is the user's choice and never turns missing
-verification into a pass.
+verification into a pass. Above the floor, a round limit or a stop time never permits building it
+yourself; at any depth it never permits weakening a scenario: stop and report instead.

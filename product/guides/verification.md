@@ -28,7 +28,13 @@ never proves a broader promise. A boundary failure is checked where it occurs, e
 
 Admit evidence only once you know which build ran and what state it used. A stale installed build or
 a test that reached real per-machine state proves nothing about the candidate. Tests use their own
-temporary resources and clean them up.
+temporary resources and clean them up. Name the shared resources a real-system check touches (the
+owner's running apps, a dev stack, a GPU, shared dependency folders); never use another session's
+running service or write into a dependency tree other checkouts use; restore the owner's apps you
+stopped, from outside your own process scope, and show that they run again.
+
+When the candidate includes other merged changes, first run the cheapest checks that cover code they
+share (build, type check, compiling the tests) before any narrower recheck.
 
 Before a long timing or resource measurement, have the same candidate reviewed or probed cheaply
 first; a blocker found that way saves the measurement.
@@ -56,7 +62,8 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
 
 The scenario list is someone else's framing. Add at least one case aimed at what it most likely
 missed: another path to the same result, state over time, an input the wording implies. Report
-variations you chose not to test as untested.
+variations you chose not to test as untested. To call a reported defect not real, address the
+reported entry point and conditions; a safe path elsewhere does not refute it.
 
 ## Report
 

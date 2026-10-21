@@ -8,7 +8,8 @@ agrees them.
 # Project knowledge: {{PROJECT}}
 
 Decisions, pitfalls and how to run things that cannot be read cheaply from the code. Each entry: the
-knowledge, its source and date, and when it applies. Remove entries that stop helping. Keep
+knowledge, its source and date, and when it applies. Remove entries that stop helping; replace an
+entry a newer one supersedes rather than adding a contradicting one. Keep
 project-scoped preferences here, at the narrowest scope the user stated.
 
 ## Commit policy

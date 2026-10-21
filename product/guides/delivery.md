@@ -22,9 +22,17 @@ request body), they decide where each part goes:
 4. **Cost:** the estimate and the actual effort.
 
 A failed agreed scenario stays failed here. It may also be recorded as a finding, but accepting the
-failure or narrowing the outcome needs the user's yes, in their words.
+failure or narrowing the outcome needs the user's yes, in their words. List every scenario that did
+not pass (failed, inconclusive or unverified) with its owner and the user's words that let it ship;
+without them it does not ship. A pass of a narrower check (one component, test intent, a partial
+recheck) is named as such and is not the scenario passing. A user decision applied to another task
+keeps its conditions.
 
-If the code changed after verification, verify again. A linked file is not proof by itself: say what
+A change meant to save cost or time is proven by its benefit measured on the work it is meant to
+improve; otherwise deliver it as "forecast, unmeasured" with who measures it and when.
+
+If the code changed after verification, verify again; so too for a document, plan or synthesis
+changed after review: recheck the changed passages. A linked file is not proof by itself: say what
 the evidence shows. The required CI checks of the exact candidate are green, or a red or pending one
 is a named limit.
 
@@ -52,16 +60,21 @@ is recorded, do not commit and say so.
 
 Work that needed no question is signed off by its request once it is verified and delivered, or by
 the user's merge where the project leaves merging to them: record that, then finish as for accepted
-work. Where you asked, keep only that change waiting (a draft pull request, the
-question in the task record's `Open for user`) and carry on with the rest; ask it in the next
-conversation with the user, one question, never a list of pending items. Record the reply word for
-word in the task record with the date. Silence is not acceptance.
+work. Where you asked, keep only that change waiting (a draft pull request, the question in the
+task record's `Open for user`) and carry on with the rest. The question is asked once: in the
+delivery message, or, if the user was not in the conversation then, in their next one, one question,
+never a list of pending items. Do not repeat it on later turns or in later conversations, such as
+after a background result; ask again only when the user returns to it or its evidence or
+conditions change. A question several sessions share is asked by the session that owns it. Record
+the reply word for word in the task record with the date. Silence is not acceptance.
 
 - **Accepted:** finish cleanup, add the delivered scenarios to the project's `checks.md` with how to
   run them, close the task record. Reply in at most three sentences.
-- **Cleanup**, when a task is merged or abandoned: remove its worktrees and the build output in them,
-  after keeping anything still needed. A worktree kept for later work holds no generated build output
-  (such as `target/`, `build/` or `node_modules/`) while it waits.
+- **Cleanup**, when a task or one of its pull requests is merged or abandoned: remove that work's
+  worktrees and the build output in them, after keeping anything still needed. A worktree kept for
+  later work holds no generated build output (such as `target/`, `build/` or `node_modules/`) while
+  it waits. Never delete results or evidence before they are kept where the task record links them.
+  Launcher pool slots are not task output.
 - **Reported wrong later:** reopen the same task record with a new candidate (and a new pull
   request where the project uses them).
 - **Changes requested:** continue under the same task record and the same pull request or a
