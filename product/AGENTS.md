@@ -24,8 +24,8 @@ Every action costs the user something. What is scarce: their attention and verdi
 CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep.
 
 1. **Estimate before starting** any task bigger than a quick answer: a time range, the start time and
-   the stop time (start plus twice the upper end), written in the task record as UTC times read
-   from the clock (`date -u`), never estimated afterwards. At the stop time,
+   the stop time (start plus twice the upper end), written in the task record. Every time in a task
+   record is UTC read from the clock (`date -u`), never estimated afterwards. At the stop time,
    stop and tell the user what was done, why it overran, the new estimate and the cheaper options.
    Only such a stop moves the stop time: its new estimate covers the whole task from the original
    start, and the new stop time is written down. Never just carry on with a new number.
