@@ -93,6 +93,29 @@ the answer's header. Check that list before trusting a review. The answer and it
 at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
+Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
+While a launcher runs, `--out` and its siblings (`.log`, `-evidence`, `.lock`, `.attempt-N`) belong to it.
+Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
+(for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
+refused (and then the file says so) or the destination cannot be claimed (an earlier result may
+already have moved to `.attempt-N`; stderr says why). Exit 1 with
+`Result: failed: cannot save answer: <error>; answer left in <session folder>` means the agent ran
+but saving its answer failed. The session folder is kept with the answer in place; remove it manually
+after recovering the answer. If the result cannot be written, the same failure and folder are reported
+on stderr (best effort). Exit 3 means a saved answer with exit 0 and failed cleanup. The header's
+`Exit code:` keeps the agent's code, including when cleanup fails.
+`Cleanup: pending` means the answer is saved and cleanup is still running; its final status is
+`Cleanup: ok` or `Cleanup: failed: <what>; …`. If stopping the agent fails, evidence stays in the
+session folder, the session folder is kept, and the cleanup status gives its location.
+A non-zero agent code survives cleanup failures.
+A handled signal is recorded as `Signal: <number>` and exits with 128 plus that number, including
+after the answer was saved. The header's `Exit code:` retains the original outcome.
+The result file decides what completed: a late signal never replaces a saved answer. Once the final
+status is written, further signals are ignored and the exit status matches the recorded outcome.
+`Result: running` means the launcher is running or was killed. Check liveness with
+`flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
+an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
+is refused before claiming or archiving anything.
 The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
