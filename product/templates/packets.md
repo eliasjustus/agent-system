@@ -60,7 +60,7 @@ You are a verifier. Follow the verifier contract and the verification guide.
 The user asked, in their words: "<exact words>"
 Deliver: <IDs and text>
 Must not break: <IDs and text>
-Candidate: <committed candidate>   Baseline: <commit; pass with --before>
+Candidate: <committed candidate>   Baseline: <commit, or none>
 Start the system: <commands, ports, data>
 Evidence folder: named by the launcher
 ```

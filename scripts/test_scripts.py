@@ -178,6 +178,8 @@ class ScriptsTest(unittest.TestCase):
         self.env["PYTHONPATH"] = str(site)
 
     def start_launcher(self, *extra, role="verifier", out=None, record=None):
+        if role == "verifier" and "--before" not in extra:
+            extra = ("--before", "none", *extra)
         env = dict(self.env, RECORD=str(record or self.record))
         process = subprocess.Popen(
             [sys.executable, str(ROOT / "scripts/run.py"), "--role", role,
@@ -215,6 +217,8 @@ class ScriptsTest(unittest.TestCase):
                               text=True, capture_output=True)
 
     def launch(self, role="builder", family="codex", *extra):
+        if role == "verifier" and "--before" not in extra:
+            extra = ("--before", "none", *extra)
         return self.run_script("run.py", "--role", role, "--family", family,
                                "--brief", self.brief, "--out", self.out,
                                "--repo", self.repo, "--method", self.method,
@@ -1113,6 +1117,356 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertIn("Before checkout:", self.out.read_text())
                 self.assertEqual((self.repo / "tracked").read_text(), "candidate")
                 self.assertTrue(Path(record["before"]).is_dir())
+
+    def test_BEFORE_S1_missing_choice_is_refused_for_both_families(self):
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.run_script("run.py", "--role", "verifier", "--family", family,
+                                         "--author-family", "claude" if family == "codex" else "codex",
+                                         "--brief", self.brief, "--out", self.out,
+                                         "--repo", self.repo, "--method", self.method,
+                                         "--private", self.private)
+                self.assert_launch_refused(result, "verifier requires --before <commit> or --before none")
+                self.assertFalse(self.pool_root().exists())
+
+    def test_BEFORE_S2_none_leases_only_candidate_for_both_families(self):
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family, "--before", "none")
+                self.assertIn("Before checkout: none (--before none)", self.out.read_text())
+                self.assertIn("Before checkout: none (--before none)", record["stdin"])
+                self.assertIn("there is no before checkout", record["stdin"])
+                self.assertEqual(record["stdin"].count(
+                    'git clone --quiet --shared --no-checkout . "$TMPDIR/before"'), 1)
+                metadata = list(self.pool_root().glob("*.json"))
+                self.assertEqual(len(metadata), 1, "none must not lease a baseline slot")
+                self.assertEqual(json.loads(metadata[0].read_text())["uses"],
+                                 1 if family == "codex" else 2)
+
+    @unittest.skipUnless(shutil.which("cargo"), "cargo is not installed; real warm-build check unavailable")
+    def test_BEFORE_S3_two_sessions_keep_both_cargo_trees_fresh(self):
+        self.env.update(PATH=self.env["PATH"] + os.pathsep + os.environ["PATH"],
+                        CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")),
+                        RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")))
+        self.env.pop("CARGO_TARGET_DIR", None)
+        self.env.pop("CARGO_BUILD_TARGET_DIR", None)
+        (self.repo / ".gitignore").write_text("ignored\ntarget/\n")
+        (self.repo / "Cargo.toml").write_text(
+            '[package]\nname = "warm_app"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[dependencies]\nwarm_dep = { path = "dep" }\n')
+        (self.repo / "src").mkdir()
+        (self.repo / "src/lib.rs").write_text("pub fn value() -> u32 { warm_dep::value() }\n")
+        (self.repo / "dep/src").mkdir(parents=True)
+        (self.repo / "dep/Cargo.toml").write_text(
+            '[package]\nname = "warm_dep"\nversion = "0.1.0"\nedition = "2021"\n')
+        (self.repo / "dep/src/lib.rs").write_text("pub fn value() -> u32 { 7 }\n")
+        lock = subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.repo,
+                              env=self.env, capture_output=True, text=True)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        self.git("add", ".")
+        self.git("commit", "-qm", "local Cargo crate and dependency")
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "src/lib.rs").write_text("pub fn value() -> u32 { warm_dep::value() + 1 }\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate source")
+        self.agent_extra('''
+import hashlib
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+record["builds"] = {}
+for name, tree in (("candidate", cwd), ("before", before)):
+    build = subprocess.run(["cargo", "build", "--offline", "--locked", "-v"], cwd=tree,
+                           capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    fingerprints = {str(p.relative_to(tree)): [p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()]
+                    for p in (tree / "target/debug/.fingerprint").rglob("*") if p.is_file()}
+    assert fingerprints, "build must leave real Cargo fingerprints in its own tree"
+    record["builds"][name] = {"tree": str(tree), "output": build.stderr, "fingerprints": fingerprints}
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        first = self.verifier("codex", "--before", baseline)["builds"]
+        second = self.verifier("codex", "--before", baseline)["builds"]
+        self.assertEqual(self.out.read_text().count("warm reset"), 2)
+        for name in ("candidate", "before"):
+            with self.subTest(tree=name):
+                self.assertIn("Compiling warm_dep", first[name]["output"])
+                self.assertIn("Compiling warm_app", first[name]["output"])
+                self.assertIn("Fresh warm_dep", second[name]["output"])
+                self.assertIn("Fresh warm_app", second[name]["output"])
+                self.assertNotIn("Compiling", second[name]["output"])
+                self.assertEqual(first[name]["tree"], second[name]["tree"])
+                self.assertEqual(first[name]["fingerprints"], second[name]["fingerprints"])
+        self.assertNotEqual(second["candidate"]["tree"], second["before"]["tree"])
+
+    def test_BEFORE_S4_joint_choice_preserves_closest_baseline_on_candidate_tie(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("other warm version")
+        self.git("add", ".")
+        self.git("commit", "-qm", "other warm version")
+        other = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, other])
+        (slots[0] / "ignored").write_text("baseline output")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        self.agent_extra('''
+record["before"] = re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        record = self.verifier("codex", "--before", baseline)
+        self.assertEqual(record["cwd"], str(slots[1]))
+        self.assertEqual(record["before"], str(slots[0]))
+        self.assertEqual((slots[0] / "ignored").read_text(), "baseline output")
+        self.assertEqual(self.out.read_text().count("warm reset"), 2)
+
+    def test_BEFORE_S4_only_warm_baseline_survives_candidate_equally_cold_elsewhere(self):
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("baseline output")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        record = self.verifier("codex", "--before", baseline)
+        self.assertNotEqual(record["cwd"], str(slot))
+        self.assertIn(f"Before checkout: {slot} ({baseline}); pool {slot}; warm reset", self.out.read_text())
+        self.assertEqual((slot / "ignored").read_text(), "baseline output")
+
+    def test_BEFORE_S4_candidate_and_baseline_keep_their_own_warm_slots(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, candidate])
+        for slot in slots:
+            (slot / "ignored").write_text(slot.name + " output")
+        record = self.verifier("codex", "--before", baseline)
+        self.assertEqual(record["cwd"], str(slots[1]))
+        self.assertIn(f"Before checkout: {slots[0]} ({baseline}); pool {slots[0]}; warm reset",
+                      self.out.read_text())
+        self.assertEqual(self.out.read_text().count("warm reset"), 2)
+        for slot in slots:
+            self.assertEqual((slot / "ignored").read_text(), slot.name + " output")
+
+    def test_BEFORE_S4_only_warm_baseline_survives_candidate_build_input_change(self):
+        baseline = self.git("rev-parse", "HEAD")
+        slot = Path(self.verifier()["cwd"])
+        (slot / "ignored").write_text("baseline output")
+        (self.repo / "Cargo.toml").write_text("changed manifest")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate build inputs")
+        record = self.verifier("codex", "--before", baseline)
+        self.assertNotEqual(record["cwd"], str(slot))
+        self.assertIn(f"Before checkout: {slot} ({baseline}); pool {slot}; warm reset", self.out.read_text())
+        self.assertEqual((slot / "ignored").read_text(), "baseline output")
+
+    def test_BEFORE_S4_total_distance_beats_candidates_individual_preference(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        (self.repo / "other-1").write_text("other")
+        (self.repo / "other-2").write_text("other")
+        self.git("add", ".")
+        self.git("commit", "-qm", "other warm version")
+        other = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, other])
+        self.git("reset", "--hard", baseline)
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "candidate")
+        self.agent_extra('''
+record["before"] = re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        record = self.verifier("codex", "--before", baseline)
+        # Candidate-first costs 1 + 3; assigning it the other slot costs 2 + 0.
+        self.assertEqual(record["cwd"], str(slots[1]))
+        self.assertEqual(record["before"], str(slots[0]))
+        self.assertEqual(self.out.read_text().count("warm reset"), 2)
+
+    def test_BEFORE_S4_joint_choice_uses_closest_free_baseline_when_best_is_busy(self):
+        (self.repo / "other").write_text("original")
+        self.git("add", ".")
+        self.git("commit", "-qm", "baseline")
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "first warm version")
+        first = self.git("rev-parse", "HEAD")
+        self.git("reset", "--hard", baseline)
+        (self.repo / "other").write_text("candidate")
+        self.git("commit", "-qam", "second warm version")
+        second = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, first, second])
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "candidate")
+        self.agent_extra('''
+record["before"] = re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        with slots[0].with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = self.verifier("codex", "--before", baseline)
+        # Both free assignments cost 1 + 1, so keep candidate-first slot order.
+        self.assertEqual(record["cwd"], str(slots[1]))
+        self.assertEqual(record["before"], str(slots[2]))
+
+    def test_BEFORE_S4_failed_candidate_releases_before_and_retries_other_pairs(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        slots = self.seed_pool([baseline, candidate])
+        (slots[0] / "ignored").write_text("baseline output")
+        self.env["UNUSABLE_SLOT"] = str(slots[1])
+        self.inject_launcher('''
+import os, subprocess
+original = subprocess.check_output
+def fail_slot(command, *args, **kwargs):
+    if os.environ["UNUSABLE_SLOT"] in command:
+        raise subprocess.CalledProcessError(71, command)
+    return original(command, *args, **kwargs)
+subprocess.check_output = fail_slot
+''')
+        record = self.verifier("codex", "--before", baseline)
+        self.assertEqual(record["cwd"], str(slots[0].with_name("slot-3")))
+        self.assertIn(f"Before checkout: {slots[0]} ({baseline}); pool {slots[0]}; warm reset",
+                      self.out.read_text())
+        self.assertEqual((slots[0] / "ignored").read_text(), "baseline output")
+        self.assertIn(f"pool slot {slots[1]} unusable:", self.out.read_text())
+
+    def test_BEFORE_S4_failed_locks_are_not_retried_in_pairs_or_fallback(self):
+        pool = self.pool_root()
+        pool.mkdir(parents=True, exist_ok=True)
+        for error in ("OSError", "ValueError"):
+            self.inject_launcher(f'''
+import fcntl, os
+original = fcntl.flock
+def fail_lock(stream, operation):
+    descriptor = stream if isinstance(stream, int) else stream.fileno()
+    if os.readlink(f"/proc/self/fd/{{descriptor}}") == {str(pool / 'slot-1.lock')!r}:
+        raise {error}("injected unusable lock")
+    return original(stream, operation)
+fcntl.flock = fail_lock
+''')
+            for fallback in (False, True):
+                with self.subTest(error=error, fallback=fallback), ExitStack() as held:
+                    if fallback:
+                        for number in range(2, 6):
+                            lock = held.enter_context((pool / f"slot-{number}.lock").open("a+b"))
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    result = self.launch("verifier", "codex", "--author-family", "claude",
+                                         "--before", "HEAD", "--clean-checkout")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reason = f"pool slot {pool / 'slot-1'} unusable: injected unusable lock"
+                    # Each checkout may try the bad lock once. Pair search and
+                    # fallback within that lease must never try it again.
+                    self.assertEqual(result.stderr.count(reason), 2 if fallback else 1)
+                    self.assertEqual(self.out.read_text().count(reason), 2 if fallback else 1)
+                    record = json.loads(self.record.read_text())
+                    self.assertEqual(Path(record["cwd"]).is_relative_to(pool), not fallback)
+
+    def test_BEFORE_S5_verifier_build_outputs_are_separate_in_prompts_and_docs(self):
+        for family in ("codex", "claude"):
+            for before in ("HEAD", "none"):
+                with self.subTest(family=family, before=before):
+                    prompt = self.verifier(family, "--before", before)["stdin"]
+                    self.assertIn("Build each source tree only into its own build folder", prompt)
+                    self.assertIn("Never point one tree's build output", prompt)
+                    for example in ("CARGO_TARGET_DIR", "Gradle build directories", "node_modules"):
+                        self.assertIn(example, prompt)
+                    self.assertEqual(prompt.count("Build each source tree only into its own build folder"), 2)
+        for document in ("product/guides/verification.md", "product/roles/verifier.md"):
+            with self.subTest(document=document):
+                text = (ROOT / document).read_text()
+                self.assertIn("Build each source tree only into its own build folder", text)
+                self.assertIn("Never point one tree's build output", text)
+                for example in ("CARGO_TARGET_DIR", "Gradle build directories", "node_modules"):
+                    self.assertIn(example, text)
+        for family in ("codex", "claude"):
+            result = self.launch("builder", family)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Never point one tree's build output", json.loads(self.record.read_text())["stdin"])
+
+    def test_BEFORE_S6_same_commit_has_distinct_writable_trees_and_resolved_header(self):
+        self.agent_extra('''
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+assert before != cwd
+(cwd / "tracked").write_text("candidate edits")
+assert (before / "tracked").read_text() == "original"
+(before / "tracked").write_text("baseline edits")
+assert (cwd / "tracked").read_text() == "candidate edits"
+record["before"] = str(before)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family, "--before", "HEAD")
+                line = f"Before checkout: {record['before']} ({self.git('rev-parse', 'HEAD')});"
+                self.assertIn(line, self.out.read_text())
+                self.assertIn(line, record["stdin"])
+                self.assertEqual((self.repo / "tracked").read_text(), "original")
+
+    def test_BEFORE_P1_invalid_before_and_nonverifier_choices_are_refused(self):
+        for role in ("builder", "investigator", "challenger", "reviewer"):
+            for before in ("HEAD", "none"):
+                with self.subTest(role=role, before=before):
+                    self.assert_launch_refused(self.launch(role, "codex", "--before", before),
+                                               "allowed only for verifiers")
+        for before in ("missing-commit", "NONE", ""):
+            with self.subTest(before=before):
+                self.assert_launch_refused(self.launch("verifier", "codex", "--author-family", "claude",
+                                                       "--before", before), "returned non-zero")
+
+    def test_BEFORE_P2_busy_pool_reports_two_fresh_checkouts(self):
+        self.busy_pool()
+        self.agent_extra('''
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+assert before != cwd
+(before / "tracked").write_text("writable fresh baseline")
+record["before"] = str(before)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        record = self.verifier("codex", "--before", "HEAD")
+        self.assertEqual(self.out.read_text().count("pool busy or slots unusable; fresh session worktree"), 2)
+        self.assertFalse(Path(record["before"]).exists())
+        self.assert_session_cleaned(record)
+
+    def test_BEFORE_P2_cleaning_applies_to_each_side(self):
+        self.agent_extra('''
+record["before"] = re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        baseline = self.git("rev-parse", "HEAD")
+        record = self.verifier("codex", "--before", baseline)
+        slots = [Path(record["cwd"]), Path(record["before"])]
+        self.hold_other_pool_slots(*slots)
+        for reason in ("--clean-checkout", "20 uses", "lockfile or toolchain changed",
+                       "untracked source file was previously tracked"):
+            with self.subTest(reason=reason):
+                extra = []
+                for slot in slots:
+                    (slot / "ignored").write_text("stale output")
+                    if reason == "20 uses":
+                        metadata = slot.with_suffix(".json")
+                        state = json.loads(metadata.read_text())
+                        state["uses"] = 20
+                        metadata.write_text(json.dumps(state))
+                if reason == "--clean-checkout":
+                    extra = ["--clean-checkout"]
+                elif reason == "lockfile or toolchain changed":
+                    (self.repo / "Cargo.lock").write_text("changed lockfile")
+                    self.git("add", ".")
+                    self.git("commit", "-qm", "build input change")
+                    baseline = self.git("rev-parse", "HEAD")
+                elif reason == "untracked source file was previously tracked":
+                    (self.repo / "forgotten").write_text("needed source")
+                    self.git("add", ".")
+                    self.git("commit", "-qm", "tracked dependency")
+                    self.verifier("codex", "--before", "HEAD")
+                    self.git("rm", "--cached", "forgotten")
+                    self.git("commit", "-qm", "forgotten dependency")
+                    baseline = self.git("rev-parse", "HEAD")
+                record = self.verifier("codex", "--before", baseline, *extra)
+                self.assertEqual({record["cwd"], record["before"]}, set(map(str, slots)))
+                self.assertEqual(self.out.read_text().count("deep clean: " + reason), 2)
+                for slot in slots:
+                    self.assertFalse((slot / "ignored").exists())
 
     def test_POOL_R2_five_slots_then_fallback_and_before_never_waits(self):
         self.env["SLEEP"] = "1"
@@ -2402,14 +2756,22 @@ def count_adds(command, *args, **kwargs):
 subprocess.check_output = count_adds
 ''')
         self.pool_probe()
-        for _ in range(2):
-            record = self.verifier()
-            self.assertEqual(record["head"], self.git("rev-parse", "HEAD"))
-            self.assertEqual(record["status"], "")
-            self.assertFalse(self.pool_root().exists())
-            self.assertIn("reftable; fresh session worktree", self.out.read_text())
-            self.assert_session_cleaned(record)
-        self.assertEqual(Path(str(self.record) + ".adds").read_text(), "add\nadd\n")
+        for before in ("none", "HEAD"):
+            for _ in range(2):
+                record = self.verifier("codex", "--before", before)
+                self.assertEqual(record["head"], self.git("rev-parse", "HEAD"))
+                self.assertEqual(record["status"], "")
+                self.assertFalse(self.pool_root().exists())
+                self.assertEqual(self.out.read_text().count("reftable; fresh session worktree"),
+                                 1 if before == "none" else 2)
+                if before != "none":
+                    line = next(line for line in self.out.read_text().splitlines()
+                                if line.startswith("Before checkout:"))
+                    path = Path(line.removeprefix("Before checkout: ").split(" (", 1)[0])
+                    self.assertNotEqual(str(path), record["cwd"])
+                    self.assertFalse(path.exists())
+                self.assert_session_cleaned(record)
+        self.assertEqual(Path(str(self.record) + ".adds").read_text(), "add\n" * 6)
 
     def test_POOL_R12_source_permissions_and_hardlinks_do_not_refuse(self):
         # This committed CRLF blob looks modified to diff under LF attributes,
@@ -2496,7 +2858,7 @@ subprocess.check_output = check_index
         self.assertNotIn("create before or known-good checkouts", record["stdin"])
         self.assertIn("create known-good checkouts", record["stdin"])
         record = self.verifier()
-        self.assertIn("create before or known-good checkouts", record["stdin"])
+        self.assertIn("Put known-good and other temporary checkouts there too", record["stdin"])
 
     def test_POOL_R10_10_unusable_slots_are_named_in_fallback(self):
         self.inject_launcher('''
@@ -4149,10 +4511,13 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                         metadata = [next(line for line in header.splitlines() if line.startswith(prefix))
                                     for prefix in ("Snapshot commit:", "Checkout:", "Untracked files left out:")]
                         expected += "\n" + "\n".join(metadata) + "\n"
+                        expected += "\nBefore checkout: none (--before none)\n"
                         evidence = Path(record["tmpdir"]).parent / "evidence"
                         expected += (f"\nEvidence folder: {evidence}; "
                                      "only this folder is kept; nothing else in the session folder is kept.\n")
-                    if role in ("builder", "verifier"):
+                    if role == "verifier":
+                        expected += f"\nTemporary folder: {record['tmpdir']}; removed when the session ends.\n"
+                    elif role == "builder":
                         expected += (f"\nTemporary folder: {record['tmpdir']}; removed when the session ends; "
                                      "create before or known-good checkouts as shared clones inside it "
                                      "(git clone --quiet --shared --no-checkout . \"$TMPDIR/before\").\n")
@@ -4568,9 +4933,10 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                     self.assertTrue(Path(folder).is_absolute())
                     self.assertEqual(Path(folder).name, "tmp")
                     self.assertIn("removed when the session ends", instructions)
-                    self.assertIn("shared clones", instructions)
-                    self.assertIn("before", instructions)
-                    self.assertIn("known-good", instructions)
+                    clone_instructions = instructions if role == "builder" else prompt
+                    self.assertIn("shared clones", clone_instructions)
+                    self.assertIn("before", clone_instructions)
+                    self.assertIn("known-good", clone_instructions)
                     self.assertIn("$TMPDIR", (self.method / "roles/builder.md").read_text())
                     for document in ("roles/builder.md", "guides/verification.md"):
                         self.assertIn('git clone --quiet --shared --no-checkout . "$TMPDIR/before"',

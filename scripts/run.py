@@ -902,13 +902,14 @@ def checkout_changes(repo, previous, commit, force_clean, untracked=None):
     return "; ".join(reasons), distance
 
 
-def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()):
+def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=(), before_commit="",
+                   reserved=None):
     # Reftable keeps per-worktree refs in admin/reftable, which the pool's
     # admin-state reset cannot discard. Bypass it before creating any slots.
     if git(repo, "config", "--default=files", "--get", "extensions.refStorage") == "reftable":
         git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
         check_checkout(fresh, commit)
-        return fresh, "reftable; fresh session worktree"
+        return fresh, "reftable; fresh session worktree", None
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     main = os.fsdecode(git(repo, "worktree", "list", "--porcelain", "-z",
                            text=False).split(b"\0", 1)[0]).removeprefix("worktree ")
@@ -916,10 +917,20 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
     pool.mkdir(parents=True, exist_ok=True)
     failures = []
+    reservation = None
+    excluded = set()
 
     def candidates():
+        nonlocal reservation
+        if reserved is not None:
+            number, paths, lock = reserved
+            yield number, paths, lock
+            excluded.add(number)
         ranked = []
+        before_ranked = []
         for number in range(1, POOL_SLOTS + 1):
+            if number in excluded:
+                continue
             slot = pool / f"slot-{number}"
             metadata = slot.with_suffix(".json")
             temporary = metadata.with_suffix(".json.tmp")
@@ -933,20 +944,56 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                     previous = checkout_metadata(metadata)
                     reason, distance = checkout_changes(repo, previous, commit, force_clean)
                     rank = 2 if reason else 0
+                    if before_commit:
+                        before_reason, before_distance = checkout_changes(repo, previous, before_commit, force_clean)
+                        before_ranked.append((2 if before_reason else 0, before_distance, number))
                 except (OSError, ValueError, KeyError, TypeError):
                     rank, distance = 3, 0
-            if rank == 0 and distance == 0:
+            if before_commit and rank in (1, 3):
+                before_ranked.append((rank, 0, number))
+            if rank == 0 and distance == 0 and not before_commit:
                 # No later slot can improve this preference. Resume ranking
                 # only if this exact match is busy or unusable.
-                yield number, paths
+                yield number, paths, None
             else:
                 ranked.append((rank, distance, number, paths))
+        # Minimise the combined rank, then the total distance. Equal totals
+        # retain the ordinary candidate-first ranking. Lease both slots without
+        # waiting, so the before preference survives the candidate's reset.
+        pairs = sorted((
+            (rank + before_rank, distance + before_distance,
+             (rank, distance, number), (before_rank, before_distance, before_number), paths)
+            for rank, distance, number, paths in ranked
+            for before_rank, before_distance, before_number in before_ranked
+            if number != before_number))
+        for _, _, (_, _, number), (_, _, before_number), paths in pairs:
+            if number in excluded or before_number in excluded:
+                continue
+            lock = try_lock(number)
+            if lock is None:
+                continue
+            before_lock = try_lock(before_number)
+            if before_lock is None:
+                lock.close()
+                continue
+            before_slot = pool / f"slot-{before_number}"
+            before_metadata = before_slot.with_suffix(".json")
+            reservation = (before_number, (before_slot, before_metadata,
+                                           before_metadata.with_suffix(".json.tmp")), before_lock)
+            leases.append(before_lock)
+            yield number, paths, lock
+            # A failed candidate reset must release its paired before slot
+            # before trying another assignment. Success keeps the reservation.
+            leases.remove(before_lock)
+            before_lock.close()
+            reservation = None
+            excluded.add(number)
         for _, _, number, paths in sorted(ranked):
-            yield number, paths
+            if number not in excluded:
+                yield number, paths, None
 
-    # This is only a preference: metadata may change before the non-blocking
-    # lease succeeds. Re-read it and recompute cleaning under that lease.
-    for number, (slot, metadata, temporary) in candidates():
+    def try_lock(number):
+        slot = pool / f"slot-{number}"
         lockpath = pool / f"slot-{number}.lock"
         lock = None
         try:
@@ -965,15 +1012,25 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
         except BlockingIOError:
             if lock is not None:
                 lock.close()
-            continue
+            return None
         except (OSError, ValueError) as error:
             if lock is not None:
                 lock.close()
+            excluded.add(number)
             failure = f"pool slot {slot} unusable: {error}"
             diagnostic(failure)
             failures.append(failure)
+            return None
+        return lock
+
+    # This is only a preference: metadata or availability may change before the
+    # non-blocking lease succeeds. Recompute cleaning under that lease.
+    for number, (slot, metadata, temporary), lock in candidates():
+        lock = lock if lock is not None else try_lock(number)
+        if lock is None:
             continue
-        leases.append(lock)
+        if lock not in leases:
+            leases.append(lock)
         new_slot = not any(os.path.lexists(path) for path in (slot, metadata, temporary))
         reasons = ["new slot"] if new_slot else []
         try:
@@ -1030,10 +1087,10 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
             "commits": [commit] if reason else previous["commits"] + [commit]}))
         temporary.replace(metadata)
         return slot, "; ".join([*failures, f"pool {slot}",
-                               f"deep clean: {reason}" if reason else "warm reset"])
+                               f"deep clean: {reason}" if reason else "warm reset"]), reservation
     git(repo, *CHECKOUT_CONFIG, "worktree", "add", "--detach", str(fresh), commit)
     check_checkout(fresh, commit)
-    return fresh, "; ".join([*failures, "pool busy or slots unusable; fresh session worktree"])
+    return fresh, "; ".join([*failures, "pool busy or slots unusable; fresh session worktree"]), None
 
 
 def main():
@@ -1049,7 +1106,7 @@ def main():
     parser.add_argument("--private", default=DEFAULT_PRIVATE)
     parser.add_argument("--full-checkout", action="store_true",
                         help="include all paths even when a review leave-out list is configured")
-    parser.add_argument("--before", help="lease a second verifier checkout at this commit")
+    parser.add_argument("--before", help="required for verifiers: baseline commit, or none for no before checkout")
     parser.add_argument("--clean-checkout", action="store_true",
                         help="deep-clean verifier checkouts, including ignored build output")
     parser.add_argument("--timeout", type=float)
@@ -1161,7 +1218,7 @@ def main():
 
 def launch(parser, args, result):
     global CLEANUP_FAILURES
-    if (args.before or args.clean_checkout) and args.role != "verifier":
+    if (args.before is not None or args.clean_checkout) and args.role != "verifier":
         parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
         parser.error("--network is allowed for only builder and verifier roles")
@@ -1180,6 +1237,8 @@ def launch(parser, args, result):
         parser.error("same-family review requires --same-family-reason")
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.role == "verifier" and args.before is None:
+        parser.error("verifier requires --before <commit> or --before none")
     brief = args.brief.expanduser().read_text()
     private = Path(args.private).expanduser().resolve()
     repo, out = args.repo.expanduser().resolve(), result.out
@@ -1234,7 +1293,7 @@ def launch(parser, args, result):
                              + ", ".join(os.fsdecode(path) for path in sorted(dirty)))
         untracked = [os.fsdecode(path) for path in git(
             repo, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", text=False).split(b"\0") if path and not result.artifact(repo / os.fsdecode(path))]
-        if args.before:
+        if args.before != "none":
             before_commit = git(repo, "rev-parse", "--verify", args.before + "^{commit}")
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     if not cache.is_absolute():
@@ -1325,16 +1384,21 @@ def launch(parser, args, result):
             if args.role == "verifier":
                 snapshot = candidate
                 update_header()
-                work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout, untracked)
+                work, note, reserved = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout,
+                                                      untracked, before_commit)
                 checkout_note = "Checkout: " + note
                 update_header()
                 prompt += f"\nSnapshot commit: {snapshot}\n{checkout_note}\n{untracked_note}\n"
                 if before_commit:
-                    before, note = lease_checkout(repo, cache, before_commit, temp / "before", leases,
-                                                  args.clean_checkout, untracked)
+                    before, note, _ = lease_checkout(repo, cache, before_commit, temp / "before", leases,
+                                                     args.clean_checkout, untracked, reserved=reserved)
                     before_note = f"Before checkout: {before} ({before_commit}); {note}"
                     update_header()
                     prompt += "\n" + before_note + "\nUse this writable checkout for the before state.\n"
+                else:
+                    before_note = "Before checkout: none (--before none)"
+                    update_header()
+                    prompt += "\n" + before_note + "\n"
                 cwd = work
             elif review:
                 env = dict(os.environ, GIT_INDEX_FILE=str(temp / "index"))
@@ -1437,11 +1501,14 @@ def launch(parser, args, result):
                 path.mkdir(parents=True, exist_ok=True)
             writable = args.role in ("builder", "verifier")
             if writable:
-                versions = "known-good" if before else "before or known-good"
-                extra = "known-good" if before else "before"
-                prompt += (f"\nTemporary folder: {temporary}; removed when the session ends; "
-                           f"create {versions} checkouts as shared clones inside it "
-                           f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
+                prompt += f"\nTemporary folder: {temporary}; removed when the session ends"
+                if args.role == "verifier" and not before:
+                    prompt += ".\n"
+                else:
+                    versions = "known-good" if before else "before or known-good"
+                    extra = "known-good" if before else "before"
+                    prompt += (f"; create {versions} checkouts as shared clones inside it "
+                               f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
             if args.family == "codex":
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
                 command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}",
