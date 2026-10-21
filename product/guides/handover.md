@@ -14,14 +14,24 @@ receives. Put nothing else in.
 
 ## Run reviews from the other family
 
-Verifiers, challengers and reviewers run in their own session, on their own checkout of the exact
-candidate, from the other model family than the author of what they check. One way to start these
-checking sessions is the optional launcher `{{METHOD}}/run.py`: it snapshots the working tree,
-uncommitted changes and untracked files up to 5 MB included, without moving any branch, gives the
-reviewer a worktree of that snapshot, and saves the answer. Never relay a
-review through yourself or summarise it before reading it in full.
+Verifiers, challengers and reviewers run in their own session, from the other model family than
+the author of what they check. Commit the candidate before sending a verifier: the launcher
+`{{METHOD}}/run.py` refuses tracked changes, leases a clean detached checkout at the committed
+HEAD captured at startup, and leaves untracked files out, naming them in the answer's header.
+A forgotten file must fail. Never relay a review through yourself or summarise it before reading
+it in full.
 
-`python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md`
+`python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
+
+`--before` leases a second writable checkout for the baseline. Without it, the verifier uses a
+shared clone inside $TMPDIR. Pool slots retain ignored build output; retry with `--clean-checkout`
+after an environment-looking failure, keeping both results. The pool has three slots per
+repository; a busy pool falls back to a temporary session worktree without waiting.
+
+Challengers and reviewers keep snapshots of uncommitted changes and untracked files up to 5 MB,
+without moving a branch. Codex reads code through `git show <snapshot>:<path>`,
+`git grep <pattern> <snapshot>` and `git diff`; only root AGENTS.md/CLAUDE.md are checked out.
+Claude keeps its checkout and optional leave-out list, with `--full-checkout` when needed.
 
 For Codex builders and verifiers, add `--network` when the assignment needs local servers, child
 processes from Node or network access; otherwise the user's network configuration applies. Use
@@ -47,8 +57,8 @@ For a committed candidate, you can instead create a detached worktree at the exa
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family
 there, give it the role contract and the brief (and `guides/verification.md` for a verifier), and
 save its full answer unedited in the task folder's `results/`. Give a verifier an evidence folder
-and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked
-candidates go through `run.py` so the checking session receives the exact snapshot.
+and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
+challenger or reviewer snapshots.
 
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the
