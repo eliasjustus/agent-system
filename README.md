@@ -156,12 +156,16 @@ Files ignored only through the user's global `core.excludesFile` are removed eve
 projects should ignore build folders in their own `.gitignore` to keep them warm. A default ACL
 on a tracked directory is not reset; this is a known limit of checkout reuse.
 
-Use verifier-only `--before <commit>` to lease a second writable slot at a baseline commit; its
-path is in the prompt and the `Before checkout:` header. Without it, use one shared clone inside
-$TMPDIR for each needed extra version and reuse it between cases. Candidate and before leases
+Verifiers require `--before <commit>` to lease a second writable slot at a baseline commit, or
+`--before none` to start without a before checkout. Its path and resolved commit (or explicit
+absence) are in the prompt and the `Before checkout:` header. If a before state is needed after
+all with `--before none`, make an ad-hoc shared clone inside $TMPDIR and reuse it between cases.
+Build each source tree only into its own build folder. Never point one tree's build output
+(`CARGO_TARGET_DIR`, Gradle build directories, `node_modules` links) at another tree. Candidate and before leases
 use the same pool. Slots are ranked without locking: those needing no deep clean first, then
 new slots before existing slots needing a deep clean. Within each group, the fewest changed
-paths from the last commit to the requested commit wins, then the lowest slot number. Slots
+paths from the last commit to the requested commit wins, then the lowest slot number. When
+candidate slots rank equally, leave the best baseline slot for the before lease if possible. Slots
 without usable metadata come last. Each lease tries that order without waiting,
 skipping busy or unusable slots, and recomputes cleaning after taking its lock.
 When all slots are busy, the launcher creates a full temporary checkout in a

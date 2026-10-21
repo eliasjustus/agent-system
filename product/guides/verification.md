@@ -46,12 +46,15 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
 - Your working directory is your leased copy of the committed candidate. With `--before <commit>`,
   use the writable **Before checkout** named in the prompt and header for the baseline. The launcher
   resets and cleans it like the candidate; do not delete either pool checkout.
-  Without `--before`, build the **before** state from the baseline commit in a shared clone inside $TMPDIR
+  Verifiers require `--before <commit>` or `--before none`. With `--before none`, there is no before
+  checkout; if you need one after all, make an ad-hoc shared clone at the baseline commit inside $TMPDIR
   (`git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`).
   Put known-good and other temporary checkouts there too, using shared clones that write nothing
   into the source repository. Never stash, revert or edit the candidate's files.
   Make each extra checkout once and reuse it between cases, resetting it between cases; never
   create a checkout per case.
+- Build each source tree only into its own build folder. Never point one tree's build output
+  (`CARGO_TARGET_DIR`, Gradle build directories, `node_modules` links) at another tree.
 - Each check of new or repaired behavior must **fail on the before state for the reason under
   test**, then pass on the candidate. Keep the first failing output.
 - Where a known-good version exists, the check also passes on it.

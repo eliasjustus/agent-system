@@ -23,8 +23,10 @@ it in full.
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
-`--before` leases a second writable checkout for the baseline. Without it, the verifier uses a
-shared clone inside $TMPDIR. Pool slots retain ignored build output; retry with `--clean-checkout`
+Verifiers require `--before <commit>` to lease a second writable checkout for the baseline, or
+`--before none` to start without one. If a before state is needed after all, the verifier makes
+an ad-hoc shared clone inside $TMPDIR and builds it into its own build folder.
+Pool slots retain ignored build output; retry with `--clean-checkout`
 after an environment-looking failure, keeping both results. The pool has five slots per
 repository; a busy pool falls back to a temporary session worktree without waiting.
 

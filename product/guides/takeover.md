@@ -18,7 +18,7 @@ is running, what is next and what would let it resume. Create temporary checkout
 that write nothing into the source repository, inside your session's temporary folder
 ($TMPDIR in sessions the launcher starts). Remove them before stopping, after keeping anything
 unique, and stop the processes you started. Leave launcher pool slots registered and in place;
-`--before` is a leased pool slot too. Commit the candidate before starting a verifier and use
+`--before` is usually a leased pool slot too. Commit the candidate before starting a verifier and use
 `--clean-checkout` after an environment-looking failure. Treat interrupted checks as not run.
 
 ## Sessions
