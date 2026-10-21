@@ -27,7 +27,7 @@ check wrong. Where feasible, the corrected check still rejects the original defe
 Send all open findings together, grouped into one repair plan per cause, not per symptom. When a
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios before the repair, and have the builder exercise them before handing back,
-rather than letting verification find them one at a time. When a second case of the same failure
+rather than letting verification find them one at a time. When a second case with the same cause
 appears, first write down the expected result for each case that shares the cause (not every
 state of the system), including what must keep working, as a table or an executable reference the
 verifier may challenge; then repair. After a
