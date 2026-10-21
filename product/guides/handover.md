@@ -61,6 +61,7 @@ and keep its evidence too. Remove the worktree when checking is finished. Uncomm
 challenger or reviewer snapshots.
 
 Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
+While a launcher runs, `--out` and its siblings (`.log`, `-evidence`, `.lock`, `.attempt-N`) belong to it.
 Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
 (for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
 refused (and then the file says so) or the destination cannot be claimed (an earlier result may

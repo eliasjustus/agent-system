@@ -282,9 +282,15 @@ class ResultDestination:
                     os.ftruncate(stream.fileno(), 0)
                     stream.write(contents)
             except Exception as report_error:
-                # Remove a stale running marker if neither write succeeds.
+                # Remove only our stale running marker if neither write succeeds.
                 try:
-                    self.out.unlink(missing_ok=True)
+                    if (self.written is not None
+                            and os.path.samestat(self.out.lstat(), self.written)):
+                        self.out.unlink(missing_ok=True)
+                    else:
+                        diagnostic(f"Result path {self.out} holds a file the launcher does not own")
+                except FileNotFoundError:
+                    pass
                 except Exception as remove_error:
                     diagnostic(f"Cannot remove stale result {self.out}: {remove_error}")
                 diagnostic(f"Cannot record result in {self.out}: {report_error}")

@@ -6554,7 +6554,9 @@ os.replace = replace
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(secret.read_text(), "keep private bytes")
         self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
-        self.assertFalse(self.out.exists())
+        self.assertTrue(self.out.is_symlink())
+        self.assertEqual(self.out.readlink(), secret)
+        self.assertIn("holds a file the launcher does not own", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_RESULTS_R5_log_tail_does_not_read_agent_symlink(self):
@@ -6609,7 +6611,11 @@ os.replace = replace
                 expected = (b"Result: running\n" if replacement == "extra-link"
                             else b"keep private bytes")
                 self.assertIn(expected, observed.read_bytes())
-                self.assertFalse(self.out.exists())
+                if replacement == "extra-link":
+                    self.assertFalse(self.out.exists())
+                else:
+                    self.assertEqual(self.out.read_bytes(), b"keep private bytes")
+                    self.assertIn("holds a file the launcher does not own", result.stderr)
                 self.assertIn("result file changed:", result.stderr)
 
     def test_RESULTS_R7_log_tail_does_not_read_agent_hardlink(self):
