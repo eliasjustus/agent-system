@@ -60,9 +60,16 @@ save its full answer unedited in the task folder's `results/`. Give a verifier a
 and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
 challenger or reviewer snapshots.
 
-Earlier results, logs and evidence are kept as `.attempt-N` siblings; `Result: running` means the
-launcher is running or was killed. `Result: launch refused` with exit 2 means no agent started;
-exit 3 means the answer was saved but cleanup failed (see `Cleanup:` in the header).
+Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
+(for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
+refused (and then the file says so) or another launcher holds the same `--out` or the destination
+is unwritable (the file is unchanged; stderr says which); exit 3 means a saved answer with exit 0
+and failed cleanup. The header's `Exit code:` keeps the agent's code, including when cleanup fails.
+`Cleanup: pending` means the answer is saved and cleanup is still running; its final status is
+`Cleanup: ok` or `Cleanup: failed: <what>; …`. A non-zero agent code survives cleanup failures.
+`Result: running` means the launcher is running or was killed. Check liveness with
+`flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` is refused
+because it would coincide with the sibling log.
 
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the

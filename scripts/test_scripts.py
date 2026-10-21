@@ -174,6 +174,7 @@ class ScriptsTest(unittest.TestCase):
         (site / "sitecustomize.py").write_text(
             f"import sys\nif sys.argv[0] == {str(ROOT / 'scripts/run.py')!r}:\n"
             + textwrap.indent(textwrap.dedent(source), "    "))
+        shutil.rmtree(site / "__pycache__", ignore_errors=True)
         self.env["PYTHONPATH"] = str(site)
 
     def start_launcher(self, *extra, role="verifier", out=None, record=None):
@@ -1732,8 +1733,9 @@ def broken_status(command, *args, **kwargs):
 subprocess.check_output = broken_status
 ''')
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("Session failed: checkout is not clean", result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("checkout is not clean", result.stderr)
+        self.assertIn("Result: launch refused\n", self.out.read_text())
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse(self.record.exists())
         self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
@@ -3426,7 +3428,7 @@ def check_output(args, *positional, **kwargs):
 subprocess.check_output = check_output
 """)
                 result = self.launch("reviewer", "codex", "--author-family", "claude")
-                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("Requested environment: restricted; discovery did not run\n",
                               self.out.read_text())
                 self.assertFalse(Path(str(self.record) + ".discovery").exists())
@@ -3806,8 +3808,11 @@ subprocess.check_output = fail
                     result = self.launch("reviewer", "claude", "--author-family", "codex")
                     # The baseline never uses these setup commands, so this is also a
                     # preservation check of cleanup on whatever path it exercises.
-                    expected = (1 if outcome == "failure" else 143) if marker.exists() else 0
+                    expected = (2 if outcome == "failure" else 143) if marker.exists() else 0
                     self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected == 2:
+                        self.assertIn("Result: launch refused\n", self.out.read_text())
+                        self.assertIn("returned non-zero exit status 23", self.out.read_text())
                     if operation == "worktree":
                         self.assertTrue(marker.exists())
                     self.assertEqual(self.non_pool_worktrees(), registrations)
@@ -4251,9 +4256,10 @@ if "model_reasoning_effort=unsupported-test-value" in args:
         hook.write_text("#!/bin/sh\nexit 1\n")
         hook.chmod(0o755)
         result = self.launch("reviewer", "claude", "--author-family", "codex")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("Session failed:", result.stderr)
-        self.assertIn("Exit code: 1", self.out.read_text())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("returned non-zero exit status 1", result.stderr)
+        self.assertIn("Result: launch refused\n", self.out.read_text())
+        self.assertIn("Exit code: 2", self.out.read_text())
         self.assertFalse(self.record.exists())
         self.assertEqual(self.non_pool_worktrees().count("worktree "), 1)
         registrations = self.repo / ".git/worktrees"
@@ -4731,7 +4737,7 @@ pathlib.Path(os.environ["RECORD"] + ".ready").touch()
             f"os.execv({real_git!r}, [{real_git!r}, *args])\n")
         (self.bin / "git").chmod(0o755)
         result = self.launch()
-        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("Cleanup failed: session worktrees", result.stderr)
         self.assertIn("forced listing failure", result.stderr)
         self.assertEqual(state.read_text(), "True")
@@ -4781,7 +4787,7 @@ for name in (b"session-present-\xff", b"session-missing-\xff"):
                 with self.subTest(fallback=bool(fallback), status=status):
                     self.env.update(FORCE_FALLBACK=fallback, SESSION_EXIT=str(status))
                     result = self.launch()
-                    self.assertEqual(result.returncode, 3 if fallback else status, result.stderr)
+                    self.assertEqual(result.returncode, 3 if fallback and status == 0 else status, result.stderr)
                     self.assertNotIn("UnicodeDecodeError", result.stderr)
                     if fallback:
                         self.assertIn("forced missing checkout removal failure", result.stderr)
@@ -5188,11 +5194,12 @@ shutil.copytree = fail_evidence
                     self.env.pop("SLEEP", None)
                 result = self.launch("verifier", "codex", "--author-family", "claude",
                                      *(("--timeout", "0.4") if code == 124 else ()))
-                self.assertEqual(result.returncode, code, result.stderr)
-                self.assertIn(f"Evidence failed: {kept}: forced evidence {operation} failure",
+                self.assertEqual(result.returncode, code or 3, result.stderr)
+                self.assertIn(f"Cleanup failed: evidence copy {kept}: forced evidence {operation} failure",
                               result.stderr)
                 self.assertNotIn("Launcher failed:", result.stderr)
                 self.assertIn(f"Exit code: {code}\n", self.out.read_text())
+                self.assertIn("Cleanup: failed: evidence copy", self.out.read_text())
                 self.assertTrue(self.out.read_text().endswith("answer\n  unchanged\n"))
                 session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
                 self.assertFalse(session.exists())
@@ -5275,11 +5282,12 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
     def test_L8_scope_cleanup_failure_keeps_status_answer_and_evidence(self):
         self.env.update(STOP_FAIL="1", SESSION_EXIT="7", EVIDENCE="1")
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("Cleanup failed:", result.stderr)
         self.assertIn("agent-verifier-", result.stderr)
         self.assertIn("scope stop refused", result.stderr)
         self.assertIn("Cleanup: failed:", self.out.read_text())
+        self.assertIn("Exit code: 7\n", self.out.read_text())
         self.assertTrue(self.out.read_text().endswith("answer\n  unchanged\n"))
         self.assertTrue((self.out.parent / "answer-evidence/proof.txt").exists())
 
@@ -5427,7 +5435,7 @@ for i in range(35):
             f"os.execv({real_git!r}, [{real_git!r}, *args])\n")
         (self.bin / "git").chmod(0o755)
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("Cleanup failed: worktree remove", result.stderr)
         record = json.loads(self.record.read_text())
         self.assertIn(record["cwd"], result.stderr)
@@ -5458,7 +5466,7 @@ for i in range(35):
             "tempfile.TemporaryDirectory.cleanup = fail\n")
         self.env.update(PYTHONPATH=str(site), SESSION_EXIT="7", EVIDENCE="1")
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("Cleanup failed: worktree remove", result.stderr)
         self.assertIn("Cleanup failed: temporary folder", result.stderr)
         self.assertIn(str(Path(json.loads(self.record.read_text())["cwd"])), result.stderr)
@@ -5575,18 +5583,6 @@ pathlib.Path.mkdir = mkdir
                     self.assertEqual((archived_evidence / "link").readlink(), Path("absent"))
         self.assertEqual((self.out.parent / "answer.attempt-1.log").read_bytes(), b"reserved\x00\xff")
 
-    def test_RESULTS_S2_reserved_attempt_names_are_not_reused(self):
-        self.out.parent.mkdir()
-        self.out.write_bytes(b"previous answer\x00\xff")
-        reserved = self.out.parent / "answer.attempt-1.lock"
-        reserved.write_bytes(b"other attempt reservation")
-        result = self.launch("reviewer")
-        self.assert_launch_refused(result, "require --author-family")
-        self.assertEqual((self.out.parent / "answer.attempt-2.md").read_bytes(),
-                         b"previous answer\x00\xff")
-        self.assertEqual(reserved.read_bytes(), b"other attempt reservation")
-        self.assertFalse((self.out.parent / "answer.attempt-1.md").exists())
-
     def test_RESULTS_S3_simultaneous_launches_share_no_files(self):
         self.env.update(SLEEP="1", EVIDENCE="1", SESSION_STDERR="winner log")
         records = [self.base / f"concurrent-{i}.json" for i in range(2)]
@@ -5681,11 +5677,20 @@ os.replace = replace
                 process.communicate(timeout=10)
                 self.assertEqual(self.out.read_bytes(), contents)
                 if after:
-                    self.assertIn(b"Cleanup: ok\n", contents)
+                    self.assertIn(b"Cleanup: pending\n", contents)
                     self.assertTrue(contents.endswith(b"answer\n  unchanged\n"))
                 else:
                     self.assertIn(b"Result: running\n", contents)
                     self.assertNotIn(b"Exit code:", contents)
+                stale = list(self.out.parent.glob("answer.saving-*"))
+                self.assertEqual(bool(stale), not after)
+                unrelated = self.out.parent / "other.saving-keep"
+                unrelated.write_text("unrelated writer")
+                self.env.pop("PYTHONPATH")
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(list(self.out.parent.glob("answer.saving-*")), [])
+                self.assertEqual(unrelated.read_text(), "unrelated writer")
 
     def test_RESULTS_S6_unexpected_cleanup_and_lease_errors_continue(self):
         self.inject_launcher('''
@@ -5805,6 +5810,217 @@ subprocess.check_output = remove
                 self.assertTrue(fixture.isascii())
                 self.assertLessEqual(len(os.fsencode(fixture + "/home/.cache/am/12345678/tmp")), 62)
                 self.assertEqual(list(inherited.iterdir()), [])
+
+    def test_RESULTS_S1_unexpected_exceptions_before_agent_are_refused(self):
+        for stage in ("brief", "checkout", "spawn"):
+            with self.subTest(stage=stage):
+                self.inject_launcher(f'''
+import pathlib, subprocess
+original_read = pathlib.Path.read_text
+original_output = subprocess.check_output
+original_spawn = subprocess.Popen
+def read(self, *args, **kwargs):
+    if {stage!r} == "brief" and self == pathlib.Path({str(self.brief)!r}):
+        raise RuntimeError("unexpected brief failure")
+    return original_read(self, *args, **kwargs)
+def output(command, *args, **kwargs):
+    if {stage!r} == "checkout" and "worktree" in command and "add" in command:
+        raise RuntimeError("unexpected checkout failure")
+    return original_output(command, *args, **kwargs)
+def spawn(command, *args, **kwargs):
+    if {stage!r} == "spawn" and "--scope" in command:
+        raise RuntimeError("unexpected spawn failure")
+    return original_spawn(command, *args, **kwargs)
+pathlib.Path.read_text = read
+subprocess.check_output = output
+subprocess.Popen = spawn
+''')
+                self.assert_launch_refused(
+                    self.launch("reviewer", "codex", "--author-family", "claude"),
+                    f"unexpected {stage} failure")
+                self.assertNotIn("Cleanup: ok", self.out.read_text())
+
+    def test_RESULTS_S1_argument_errors_record_refusal(self):
+        for extra, reason in (
+                (("--unknown-option",), "unrecognized arguments"),
+                (("--timeout", "invalid"), "invalid float value"),
+                (("--role", "invalid"), "invalid choice")):
+            with self.subTest(extra=extra):
+                self.assert_launch_refused(self.launch("builder", "codex", *extra), reason)
+        self.assert_launch_refused(self.run_script("run.py", "--out", self.out),
+                                   "the following arguments are required")
+
+    def pause_result_stage(self, stage, marker, release):
+        self.inject_launcher(f'''
+import os, pathlib, shutil, subprocess, tempfile, time
+out = pathlib.Path({str(self.out)!r})
+def pause():
+    pathlib.Path({str(marker)!r}).touch()
+    while not pathlib.Path({str(release)!r}).exists():
+        time.sleep(0.01)
+original_replace = os.replace
+def replace(source, destination, *args, **kwargs):
+    contents = pathlib.Path(source).read_bytes() if ".saving-" in str(source) else b""
+    selected = destination == out and (
+        ({stage!r} == "claim" and b"Result: running\\n" in contents) or
+        ({stage!r} in ("save", "saved") and b"Cleanup: pending\\n" in contents) or
+        ({stage!r} in ("finish", "finished") and b"Cleanup: ok\\n" in contents))
+    if selected and {stage!r} in ("claim", "saved", "finished"):
+        result = original_replace(source, destination, *args, **kwargs)
+        pause()
+        return result
+    if selected:
+        pause()
+    return original_replace(source, destination, *args, **kwargs)
+os.replace = replace
+original_copy = shutil.copytree
+def copy(source, destination, *args, **kwargs):
+    if {stage!r} == "evidence" and pathlib.Path(destination) == out.with_name(out.stem + "-evidence"):
+        pause()
+    return original_copy(source, destination, *args, **kwargs)
+shutil.copytree = copy
+original_output = subprocess.check_output
+def output(command, *args, **kwargs):
+    if ({stage!r} == "worktrees" and "worktree" in command and "list" in command
+            and out.exists() and b"Cleanup: pending\\n" in out.read_bytes()):
+        pause()
+    return original_output(command, *args, **kwargs)
+subprocess.check_output = output
+original_fdopen = os.fdopen
+class Lease:
+    def __init__(self, stream, kind):
+        self.stream, self.kind = stream, kind
+    def fileno(self):
+        return self.stream.fileno()
+    def close(self):
+        if ({stage!r}, self.kind) in (("leases", "lease"), ("unlock", "result")):
+            pause()
+        self.stream.close()
+def fdopen(fd, *args, **kwargs):
+    stream = original_fdopen(fd, *args, **kwargs)
+    if args in (("a+b",), ("a",)):
+        return Lease(stream, "lease" if args == ("a+b",) else "result")
+    return stream
+os.fdopen = fdopen
+original_cleanup = tempfile.TemporaryDirectory.cleanup
+def cleanup(self):
+    if {stage!r} == "folder" and pathlib.Path(self.name).parent.name == "am":
+        pause()
+    return original_cleanup(self)
+tempfile.TemporaryDirectory.cleanup = cleanup
+''')
+        self.addCleanup(release.touch)
+
+    def test_RESULTS_early_signals_are_handled_during_claim(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                marker, release = self.base / f"claim-{sig}", self.base / f"release-claim-{sig}"
+                self.pause_result_stage("claim", marker, release)
+                process = self.start_launcher(role="builder")
+                self.wait_path(marker)
+                self.assertIn("Result: running\n", self.out.read_text())
+                process.send_signal(sig)
+                release.touch()
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 128 + sig, stderr)
+                self.assertIn("Result: interrupted\n", self.out.read_text())
+                self.assertFalse(self.record.exists())
+
+    def test_RESULTS_signal_at_final_write_preserves_answer(self):
+        self.env.update(SESSION_EXIT="7", EVIDENCE="1")
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+writes = 0
+def replace(source, destination, *args, **kwargs):
+    global writes
+    contents = pathlib.Path(source).read_bytes() if ".saving-" in str(source) else b""
+    if destination == pathlib.Path({str(self.out)!r}) and b"Exit code:" in contents:
+        writes += 1
+        if writes == 2:
+            assert pathlib.Path({str(self.out.parent / 'answer-evidence/proof.txt')!r}).read_text() == "proof"
+            os.kill(os.getpid(), {int(sig)})
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 128 + sig, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("Cleanup: ok\n", output)
+                self.assertIn("Exit code: 7\n", output)
+                self.assertTrue(output.endswith("answer\n  unchanged\n"))
+                self.assertNotIn("Result: interrupted", output)
+
+    def test_RESULTS_signals_during_save_and_cleanup_preserve_answer(self):
+        self.env.update(EVIDENCE="1", SESSION_EXIT="7")
+        for stage in ("save", "saved", "evidence", "worktrees", "leases", "folder", "finish", "finished", "unlock"):
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                with self.subTest(stage=stage, signal=sig):
+                    marker = self.base / f"{stage}-{sig}"
+                    release = self.base / f"release-{stage}-{sig}"
+                    self.pause_result_stage(stage, marker, release)
+                    process = self.start_launcher()
+                    self.wait_path(marker)
+                    contents = self.out.read_bytes()
+                    with self.out.with_suffix(".lock").open() as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if stage == "save":
+                        self.assertIn(b"Result: running\n", contents)
+                    else:
+                        cleanup = b"ok" if stage in ("finished", "unlock") else b"pending"
+                        self.assertIn(b"Cleanup: " + cleanup + b"\n", contents)
+                        self.assertIn(b"Exit code: 7\n", contents)
+                        self.assertTrue(contents.endswith(b"answer\n  unchanged\n"))
+                    if stage in ("worktrees", "leases", "folder", "finish", "finished", "unlock"):
+                        self.assertEqual((self.out.parent / "answer-evidence/proof.txt").read_text(), "proof")
+                    process.send_signal(sig)
+                    release.touch()
+                    _, stderr = process.communicate(timeout=10)
+                    if sig == signal.SIGKILL:
+                        self.assertEqual(process.returncode, -sig, stderr)
+                        self.assertEqual(self.out.read_bytes(), contents)
+                    else:
+                        self.assertEqual(process.returncode, 128 + sig, stderr)
+                        output = self.out.read_bytes()
+                        self.assertIn(b"Cleanup: ok\n", output)
+                        self.assertIn(b"Exit code: 7\n", output)
+                        self.assertTrue(output.endswith(b"answer\n  unchanged\n"))
+                        self.assertNotIn(b"Result: interrupted\n", output)
+                    with self.out.with_suffix(".lock").open() as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_RESULTS_archive_suffix_and_no_attempt_locks(self):
+        for suffix in (".txt", ""):
+            with self.subTest(suffix=suffix):
+                self.out = self.base / "results" / ("answer" + suffix)
+                self.out.parent.mkdir(exist_ok=True)
+                self.out.write_bytes(b"original answer")
+                reserved = self.out.with_name("answer.attempt-1" + suffix)
+                reserved.write_bytes(b"reserved")
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(reserved.read_bytes(), b"reserved")
+                self.assertEqual(self.out.with_name("answer.attempt-2" + suffix).read_bytes(), b"original answer")
+                self.assertEqual(list(self.out.parent.glob("*.attempt-*.lock")), [])
+                self.assertEqual(list(self.out.parent.glob("*.lock")), [self.out.with_suffix(".lock")])
+                for path in self.out.parent.iterdir():
+                    if path.is_file():
+                        path.unlink()
+
+    def test_RESULTS_log_output_alias_records_refusal_and_archives_previous(self):
+        self.out = self.base / "answer.log"
+        self.out.write_bytes(b"previous log answer")
+        result = self.launch()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--out must differ from its sibling .log path", result.stderr)
+        self.assertIn("Result: launch refused\n", self.out.read_text())
+        self.assertIn("--out must differ from its sibling .log path", self.out.read_text())
+        self.assertEqual((self.base / "answer.attempt-1.log").read_bytes(), b"previous log answer")
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.base.glob("answer.attempt-*.lock")), [])
 
     def test_RESULTS_P3_output_in_repository_is_not_snapshot_input(self):
         self.out = self.repo / "results/answer.md"
