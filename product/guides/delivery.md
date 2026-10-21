@@ -60,12 +60,13 @@ is recorded, do not commit and say so.
 
 Work that needed no question is signed off by its request once it is verified and delivered, or by
 the user's merge where the project leaves merging to them: record that, then finish as for accepted
-work. Where you asked, keep only that change waiting (a draft pull request, the
-question in the task record's `Open for user`) and carry on with the rest; ask it once, in the next
-conversation with the user, one question, never a list of pending items: do not repeat
-it on later turns, such as after a background result; ask again only when the user returns to it or its evidence or
-conditions change. A question several sessions share is asked by the session that owns it. Record the reply word for
-word in the task record with the date. Silence is not acceptance.
+work. Where you asked, keep only that change waiting (a draft pull request, the question in the
+task record's `Open for user`) and carry on with the rest. The question is asked once: in the
+delivery message, or in the next conversation with the user if they were not there, one question,
+never a list of pending items. Do not repeat it on later turns or in later conversations, such as
+after a background result; ask again only when the user returns to it or its evidence or
+conditions change. A question several sessions share is asked by the session that owns it. Record
+the reply word for word in the task record with the date. Silence is not acceptance.
 
 - **Accepted:** finish cleanup, add the delivered scenarios to the project's `checks.md` with how to
   run them, close the task record. Reply in at most three sentences.
