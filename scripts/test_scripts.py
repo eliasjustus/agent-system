@@ -5279,7 +5279,7 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
         self.assertFalse(self.record.exists())
         self.assertFalse((self.home / "refused").exists())
 
-    def test_L8_scope_cleanup_failure_keeps_status_answer_and_evidence(self):
+    def test_L8_scope_cleanup_failure_keeps_status_answer_and_session_evidence(self):
         self.env.update(STOP_FAIL="1", SESSION_EXIT="7", EVIDENCE="1")
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 7, result.stderr)
@@ -5289,7 +5289,11 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
         self.assertIn("Cleanup: failed:", self.out.read_text())
         self.assertIn("Exit code: 7\n", self.out.read_text())
         self.assertTrue(self.out.read_text().endswith("answer\n  unchanged\n"))
-        self.assertTrue((self.out.parent / "answer-evidence/proof.txt").exists())
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertEqual((session / "evidence/proof.txt").read_text(), "proof")
+        self.assertFalse((self.out.parent / "answer-evidence").exists())
+        self.assertIn(f"session folder kept at {session}; evidence left in {session / 'evidence'}",
+                      self.out.read_text())
 
     def assert_writable_refused(self, root):
         result = self.launch("builder", "codex", "--writable", root)
@@ -6045,7 +6049,6 @@ os.open = open
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
         self.assertEqual(secret.stat().st_nlink, int(Path(str(self.record) + ".links").read_text()))
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
         session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
         self.assertTrue(session.is_dir())
         self.assertIn(f"; answer left in {session}\n", self.out.read_text())
@@ -6187,7 +6190,6 @@ os.replace, os.open = replace, open
         self.assertIn("Result: failed: cannot save answer: forced result write failure; "
                       f"answer left in {session}\n", result.stderr)
         self.assertFalse(self.out.exists())
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
 
     def assert_unsaved_answer(self, result, reason):
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -6199,7 +6201,6 @@ os.replace, os.open = replace, open
         session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
         self.assertTrue(session.is_dir())
         self.assertIn(f"; answer left in {session}\n", output)
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
         return session
 
     def test_RESULTS_R3_replace_failure_keeps_binary_answer(self):
@@ -6407,7 +6408,6 @@ answer.symlink_to({str(secret)!r})
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
         self.assertEqual(secret.stat().st_nlink, 1)
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
         self.assertNotIn(secret.read_text(), self.out.read_text() + result.stderr)
         self.assertIn("Result: failed: cannot save answer:", self.out.read_text())
 
@@ -6573,6 +6573,102 @@ log.symlink_to({str(secret)!r})
         self.assertIn("Cleanup: failed: session log tail:", self.out.read_text())
         self.assertTrue(self.out.read_text().endswith("answer\n  unchanged\n"))
 
+    def test_RESULTS_R7_terminal_fallback_checks_links_and_identity_before_truncating(self):
+        for replacement in ("hardlink", "extra-link", "single-link"):
+            with self.subTest(replacement=replacement):
+                secret = self.base / (replacement + "-secret")
+                observed = self.base / (replacement + "-observed")
+                secret.write_bytes(b"keep private bytes")
+                self.inject_launcher(f'''
+import atexit, os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        secret = pathlib.Path({str(secret)!r})
+        if {replacement!r} == "extra-link":
+            secret.unlink()
+            os.link(destination, secret)
+        else:
+            destination.unlink()
+            if {replacement!r} == "hardlink":
+                os.link(secret, destination)
+            else:
+                secret.rename(destination)
+        stream = destination.open("rb")
+        def observe():
+            pathlib.Path({str(observed)!r}).write_bytes(stream.read())
+            stream.close()
+        atexit.register(observe)
+        raise OSError("forced terminal replacement failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+                result = self.launch("builder", "codex", "--before", "HEAD")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                expected = (b"Result: running\n" if replacement == "extra-link"
+                            else b"keep private bytes")
+                self.assertIn(expected, observed.read_bytes())
+                self.assertFalse(self.out.exists())
+                self.assertIn("result file changed:", result.stderr)
+
+    def test_RESULTS_R7_log_tail_does_not_read_agent_hardlink(self):
+        secret = self.base / "secret"
+        secret.write_text("private log contents")
+        self.env["SESSION_EXIT"] = "7"
+        self.agent_extra(f'''
+log = pathlib.Path({str(self.out.with_suffix('.log'))!r})
+log.unlink()
+os.link({str(secret)!r}, log)
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertNotIn(secret.read_text(), self.out.read_text() + result.stderr)
+        self.assertIn("Cleanup: failed: session log tail:", self.out.read_text())
+        self.assertEqual(secret.read_text(), "private log contents")
+
+    def test_RESULTS_R7_stop_exception_skips_evidence_copy_and_keeps_session(self):
+        self.env["EVIDENCE"] = "1"
+        copied = self.base / "copied"
+        self.inject_launcher(f'''
+import pathlib, shutil, subprocess
+original_run, original_copy = subprocess.run, shutil.copytree
+def run(command, *args, **kwargs):
+    if command[:3] == ["systemctl", "--user", "stop"]:
+        raise RuntimeError("forced stop exception")
+    return original_run(command, *args, **kwargs)
+def copy(source, destination, *args, **kwargs):
+    if pathlib.Path(destination) == pathlib.Path({str(self.out.with_name('answer-evidence'))!r}):
+        pathlib.Path({str(copied)!r}).touch()
+    return original_copy(source, destination, *args, **kwargs)
+subprocess.run, shutil.copytree = run, copy
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(copied.exists())
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertEqual((session / "evidence/proof.txt").read_text(), "proof")
+        output = self.out.read_text()
+        self.assertIn("Cleanup: failed:", output)
+        self.assertIn("forced stop exception", output)
+        self.assertIn(f"session folder kept at {session}; evidence left in {session / 'evidence'}", output)
+
+    def test_RESULTS_R7_stale_temp_names_require_eight_tempfile_characters(self):
+        self.out.parent.mkdir()
+        stale = self.out.parent / "answer.saving-a0_b1_c2"
+        stale.write_bytes(b"stale temporary result")
+        others = [self.out.parent / name for name in (
+            "answer.saving-notes", "answer.saving-abcdefg", "answer.saving-abcdefghi",
+            "answer.saving-ABCDEFGH", "answer.saving-abcd-efg")]
+        for path in others:
+            path.write_bytes(b"user file")
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        for path in others:
+            self.assertTrue(path.exists(), f"deleted user file: {path}")
+            self.assertEqual(path.read_bytes(), b"user file")
+
     def test_RESULTS_R5_failed_stderr_recovery_preserves_session_answer(self):
         self.agent_extra(f'''
 pathlib.Path({str(self.out.parent)!r}).chmod(0o555)
@@ -6658,7 +6754,7 @@ def open(self, mode="r", *args, **kwargs):
         raise RuntimeError("forced terminal fallback failure")
     return original_open(self, mode, *args, **kwargs)
 def os_open(path, flags, *args, **kwargs):
-    if {fallback_fails!r} and pathlib.Path(path) == pathlib.Path({str(self.out)!r}) and flags & os.O_TRUNC:
+    if {fallback_fails!r} and pathlib.Path(path) == pathlib.Path({str(self.out)!r}) and flags & os.O_WRONLY:
         raise RuntimeError("forced terminal fallback failure")
     return original_os_open(path, flags, *args, **kwargs)
 os.replace, pathlib.Path.open, os.open = replace, open, os_open
@@ -6731,7 +6827,6 @@ os.replace = replace
         self.assertEqual(self.out.read_text().count("End UTC:"), 1)
         session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
         self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
 
     def test_RESULTS_R3_interrupted_header_and_double_signal_are_complete(self):
         self.inject_launcher(f'''
@@ -6771,8 +6866,8 @@ pathlib.Path.read_text, os.replace = read, replace
             self.assertEqual(other.read_bytes(), b"another destination")
 
     def test_RESULTS_R3_reserved_destination_names_are_refused(self):
-        for name in ("answer.saving-x.md", "answer.attempt-1.md", "answer.unsaved-123.md",
-                     "answer.saving-x", "answer.attempt-1", "answer.unsaved-123"):
+        for name in ("answer.saving-x.md", "answer.attempt-1.md",
+                     "answer.saving-x", "answer.attempt-1"):
             with self.subTest(name=name):
                 self.out = self.base / name
                 self.out.write_bytes(b"keep existing answer")
@@ -6919,18 +7014,6 @@ pathlib.Path.read_text = read
         self.addCleanup(self.out.parent.chmod, 0o755)
         self.assert_launch_refused(self.launch(), "forced brief read failure")
         self.assertEqual(self.out.read_text().count("End UTC:"), 1)
-
-    def test_RESULTS_R3_unsaved_answer_is_excluded_from_review_snapshot(self):
-        self.out = self.repo / "results/answer.md"
-        self.out.parent.mkdir()
-        fallback = self.out.with_name("answer.unsaved-123.md")
-        fallback.write_bytes(b"previous unsaved answer")
-        result = self.launch("reviewer", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        snapshot = next(line.split(": ", 1)[1] for line in self.out.read_text().splitlines()
-                        if line.startswith("Snapshot commit:"))
-        self.assertEqual(self.git("ls-tree", "-r", snapshot, "--", "results"), "")
-        self.assertEqual(fallback.read_bytes(), b"previous unsaved answer")
 
     def test_RESULTS_R3_cleanup_status_write_failure_keeps_saved_agent_status(self):
         self.inject_launcher(f'''

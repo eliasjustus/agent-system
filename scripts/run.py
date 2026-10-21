@@ -169,6 +169,7 @@ class ResultDestination:
         self.saved = None
         self.code = None
         self.rendered = None
+        self.written = None
         self.pending_cleanup = False
         self.lock = None
         self.claimed = False
@@ -185,8 +186,8 @@ class ResultDestination:
             raise ValueError("--out must differ from its stem lock path")
         if self.out == self.out.with_suffix(".log"):
             raise ValueError("--out must differ from its sibling .log path")
-        if any(part in self.out.name for part in (".saving-", ".attempt-", ".unsaved-")):
-            raise ValueError("--out name must not contain .saving-, .attempt- or .unsaved-")
+        if any(part in self.out.name for part in (".saving-", ".attempt-")):
+            raise ValueError("--out name must not contain .saving- or .attempt-")
         if self.out.stem.endswith("-evidence"):
             raise ValueError("--out stem must not end in -evidence")
         if self.out.is_dir():
@@ -212,7 +213,7 @@ class ResultDestination:
                            f"Start UTC: {self.start}\n")
             # Under the stem lock, no writer of these temporary files is alive.
             for path in self.out.parent.iterdir():
-                if (re.fullmatch(re.escape(self.out.stem) + r"\.saving-[a-z0-9_]+", path.name)
+                if (re.fullmatch(re.escape(self.out.stem) + r"\.saving-[a-z0-9_]{8}", path.name)
                         and not path.is_dir()):
                     path.unlink()
             paths = (self.out, self.out.with_suffix(".log"),
@@ -247,7 +248,9 @@ class ResultDestination:
                 name = stream.name
                 os.fchmod(stream.fileno(), self.mode)
                 stream.write(contents)
+                written = os.fstat(stream.fileno())
             os.replace(name, self.out)
+            self.written = written
             name = None
         finally:
             if name is not None:
@@ -271,7 +274,12 @@ class ResultDestination:
         except Exception:
             try:
                 # Replacement may fail while the already claimed file is writable.
-                with open_result(self.out, os.O_WRONLY | os.O_TRUNC, "wb") as stream:
+                with open_result(self.out, os.O_WRONLY, "wb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if (info.st_nlink != 1 or self.written is None
+                            or not os.path.samestat(info, self.written)):
+                        raise OSError(f"result file changed: {self.out}")
+                    os.ftruncate(stream.fileno(), 0)
                     stream.write(contents)
             except Exception as report_error:
                 # Remove a stale running marker if neither write succeeds.
@@ -304,8 +312,7 @@ class ResultDestination:
         name = path.relative_to(self.out.parent).parts[0]
         return (name in (self.out.name, self.out.with_suffix(".log").name,
                          self.out.stem + "-evidence", self.out.stem + ".lock")
-                or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-",
-                                    self.out.stem + ".unsaved-")))
+                or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-")))
 
     def save(self, header, answer, code):
         if self.saved is not None:
@@ -1525,8 +1532,14 @@ def launch(parser, args, result):
             result.finalizing = True
             if CLEANUP_FAILURES is None:
                 CLEANUP_FAILURES = []
+            stop_failures = len(CLEANUP_FAILURES)
             if process is not None:
                 cleanup_step("stop session", stop_session, unit, process, guarded=bool(leases))
+            stop_failed = len(CLEANUP_FAILURES) != stop_failures
+            if stop_failed:
+                result.keep_session = True
+                cleanup_failed("session retention", f"stopping agent failed; session folder kept at {temp}"
+                               + (f"; evidence left in {source}" if args.role == "verifier" else ""))
             try:
                 if process is not None:
                     answer_bytes = None
@@ -1549,7 +1562,7 @@ def launch(parser, args, result):
                         result.save(header, answer_bytes, code)
                         evidence = out.with_name(out.stem + "-evidence")
                         try:
-                            if args.role == "verifier":
+                            if args.role == "verifier" and not stop_failed:
                                 if not stat.S_ISDIR(source.lstat().st_mode):
                                     raise OSError(f"non-directory evidence: {source}")
                                 if any(source.iterdir()):
@@ -1563,13 +1576,16 @@ def launch(parser, args, result):
                 if code:
                     try:
                         with open_result(out.with_suffix(".log"), os.O_RDONLY, "rb") as log:
+                            if os.fstat(log.fileno()).st_nlink != 1:
+                                raise OSError(f"hard-linked session log: {out.with_suffix('.log')}")
                             diagnostic(b"".join(deque(log, maxlen=20)), end="")
                     except FileNotFoundError:
                         pass
                     except Exception as error:
                         cleanup_failed("session log tail", error)
             finally:
-                cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
+                if not stop_failed:
+                    cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
     finally:
         if CLEANUP_FAILURES is None:
             CLEANUP_FAILURES = []
