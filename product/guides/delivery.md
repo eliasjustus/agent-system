@@ -62,7 +62,7 @@ Work that needed no question is signed off by its request once it is verified an
 the user's merge where the project leaves merging to them: record that, then finish as for accepted
 work. Where you asked, keep only that change waiting (a draft pull request, the question in the
 task record's `Open for user`) and carry on with the rest. The question is asked once: in the
-delivery message, or in the next conversation with the user if they were not there, one question,
+delivery message, or, if the user was not in the conversation then, in their next one, one question,
 never a list of pending items. Do not repeat it on later turns or in later conversations, such as
 after a background result; ask again only when the user returns to it or its evidence or
 conditions change. A question several sessions share is asked by the session that owns it. Record
