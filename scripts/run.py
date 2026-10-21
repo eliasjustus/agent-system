@@ -43,8 +43,9 @@ BUILD_INPUTS = {
 # subreaper keeps even double-forked children attached to it if the launcher dies.
 # Do not pass the descriptors to the agent: programs routinely close extra fds.
 LEASE_GUARD = r'''
-import ctypes, os, signal, subprocess, sys
+import ctypes, os, runpy, signal, subprocess, sys
 launcher = int(sys.argv[4])
+helpers = runpy.run_path(sys.argv[1])
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(36, 1, 0, 0, 0):
     raise OSError(ctypes.get_errno(), "cannot become lease subreaper")
@@ -61,7 +62,7 @@ def kill_children(pid):
     try:
         children = open(f"/proc/{pid}/task/{pid}/children").read().split()
     except OSError as error:
-        print(f"Warning: cannot list lease guard children for {pid}: {error}", file=sys.stderr, flush=True)
+        helpers["diagnostic"](f"Warning: cannot list lease guard children for {pid}: {error}")
         return
     for child in children:
         kill_children(int(child))
@@ -91,8 +92,7 @@ finally:
         except ChildProcessError:
             break
     if os.getppid() != launcher:
-        import pathlib, runpy, shutil
-        helpers = runpy.run_path(sys.argv[1])
+        import pathlib, shutil
         helpers["cleanup_worktrees"](pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
         shutil.rmtree(sys.argv[3], ignore_errors=True)
 sys.exit(code if code >= 0 else 128 - code)
@@ -120,10 +120,39 @@ def write_bytes():
 CLEANUP_FAILURES = None
 
 
+def diagnostic(message, *, end="\n"):
+    if sys.stderr is None:
+        return False
+    contents = message if isinstance(message, bytes) else str(message).encode("utf-8", errors="backslashreplace")
+    try:
+        remaining = memoryview(contents + end.encode())
+        while remaining:
+            remaining = remaining[os.write(sys.stderr.fileno(), remaining):]
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def header_value(value):
+    return "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
+                   for char in str(value))
+
+
+def open_result(path, flags, mode):
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"non-regular result file: {path}")
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def cleanup_failed(what, error):
     if CLEANUP_FAILURES is not None:
-        CLEANUP_FAILURES.append(f"{what}: {error}".replace("\n", "\\n"))
-    print(f"Cleanup failed: {what}: {error}", file=sys.stderr)
+        CLEANUP_FAILURES.append(header_value(f"{what}: {error}"))
+    diagnostic(f"Cleanup failed: {what}: {error}")
 
 
 def cleanup_step(what, action, *args, **kwargs):
@@ -138,6 +167,9 @@ class ResultDestination:
         requested = args.out.expanduser()
         self.out = requested.parent.resolve() / requested.name
         self.saved = None
+        self.code = None
+        self.rendered = None
+        self.pending_cleanup = False
         self.lock = None
         self.claimed = False
         self.finalizing = False
@@ -176,7 +208,7 @@ class ResultDestination:
             self.header = ((f"Role: {args.role}\n" if args.role is not None else "")
                            + f"Family: {args.family}\n"
                            f"Author family: {args.author_family or ''}\n"
-                           f"Same-family reason: {args.same_family_reason or ''}\n"
+                           f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
                            f"Start UTC: {self.start}\n")
             # Under the stem lock, no writer of these temporary files is alive.
             for path in self.out.parent.iterdir():
@@ -223,72 +255,82 @@ class ResultDestination:
     def refused(self, reason):
         self.finalizing = True
         if self.saved is not None:
-            return 2
-        self.write_terminal((self.header + f"Result: launch refused\nReason: {reason}\n"
-                             f"End UTC: {utc()}\nExit code: 2\n").encode("utf-8", errors="backslashreplace"))
-        print(reason, file=sys.stderr)
+            return self.code
+        self.write_terminal((self.header + f"Result: launch refused\nReason: {header_value(reason)}\n"
+                             f"End UTC: {utc()}\nExit code: 2\n").encode("utf-8", errors="backslashreplace"), 2)
+        diagnostic(reason)
         return 2
 
-    def write_terminal(self, contents):
+    def write_terminal(self, contents, code):
         self.finalizing = True
+        if self.saved is not None:
+            return
         try:
             self.write(contents)
         except Exception:
             try:
                 # Replacement may fail while the already claimed file is writable.
-                with self.out.open("wb") as stream:
+                with open_result(self.out, os.O_WRONLY | os.O_TRUNC, "wb") as stream:
                     stream.write(contents)
             except Exception as report_error:
                 # Remove a stale running marker if neither write succeeds.
                 try:
                     self.out.unlink(missing_ok=True)
-                except OSError as remove_error:
-                    print(f"Cannot remove stale result {self.out}: {remove_error}", file=sys.stderr)
-                print(f"Cannot record result in {self.out}: {report_error}", file=sys.stderr)
-                sys.stderr.buffer.write(contents)
-                sys.stderr.buffer.flush()
+                except Exception as remove_error:
+                    diagnostic(f"Cannot remove stale result {self.out}: {remove_error}")
+                diagnostic(f"Cannot record result in {self.out}: {report_error}")
+                diagnostic(contents, end="")
+        self.saved = (contents.decode("utf-8"), b"")
+        self.code = code
+        self.rendered = contents
 
     def cannot_save(self, error, answer, answer_bytes=None):
         self.finalizing = True
+        if self.saved is not None:
+            cleanup_failed("answer saving", error)
+            return self.code
         reason = f"failed: cannot save answer: {error}"
+        contents = (self.header + f"Result: {header_value(reason)}\nEnd UTC: {utc()}\nExit code: 1\n").encode(
+            "utf-8", errors="backslashreplace")
+        self.write_terminal(contents, 1)
         fallback = self.out.with_name(f"{self.out.stem}.unsaved-{os.getpid()}{self.out.suffix}")
         preserved = False
         if answer_bytes is None:
             try:
                 # A link can preserve unreadable bytes without replacing an older
                 # fallback. Session cleanup only unlinks the original answer.
-                os.link(answer, fallback)
-                preserved = True
+                if not stat.S_ISREG(answer.lstat().st_mode):
+                    raise OSError(f"non-regular answer: {answer}")
+                os.link(answer, fallback, follow_symlinks=False)
+                try:
+                    with open_result(fallback, os.O_PATH, "rb"):
+                        preserved = True
+                        os.chmod(fallback, self.mode, follow_symlinks=False)
+                except OSError as mode_error:
+                    if not preserved:
+                        fallback.unlink()
+                        raise
+                    diagnostic(f"Cannot set answer fallback mode {fallback}: {mode_error}")
             except OSError:
                 try:
-                    answer.chmod(0o600)
-                    with answer.open("rb") as stream:
+                    with open_result(answer, os.O_RDONLY, "rb") as stream:
                         answer_bytes = stream.read()
                 except OSError as recovery_error:
                     # Do not let session cleanup destroy the only remaining copy.
                     self.keep_session = True
-                    print(f"Cannot recover answer {answer}: {recovery_error}; keeping session folder",
-                          file=sys.stderr)
-            if preserved:
-                try:
-                    fallback.chmod(self.mode)
-                except OSError as mode_error:
-                    print(f"Cannot set answer fallback mode {fallback}: {mode_error}", file=sys.stderr)
+                    diagnostic(f"Cannot recover answer {answer}: {recovery_error}; keeping session folder")
         if answer_bytes is not None:
             try:
-                with fallback.open("xb") as stream:
+                with open_result(fallback, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb") as stream:
                     stream.write(answer_bytes)
                 preserved = True
             except OSError:
-                print("Unsaved answer follows on stderr:", file=sys.stderr, flush=True)
-                sys.stderr.buffer.write(answer_bytes)
-                sys.stderr.buffer.flush()
-        contents = (self.header + f"Result: {reason}\nEnd UTC: {utc()}\nExit code: 1\n").encode(
-            "utf-8", errors="backslashreplace")
-        self.write_terminal(contents)
-        print(reason, file=sys.stderr)
+                diagnostic("Unsaved answer follows on stderr:")
+                if not diagnostic(answer_bytes, end=""):
+                    self.keep_session = True
+        diagnostic(reason)
         if preserved:
-            print(f"Answer kept in {fallback}", file=sys.stderr)
+            diagnostic(f"Answer kept in {fallback}")
         return 1
 
     def artifact(self, path):
@@ -300,25 +342,42 @@ class ResultDestination:
                 or name.startswith((self.out.stem + ".attempt-", self.out.stem + ".saving-",
                                     self.out.stem + ".unsaved-")))
 
-    def save(self, header, answer):
-        self.write(header.replace("\nExit code:", "\nCleanup: pending\nExit code:", 1).encode(
-            "utf-8", errors="backslashreplace") + answer)
+    def save(self, header, answer, code):
+        if self.saved is not None:
+            return
+        before, separator, after = header.rpartition("\nExit code:")
+        contents = (before + "\nCleanup: pending" + separator + after).encode(
+            "utf-8", errors="backslashreplace") + answer
+        self.write(contents)
         self.saved = (header, answer)
+        self.code = code
+        self.rendered = contents
+        self.pending_cleanup = True
 
     def finish(self):
         if self.saved is not None:
             header, answer = self.saved
-            cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
-            try:
-                self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
-            except Exception as error:
-                cleanup_failed("result finalization", error)
-                cleanup = "failed: " + "; ".join(CLEANUP_FAILURES)
+            failures = 0
+            while True:
+                status = ""
+                if self.pending_cleanup or CLEANUP_FAILURES:
+                    cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
+                    status += f"\nCleanup: {cleanup}"
+                if self.signal_code is not None:
+                    status += f"\nSignal: {self.signal_code - 128}"
+                before, separator, after = header.rpartition("\nExit code:")
+                contents = (before + status + separator + after).encode("utf-8", errors="backslashreplace") + answer
+                if contents == self.rendered:
+                    return
                 try:
-                    self.write(header.replace("\nExit code:", f"\nCleanup: {cleanup}\nExit code:", 1).encode("utf-8", errors="backslashreplace") + answer)
+                    self.write(contents)
+                    self.rendered = contents
                 except Exception as report_error:
-                    # The pending answer remains intact if status cannot be saved.
-                    print(f"Cannot update cleanup status in {self.out}: {report_error}", file=sys.stderr)
+                    failures += 1
+                    if failures == 2:
+                        diagnostic(f"Cannot update cleanup status in {self.out}: {report_error}")
+                        return
+                    cleanup_failed("result finalization", report_error)
 
 
 def registered_gitfile(admin):
@@ -465,10 +524,10 @@ def check_entries(repo, method, private):
             if path.is_file() and actual != path.read_text(encoding="utf-8", newline=""):
                 differences.append(builder)
     except (OSError, ValueError) as error:
-        print(f"Warning: cannot check {path}: {error}", file=sys.stderr)
+        diagnostic(f"Warning: cannot check {path}: {error}")
         return
     for path in differences:
-        print(f"Warning: {path} differs from the installed method; see {command}", file=sys.stderr)
+        diagnostic(f"Warning: {path} differs from the installed method; see {command}")
 
 
 def review_leave_out(repo, private, head, snapshot):
@@ -486,7 +545,7 @@ def review_leave_out(repo, private, head, snapshot):
         except FileNotFoundError:
             return []
     except (OSError, UnicodeError) as error:
-        print(f"Warning: cannot read {path}: {error}; using a full checkout", file=sys.stderr)
+        diagnostic(f"Warning: cannot read {path}: {error}; using a full checkout")
         return []
     entries = []
     for line in lines:
@@ -495,7 +554,7 @@ def review_leave_out(repo, private, head, snapshot):
         entry = os.path.normpath(line)
         if (line.startswith("/") or ".." in line.split("/") or entry == "." or "\0" in line
                 or entry.split("/", 1)[0] in ("AGENTS.md", "CLAUDE.md", ".claude", ".codex")):
-            print(f"Warning: ignoring invalid leave-out path {line!r}", file=sys.stderr)
+            diagnostic(f"Warning: ignoring invalid leave-out path {line!r}")
         elif entry not in entries:
             entries.append(entry)
     if not entries:
@@ -933,7 +992,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
             if lock is not None:
                 lock.close()
             failure = f"pool slot {slot} unusable: {error}"
-            print(failure, file=sys.stderr)
+            diagnostic(failure)
             failures.append(failure)
             continue
         leases.append(lock)
@@ -982,7 +1041,7 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
                 reset_checkout(slot, common, commit, True, pass_fds)
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 failure = f"pool slot {slot} unusable: {error}"
-                print(failure, file=sys.stderr)
+                diagnostic(failure)
                 failures.append(failure)
                 cleanup_worktrees(repo, slot)
                 leases.remove(lock)
@@ -1041,7 +1100,7 @@ def main():
     try:
         result = ResultDestination(args)
     except Exception as error:
-        print(f"Cannot prepare result destination {args.out}: {error}", file=sys.stderr)
+        diagnostic(f"Cannot prepare result destination {args.out}: {error}")
         return 2
     def handle_signal(signum, frame):
         if result.signal_code is not None:
@@ -1066,11 +1125,14 @@ def main():
         else:
             code = launch(parser, args, result)
     except Exception as error:
+        result.finalizing = True
         if result.saved is not None:
-            print(f"Cannot save result {result.out}: {error}", file=sys.stderr)
-            code = 1
+            if CLEANUP_FAILURES is None:
+                CLEANUP_FAILURES = []
+            cleanup_failed("launcher", error)
+            code = result.code or 3
         elif not result.claimed:
-            print(f"Cannot prepare result destination {args.out}: {error}", file=sys.stderr)
+            diagnostic(f"Cannot prepare result destination {args.out}: {error}")
             code = 2
         else:
             code = result.refused(str(error) or type(error).__name__)
@@ -1079,13 +1141,26 @@ def main():
         code = 128 + (error.args[0] if error.args else signal.SIGINT)
         if result.saved is None and result.claimed:
             result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
-                                   f"Exit code: {code}\n").encode("utf-8", errors="backslashreplace"))
+                                   f"Exit code: {code}\n").encode("utf-8", errors="backslashreplace"), code)
     finally:
+        result.finalizing = True
+        if CLEANUP_FAILURES is None:
+            CLEANUP_FAILURES = []
         if result.lock is not None:
-            result.lock.close()
+            # Keep ownership through close hooks and the last status update.
+            try:
+                held_lock = os.dup(result.lock.fileno())
+            except (OSError, ValueError):
+                held_lock = None
+            try:
+                cleanup_step("result lock close", result.lock.close)
+                result.finish()
+            finally:
+                if held_lock is not None:
+                    cleanup_step("result lock release", os.close, held_lock)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
-    return result.signal_code or code
+    return result.signal_code or (3 if code == 0 and CLEANUP_FAILURES else code)
 
 
 def launch(parser, args, result):
@@ -1200,6 +1275,7 @@ def launch(parser, args, result):
     environment = ("restricted; discovery did not run"
                    if restricted else "user configuration")
     start, snapshot, code = result.start, "", 1
+    writes = "unavailable"
     skipped = []
     checkout_note, before_note = "", ""
     untracked_note = ""
@@ -1225,26 +1301,43 @@ def launch(parser, args, result):
             return result.refused(f"Cannot create session temporary folder {temporary}: {error}")
         length = len(os.fsencode(temporary))
         if length > 62:
-            print(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
-                  "to create Unix sockets in it above 62 bytes; starting anyway",
-                  file=sys.stderr)
+            diagnostic(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
+                       "to create Unix sockets in it above 62 bytes; starting anyway")
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
-        launch_error = None
         systemd = shutil.which("systemd-run")
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
+        def update_header():
+            result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
+                             f"Executable: {header_value(executable)}\n"
+                             + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
+                                f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
+                                f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
+                             + f"Author family: {args.author_family or ''}\n"
+                             f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
+                             f"Scope: {header_value(unit or 'none')}\n"
+                             + (f"Snapshot commit: {snapshot}\n" if review else "")
+                             + (header_value(checkout_note) + "\n" if checkout_note else "")
+                             + (header_value(before_note) + "\n" if before_note else "")
+                             + (untracked_note + "\n" if untracked_note else "")
+                             + (f"Skipped untracked (>5 MB): {', '.join(header_value(path) for path in skipped)}\n" if skipped else "")
+                             + f"Write bytes: {writes}\nStart UTC: {start}\n")
+        update_header()
         try:
             cwd = repo
             if args.role == "verifier":
                 snapshot = candidate
+                update_header()
                 work, note = lease_checkout(repo, cache, candidate, work, leases, args.clean_checkout, untracked)
                 checkout_note = "Checkout: " + note
+                update_header()
                 prompt += f"\nSnapshot commit: {snapshot}\n{checkout_note}\n{untracked_note}\n"
                 if before_commit:
                     before, note = lease_checkout(repo, cache, before_commit, temp / "before", leases,
                                                   args.clean_checkout, untracked)
                     before_note = f"Before checkout: {before} ({before_commit}); {note}"
+                    update_header()
                     prompt += "\n" + before_note + "\nUse this writable checkout for the before state.\n"
                 cwd = work
             elif review:
@@ -1278,6 +1371,7 @@ def launch(parser, args, result):
                         continue
                     if (repo / path).lstat().st_size > 5 * 1024 * 1024:
                         skipped.append(path)
+                        update_header()
                     else:
                         paths.append(path)
                 if paths:
@@ -1309,6 +1403,7 @@ def launch(parser, args, result):
                         leave_out = []
                     else:
                         checkout_note = f"Checkout: left-out paths {leave_out!r}"
+                update_header()
                 if leave_out or git_only:
                     git(repo, "worktree", "add", "--no-checkout", "--detach", str(work), snapshot)
                     git(work, "read-tree", snapshot)
@@ -1366,14 +1461,15 @@ def launch(parser, args, result):
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
                     out.parent.mkdir(parents=True, exist_ok=True)
-                    with out.with_suffix(".log").open("wb") as log:
+                    with open_result(out.with_suffix(".log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "wb") as log:
                         environment = "restricted with MCP servers not disabled: discovery did not complete"
+                        update_header()
                         servers, reason = discover_servers(executable, cwd, agent_env,
                                                            min(30, args.timeout or 30), log, result)
                     environment = "restricted"
                     if reason:
                         environment += f" with MCP servers not disabled: {reason}"
-                        print(f"Warning: MCP servers were not disabled: {reason}", file=sys.stderr)
+                        diagnostic(f"Warning: MCP servers were not disabled: {reason}")
                     unsupported = []
                     for name in servers:
                         if re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -1383,7 +1479,7 @@ def launch(parser, args, result):
                     if unsupported:
                         reason = f"unsupported server names: {', '.join(unsupported)}"
                         environment += f" with MCP servers not all disabled: {reason}"
-                        print(f"Warning: MCP servers were not all disabled: {reason}", file=sys.stderr)
+                        diagnostic(f"Warning: MCP servers were not all disabled: {reason}")
                 command += ["-"]
             else:
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
@@ -1402,13 +1498,16 @@ def launch(parser, args, result):
                 command = [systemd, "--user", "--scope", "--quiet", "--collect",
                            "--slice=agents.slice", f"--unit={unit}", "--", *command]
             else:
-                print("systemd-run unavailable; running without a scope", file=sys.stderr)
+                diagnostic("systemd-run unavailable; running without a scope")
             if leases:
                 command = [sys.executable, "-I", "-c", LEASE_GUARD, str(Path(__file__).resolve()),
                            str(repo), str(temp), str(os.getpid()), *command]
-            with (answer.open("wb") if args.family == "claude" else open(os.devnull, "wb")) as stdout:
+            update_header()
+            with (open_result(answer, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "wb")
+                  if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
-                with out.with_suffix(".log").open("ab" if restricted else "wb") as log:
+                log_flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if restricted else os.O_TRUNC)
+                with open_result(out.with_suffix(".log"), log_flags, "ab" if restricted else "wb") as log:
                     # Defer signals until Popen returns the identity needed to stop
                     # the child, including a signal delivered inside Popen itself.
                     result.spawning = True
@@ -1426,14 +1525,17 @@ def launch(parser, args, result):
                 except subprocess.TimeoutExpired:
                     code = 124
         except KeyboardInterrupt as error:
-            if process is None:
-                raise
+            result.finalizing = True
             code = 128 + (error.args[0] if error.args else signal.SIGINT)
-        except Exception as error:
             if process is None:
-                launch_error, code = str(error) or type(error).__name__, 2
+                result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
+                                       f"Exit code: {code}\n").encode("utf-8", errors="backslashreplace"), code)
+        except Exception as error:
+            result.finalizing = True
+            if process is None:
+                code = result.refused(str(error) or type(error).__name__)
             else:
-                print(f"Session failed: {error}", file=sys.stderr)
+                diagnostic(f"Session failed: {error}")
                 code = 127 if isinstance(error, FileNotFoundError) else 1
         finally:
             # Record late signals without interrupting saving or cleanup.
@@ -1442,50 +1544,44 @@ def launch(parser, args, result):
                 CLEANUP_FAILURES = []
             if process is not None:
                 cleanup_step("stop session", stop_session, unit, process, guarded=bool(leases))
-            answer_bytes = None
             try:
-                answer_bytes = answer.read_bytes() if answer.exists() else b""
-                if process is not None and not answer_bytes.decode("utf-8", errors="replace").strip():
-                    print("Session failed: agent produced no non-empty answer.", file=sys.stderr)
-                    code = code or 1
-                if code and out.with_suffix(".log").exists():
-                    with out.with_suffix(".log").open(errors="replace") as log:
-                        sys.stderr.writelines(deque(log, maxlen=20))
-                end = utc()
-                final_io = write_bytes()
-                writes = (f"{(final_io - initial_io) / 1024**2:.1f} MiB"
-                          if initial_io is not None and final_io is not None else "unavailable")
-                header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {model}\n"
-                          f"Executable: {executable}\n"
-                          + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
-                             f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
-                             f"Requested environment: {environment}\n" if args.family == "codex" else "")
-                          + f"Author family: {args.author_family or ''}\n"
-                          f"Same-family reason: {args.same_family_reason or ''}\n"
-                          f"Scope: {unit or 'none'}\n"
-                          + (f"Snapshot commit: {snapshot}\n" if review else "")
-                          + (checkout_note + "\n" if checkout_note else "")
-                          + (before_note + "\n" if before_note else "")
-                          + (untracked_note + "\n" if untracked_note else "")
-                          + (f"Skipped untracked (>5 MB): {', '.join(skipped)}\n" if skipped else "")
-                          + f"Write bytes: {writes}\nStart UTC: {start}\nEnd UTC: {end}\nExit code: {code}\n\n")
                 if process is not None:
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    result.save(header, answer_bytes)
-                    evidence = out.with_name(out.stem + "-evidence")
+                    answer_bytes = None
                     try:
-                        if args.role == "verifier" and source.is_dir() and any(source.iterdir()):
-                            shutil.copytree(source, evidence, symlinks=True)
+                        try:
+                            with open_result(answer, os.O_RDONLY, "rb") as stream:
+                                answer_bytes = stream.read()
+                        except FileNotFoundError:
+                            answer_bytes = b""
+                        if not answer_bytes.decode("utf-8", errors="replace").strip():
+                            diagnostic("Session failed: agent produced no non-empty answer.")
+                            code = code or 1
+                        end = utc()
+                        final_io = write_bytes()
+                        writes = (f"{(final_io - initial_io) / 1024**2:.1f} MiB"
+                                  if initial_io is not None and final_io is not None else "unavailable")
+                        update_header()
+                        header = result.header + f"End UTC: {end}\nExit code: {code}\n\n"
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        result.save(header, answer_bytes, code)
+                        evidence = out.with_name(out.stem + "-evidence")
+                        try:
+                            if args.role == "verifier" and source.is_dir() and any(source.iterdir()):
+                                shutil.copytree(source, evidence, symlinks=True)
+                        except Exception as error:
+                            cleanup_failed(f"evidence copy {evidence}", error)
                     except Exception as error:
-                        cleanup_failed(f"evidence copy {evidence}", error)
-                else:
-                    result.header = header.rsplit("End UTC:", 1)[0]
-                    if launch_error is not None:
-                        result.refused(launch_error)
-            except Exception as error:
-                if process is None or result.saved is not None:
-                    raise
-                code = result.cannot_save(error, answer, answer_bytes)
+                        if result.saved is not None:
+                            raise
+                        code = result.cannot_save(error, answer, answer_bytes)
+                if code:
+                    try:
+                        with open_result(out.with_suffix(".log"), os.O_RDONLY, "r") as log:
+                            diagnostic("".join(deque(log, maxlen=20)), end="")
+                    except FileNotFoundError:
+                        pass
+                    except Exception as error:
+                        cleanup_failed("session log tail", error)
             finally:
                 cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
     finally:
@@ -1505,5 +1601,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (OSError, subprocess.CalledProcessError) as error:
-        print(f"Launcher failed: {error}", file=sys.stderr)
+        diagnostic(f"Launcher failed: {error}")
         sys.exit(1)

@@ -6062,13 +6062,20 @@ os.replace = replace
 pathlib.Path(args[args.index("-o") + 1]).chmod(0)
 ''')
         self.inject_launcher('''
-import pathlib
+import os, pathlib
 original = pathlib.Path.read_bytes
+original_open = os.open
 def read(self):
     if self.name == "answer" and self.parent.parent.name == "am":
         raise PermissionError("forced answer read failure")
     return original(self)
+def open(path, flags, *args, **kwargs):
+    path = pathlib.Path(path)
+    if path.name == "answer" and path.parent.parent.name == "am":
+        raise PermissionError("forced answer read failure")
+    return original_open(path, flags, *args, **kwargs)
 pathlib.Path.read_bytes = read
+os.open = open
 ''')
         result = self.launch()
         self.assert_unsaved_answer(result, "forced answer read failure")
@@ -6152,6 +6159,296 @@ subprocess.Popen = spawn
                         except ProcessLookupError:
                             pass
 
+    def closed_stderr_outcome(self, outcome):
+        hook = self.base / "escaped-exception"
+        extra = ()
+        expected = {"success": 0, "timeout": 124, "refusal": 2, "cleanup": 3, "save": 1}[outcome]
+        if outcome == "success":
+            self.configure_scope(present=False)
+        elif outcome == "timeout":
+            self.env.update(SLEEP="1", SESSION_STDERR="timeout log tail")
+            extra = ("--timeout", "0.3")
+        elif outcome == "refusal":
+            extra = ("--before", "HEAD")
+        for closed in (True, False):
+            with self.subTest(closed=closed):
+                self.inject_launcher(f'''
+import os, pathlib, sys, tempfile
+sys.excepthook = lambda *args: pathlib.Path({str(hook)!r}).write_text("traceback")
+sys.unraisablehook = lambda *args: pathlib.Path({str(hook)!r}).write_text("unraisable")
+if {closed!r}:
+    os.close(2)
+else:
+    reader, writer = os.pipe()
+    os.close(reader)
+    os.dup2(writer, 2)
+    os.close(writer)
+original_cleanup = tempfile.TemporaryDirectory.cleanup
+def cleanup(self):
+    original_cleanup(self)
+    if {outcome!r} == "cleanup" and pathlib.Path(self.name).parent.name == "am":
+        raise OSError("forced cleanup failure")
+tempfile.TemporaryDirectory.cleanup = cleanup
+original_replace = os.replace
+def replace(source, destination, *args, **kwargs):
+    if ({outcome!r} == "save" and destination == pathlib.Path({str(self.out)!r})
+            and b"Cleanup: pending\\n" in pathlib.Path(source).read_bytes()):
+        raise OSError("forced save failure")
+    return original_replace(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+                result = self.launch("builder", "codex", *extra)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertFalse(hook.exists())
+                self.assertNotIn("Traceback", result.stdout + result.stderr)
+                output = self.out.read_text()
+                self.assertNotIn("Result: running", output)
+                self.assertEqual(output.count("End UTC:"), 1)
+                self.assertIn(f"Exit code: {expected if outcome != 'cleanup' else 0}\n", output)
+                if outcome in ("success", "timeout", "cleanup"):
+                    self.assertTrue(output.endswith("answer\n  unchanged\n"))
+                    self.assertNotIn("cannot save", output)
+                elif outcome == "refusal":
+                    self.assertIn("Result: launch refused\n", output)
+                    self.assertIn("allowed only for verifiers", output)
+                else:
+                    self.assertIn("Result: failed: cannot save answer: forced save failure\n", output)
+                if outcome == "cleanup":
+                    self.assertIn("Cleanup: failed:", output)
+
+    def test_RESULTS_R5_closed_stderr_success(self):
+        self.closed_stderr_outcome("success")
+
+    def test_RESULTS_R5_closed_stderr_timeout(self):
+        self.closed_stderr_outcome("timeout")
+
+    def test_RESULTS_R5_closed_stderr_refusal(self):
+        self.closed_stderr_outcome("refusal")
+
+    def test_RESULTS_R5_closed_stderr_cleanup_failure(self):
+        self.closed_stderr_outcome("cleanup")
+
+    def test_RESULTS_R5_closed_stderr_cannot_save(self):
+        self.closed_stderr_outcome("save")
+
+    def test_RESULTS_R5_answer_symlink_does_not_expose_or_chmod_private_file(self):
+        secret = self.base / "secret"
+        secret.write_bytes(b"private answer must never be exposed")
+        secret.chmod(0o600)
+        self.agent_extra(f'''
+answer = pathlib.Path(args[args.index("-o") + 1])
+answer.unlink()
+answer.symlink_to({str(secret)!r})
+''')
+        self.inject_launcher('''
+import pathlib
+original = pathlib.Path.read_bytes
+def read(self):
+    if self.name == "answer" and self.parent.parent.name == "am":
+        raise PermissionError("forced answer read failure")
+    return original(self)
+pathlib.Path.read_bytes = read
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
+        self.assertEqual(secret.stat().st_nlink, 1)
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+        self.assertNotIn(secret.read_text(), self.out.read_text() + result.stderr)
+        self.assertIn("Result: failed: cannot save answer:", self.out.read_text())
+
+    def test_RESULTS_R5_header_values_cannot_forge_exit_or_cleanup(self):
+        reason = "reason\nExit code: 0\r\t\x1b\x85"
+        name = "oversized\nExit code: 0\r\t\x1b\x85"
+        with (self.repo / name).open("wb") as stream:
+            stream.truncate(5 * 1024 * 1024 + 1)
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                extra = ("--before", "HEAD") if refused else ()
+                role = "builder" if refused else "reviewer"
+                result = self.launch(role, "codex", "--author-family", "claude",
+                                     "--same-family-reason", reason, *extra)
+                self.assertEqual(result.returncode, 2 if refused else 0, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("Same-family reason: reason\\nExit code: 0\\r\\t\\x1b\\x85\n", output)
+                self.assertEqual(output.count("\nExit code:"), 1)
+                if not refused:
+                    self.assertIn("Skipped untracked (>5 MB): oversized\\nExit code: 0\\r\\t\\x1b\\x85\n", output)
+                    self.assertIn("Cleanup: ok\nExit code: 0\n", output)
+
+    def test_RESULTS_R5_path_header_values_are_single_line(self):
+        fake = self.base / "fake\nExit code: 0\t\x1b"
+        fake.write_text(FAKE)
+        fake.chmod(0o755)
+        self.env["AGENT_CODEX_CMD"] = str(fake)
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.out.read_text()
+        self.assertIn("fake\\nExit code: 0\\t\\x1b\n", output)
+        self.assertEqual(output.count("\nExit code:"), 1)
+        self.assertIn("Cleanup: ok\nExit code: 0\n", output)
+
+    def test_RESULTS_R5_late_signal_is_recorded_for_every_final_result(self):
+        for outcome in ("answer", "refusal", "save", "interrupted"):
+            for stage in ("write", "unlock"):
+                with self.subTest(outcome=outcome, stage=stage):
+                    self.inject_launcher(f'''
+import os, pathlib, signal
+original_replace, original_close, original_read = os.replace, os.fdopen, pathlib.Path.read_text
+def read(self, *args, **kwargs):
+    if {outcome!r} == "interrupted" and self == pathlib.Path({str(self.brief)!r}):
+        raise KeyboardInterrupt(signal.SIGINT)
+    return original_read(self, *args, **kwargs)
+pathlib.Path.read_text = read
+def replace(source, destination, *args, **kwargs):
+    contents = pathlib.Path(source).read_bytes() if ".saving-" in str(source) else b""
+    if {outcome!r} == "save" and b"Cleanup: pending\\n" in contents:
+        raise OSError("forced save failure")
+    value = original_replace(source, destination, *args, **kwargs)
+    if ({stage!r} == "write" and destination == pathlib.Path({str(self.out)!r})
+            and b"Result: running\\n" not in contents):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return value
+os.replace = replace
+class Lock:
+    def __init__(self, stream):
+        self.stream = stream
+    def fileno(self):
+        return self.stream.fileno()
+    def close(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+        self.stream.close()
+def fdopen(fd, *args, **kwargs):
+    stream = original_close(fd, *args, **kwargs)
+    return Lock(stream) if {stage!r} == "unlock" and args == ("a",) else stream
+os.fdopen = fdopen
+''')
+                    extra = ("--before", "HEAD") if outcome == "refusal" else ()
+                    result = self.launch("builder", "codex", *extra)
+                    self.assertEqual(result.returncode, 143, result.stderr)
+                    output = self.out.read_text()
+                    self.assertIn("\nSignal: 15\n", output)
+                    self.assertEqual(output.count("\nSignal:"), 1)
+                    self.assertEqual(output.count("End UTC:"), 1)
+                    if outcome == "answer":
+                        self.assertTrue(output.endswith("answer\n  unchanged\n"))
+                    else:
+                        expected = {"refusal": "launch refused", "save": "failed: cannot save answer:",
+                                    "interrupted": "interrupted"}[outcome]
+                        self.assertIn("Result: " + expected, output)
+
+    def test_RESULTS_R5_secondary_exception_keeps_original_terminal_result(self):
+        self.inject_launcher(f'''
+import pathlib, shutil, subprocess
+original_spawn, original_rmtree = subprocess.Popen, shutil.rmtree
+def spawn(command, *args, **kwargs):
+    if "--scope" in command:
+        raise RuntimeError("original launch refusal")
+    return original_spawn(command, *args, **kwargs)
+def rmtree(path, *args, **kwargs):
+    if pathlib.Path(path).parent.name == "am":
+        raise RuntimeError("secondary cleanup error")
+    return original_rmtree(path, *args, **kwargs)
+subprocess.Popen, shutil.rmtree = spawn, rmtree
+original_read, original_exists = pathlib.Path.read_bytes, pathlib.Path.exists
+def read(self):
+    if self.name == "answer" and self.parent.parent.name == "am":
+        raise RuntimeError("secondary answer error")
+    return original_read(self)
+def exists(self):
+    if self.name == "answer" and self.parent.parent.name == "am":
+        return True
+    return original_exists(self)
+pathlib.Path.read_bytes, pathlib.Path.exists = read, exists
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        output = self.out.read_text()
+        self.assertIn("Reason: original launch refusal\n", output)
+        self.assertIn("Cleanup: failed:", output)
+        self.assertNotIn("secondary answer error", output)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_RESULTS_R5_first_signal_during_main_exception_keeps_original_reason(self):
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = pathlib.Path.read_text
+class Refusal(RuntimeError):
+    def __str__(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return "original brief refusal"
+def read(self, *args, **kwargs):
+    if self == pathlib.Path({str(self.brief)!r}):
+        raise Refusal()
+    return original(self, *args, **kwargs)
+pathlib.Path.read_text = read
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        output = self.out.read_text()
+        self.assertIn("Result: launch refused\nReason: original brief refusal\n", output)
+        self.assertIn("Signal: 15\n", output)
+        self.assertNotIn("Result: running", output)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_RESULTS_R5_terminal_fallback_does_not_follow_result_symlink(self):
+        secret = self.base / "secret"
+        secret.write_text("keep private bytes")
+        secret.chmod(0o600)
+        self.inject_launcher(f'''
+import os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        destination.unlink()
+        destination.symlink_to({str(secret)!r})
+        raise OSError("forced terminal replacement failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch("builder", "codex", "--before", "HEAD")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(secret.read_text(), "keep private bytes")
+        self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
+        self.assertFalse(self.out.exists())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_RESULTS_R5_log_tail_does_not_read_agent_symlink(self):
+        secret = self.base / "secret"
+        secret.write_text("private log contents")
+        secret.chmod(0o600)
+        self.env["SESSION_EXIT"] = "7"
+        self.agent_extra(f'''
+log = pathlib.Path({str(self.out.with_suffix('.log'))!r})
+log.unlink()
+log.symlink_to({str(secret)!r})
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertNotIn(secret.read_text(), self.out.read_text() + result.stderr)
+        self.assertIn("Cleanup: failed: session log tail:", self.out.read_text())
+        self.assertTrue(self.out.read_text().endswith("answer\n  unchanged\n"))
+
+    def test_RESULTS_R5_failed_stderr_recovery_preserves_session_answer(self):
+        self.agent_extra(f'''
+pathlib.Path({str(self.out.parent)!r}).chmod(0o555)
+''')
+        self.addCleanup(self.out.parent.chmod, 0o755)
+        self.inject_launcher('''
+import os
+reader, writer = os.pipe()
+os.close(reader)
+os.dup2(writer, 2)
+os.close(writer)
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertTrue(session.exists())
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
+        self.assertIn("Result: failed: cannot save answer:", self.out.read_text())
+
     def test_RESULTS_R4_non_utf8_tracked_filename_refusal_is_recorded(self):
         path = self.repo / os.fsdecode(b"modified-\xff")
         path.write_bytes(b"committed")
@@ -6207,6 +6504,7 @@ subprocess.Popen = spawn
                 self.inject_launcher(f'''
 import os, pathlib
 original_replace, original_open = os.replace, pathlib.Path.open
+original_os_open = os.open
 def replace(source, destination, *args, **kwargs):
     if (destination == pathlib.Path({str(self.out)!r})
             and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
@@ -6216,7 +6514,11 @@ def open(self, mode="r", *args, **kwargs):
     if {fallback_fails!r} and self == pathlib.Path({str(self.out)!r}) and mode == "wb":
         raise RuntimeError("forced terminal fallback failure")
     return original_open(self, mode, *args, **kwargs)
-os.replace, pathlib.Path.open = replace, open
+def os_open(path, flags, *args, **kwargs):
+    if {fallback_fails!r} and pathlib.Path(path) == pathlib.Path({str(self.out)!r}) and flags & os.O_TRUNC:
+        raise RuntimeError("forced terminal fallback failure")
+    return original_os_open(path, flags, *args, **kwargs)
+os.replace, pathlib.Path.open, os.open = replace, open, os_open
 ''')
                 result = self.launch("builder", "codex", "--before", "HEAD")
                 self.assertEqual(result.returncode, 2, result.stderr)
