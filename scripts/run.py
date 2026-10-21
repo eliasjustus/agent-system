@@ -234,7 +234,8 @@ class ResultDestination:
             self.write(self.header.encode("utf-8", errors="backslashreplace") + b"Result: running\n")
             self.claimed = True
         except BaseException:
-            self.lock.close()
+            if not self.claimed:
+                self.lock.close()
             raise
 
     def write(self, contents):
@@ -284,53 +285,17 @@ class ResultDestination:
         self.code = code
         self.rendered = contents
 
-    def cannot_save(self, error, answer, answer_bytes=None):
+    def cannot_save(self, error, answer):
         self.finalizing = True
         if self.saved is not None:
             cleanup_failed("answer saving", error)
             return self.code
-        reason = f"failed: cannot save answer: {error}"
+        self.keep_session = True
+        reason = f"failed: cannot save answer: {error}; answer left in {answer.parent}"
         contents = (self.header + f"Result: {header_value(reason)}\nEnd UTC: {utc()}\nExit code: 1\n").encode(
             "utf-8", errors="backslashreplace")
         self.write_terminal(contents, 1)
-        fallback = self.out.with_name(f"{self.out.stem}.unsaved-{os.getpid()}{self.out.suffix}")
-        preserved = False
-        if answer_bytes is None:
-            try:
-                # A link can preserve unreadable bytes without replacing an older
-                # fallback. Session cleanup only unlinks the original answer.
-                if not stat.S_ISREG(answer.lstat().st_mode):
-                    raise OSError(f"non-regular answer: {answer}")
-                os.link(answer, fallback, follow_symlinks=False)
-                try:
-                    with open_result(fallback, os.O_PATH, "rb"):
-                        preserved = True
-                        os.chmod(fallback, self.mode, follow_symlinks=False)
-                except OSError as mode_error:
-                    if not preserved:
-                        fallback.unlink()
-                        raise
-                    diagnostic(f"Cannot set answer fallback mode {fallback}: {mode_error}")
-            except OSError:
-                try:
-                    with open_result(answer, os.O_RDONLY, "rb") as stream:
-                        answer_bytes = stream.read()
-                except OSError as recovery_error:
-                    # Do not let session cleanup destroy the only remaining copy.
-                    self.keep_session = True
-                    diagnostic(f"Cannot recover answer {answer}: {recovery_error}; keeping session folder")
-        if answer_bytes is not None:
-            try:
-                with open_result(fallback, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb") as stream:
-                    stream.write(answer_bytes)
-                preserved = True
-            except OSError:
-                diagnostic("Unsaved answer follows on stderr:")
-                if not diagnostic(answer_bytes, end=""):
-                    self.keep_session = True
         diagnostic(reason)
-        if preserved:
-            diagnostic(f"Answer kept in {fallback}")
         return 1
 
     def artifact(self, path):
@@ -1146,6 +1111,14 @@ def main():
         result.finalizing = True
         if CLEANUP_FAILURES is None:
             CLEANUP_FAILURES = []
+        # A signal can escape an exception handler before it starts finalizing.
+        if result.claimed and result.saved is None:
+            if result.signal_code is not None:
+                result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
+                                       f"Exit code: {result.signal_code}\n").encode(
+                                           "utf-8", errors="backslashreplace"), result.signal_code)
+            else:
+                result.refused("launcher ended without a final result")
         if result.lock is not None:
             # Keep ownership through close hooks and the last status update.
             try:
@@ -1156,11 +1129,21 @@ def main():
                 cleanup_step("result lock close", result.lock.close)
                 result.finish()
             finally:
+                # The file is final. Signals after this point cannot change its status.
+                for sig in previous_handlers:
+                    signal.signal(sig, signal.SIG_IGN)
                 if held_lock is not None:
                     cleanup_step("result lock release", os.close, held_lock)
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
-    return result.signal_code or (3 if code == 0 and CLEANUP_FAILURES else code)
+        else:
+            for sig in previous_handlers:
+                signal.signal(sig, signal.SIG_IGN)
+    if result.rendered is not None:
+        header = result.rendered.split(b"\n\n", 1)[0]
+        rendered_signal = re.search(rb"^Signal: (\d+)$", header, re.MULTILINE)
+        if rendered_signal is not None:
+            return 128 + int(rendered_signal[1])
+        code = result.code
+    return 3 if code == 0 and CLEANUP_FAILURES else code
 
 
 def launch(parser, args, result):
@@ -1566,18 +1549,21 @@ def launch(parser, args, result):
                         result.save(header, answer_bytes, code)
                         evidence = out.with_name(out.stem + "-evidence")
                         try:
-                            if args.role == "verifier" and source.is_dir() and any(source.iterdir()):
-                                shutil.copytree(source, evidence, symlinks=True)
+                            if args.role == "verifier":
+                                if not stat.S_ISDIR(source.lstat().st_mode):
+                                    raise OSError(f"non-directory evidence: {source}")
+                                if any(source.iterdir()):
+                                    shutil.copytree(source, evidence, symlinks=True)
                         except Exception as error:
                             cleanup_failed(f"evidence copy {evidence}", error)
                     except Exception as error:
                         if result.saved is not None:
                             raise
-                        code = result.cannot_save(error, answer, answer_bytes)
+                        code = result.cannot_save(error, answer)
                 if code:
                     try:
-                        with open_result(out.with_suffix(".log"), os.O_RDONLY, "r") as log:
-                            diagnostic("".join(deque(log, maxlen=20)), end="")
+                        with open_result(out.with_suffix(".log"), os.O_RDONLY, "rb") as log:
+                            diagnostic(b"".join(deque(log, maxlen=20)), end="")
                     except FileNotFoundError:
                         pass
                     except Exception as error:
@@ -1600,6 +1586,8 @@ def launch(parser, args, result):
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except KeyboardInterrupt as error:
+        sys.exit(128 + (error.args[0] if error.args else signal.SIGINT))
     except (OSError, subprocess.CalledProcessError) as error:
         diagnostic(f"Launcher failed: {error}")
         sys.exit(1)

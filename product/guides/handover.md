@@ -64,15 +64,18 @@ Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidenc
 Earlier results, logs and evidence are kept as `.attempt-N` siblings, retaining the output suffix
 (for example, `answer.attempt-1.txt` for `--out answer.txt`). The result file decides; exit 2 means
 refused (and then the file says so) or the destination cannot be claimed (the file is unchanged;
-stderr says why). Exit 1 with `Result: failed: cannot save answer: <error>` means the agent ran
-but saving its answer failed. Answer bytes are kept beside `--out` in
-`<stem>.unsaved-<pid><suffix>`, or printed on stderr if that file cannot be written. Exit 3 means
-a saved answer with exit 0 and failed cleanup. The header's `Exit code:` keeps the agent's code,
-including when cleanup fails.
+stderr says why). Exit 1 with
+`Result: failed: cannot save answer: <error>; answer left in <session folder>` means the agent ran
+but saving its answer failed. The session folder is kept with the answer in place; remove it manually
+after recovering the answer. If the result cannot be written, the same failure and folder are reported
+on stderr (best effort). Exit 3 means a saved answer with exit 0 and failed cleanup. The header's
+`Exit code:` keeps the agent's code, including when cleanup fails.
 `Cleanup: pending` means the answer is saved and cleanup is still running; its final status is
 `Cleanup: ok` or `Cleanup: failed: <what>; …`. A non-zero agent code survives cleanup failures.
-A handled signal exits with 128 plus its signal number, including after the answer was saved.
-The result file decides what completed: a late signal never replaces a saved answer.
+A handled signal is recorded as `Signal: <number>` and exits with 128 plus that number, including
+after the answer was saved. The header's `Exit code:` retains the original outcome.
+The result file decides what completed: a late signal never replaces a saved answer. Once the final
+status is written, further signals are ignored and the exit status matches the recorded outcome.
 `Result: running` means the launcher is running or was killed. Check liveness with
 `flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-`, `.attempt-` or

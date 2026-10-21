@@ -6021,6 +6021,174 @@ os.replace = replace
         self.assertEqual(list(self.base.glob("answer.attempt-*")), [])
         self.assertFalse(self.out.with_suffix(".lock").exists())
 
+    def test_RESULTS_R6_hardlinked_answer_cannot_change_private_inode(self):
+        secret = self.base / "secret"
+        secret.write_bytes(b"private answer must stay private")
+        secret.chmod(0o600)
+        self.agent_extra(f'''
+answer = pathlib.Path(args[args.index("-o") + 1])
+answer.unlink()
+os.link({str(secret)!r}, answer)
+pathlib.Path(os.environ["RECORD"] + ".links").write_text(str(answer.stat().st_nlink))
+''')
+        self.inject_launcher('''
+import os, pathlib
+original = os.open
+def open(path, flags, *args, **kwargs):
+    path = pathlib.Path(path)
+    if path.name == "answer" and path.parent.parent.name == "am":
+        raise PermissionError("forced answer read failure")
+    return original(path, flags, *args, **kwargs)
+os.open = open
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o600)
+        self.assertEqual(secret.stat().st_nlink, int(Path(str(self.record) + ".links").read_text()))
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertTrue(session.is_dir())
+        self.assertIn(f"; answer left in {session}\n", self.out.read_text())
+        self.assertNotIn(secret.read_text(), result.stderr + self.out.read_text())
+
+    def test_RESULTS_R6_evidence_root_symlink_is_not_copied(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("outside evidence")
+        self.agent_extra(f'''
+assert evidence is not None
+evidence.rmdir()
+evidence.symlink_to({str(outside)!r}, target_is_directory=True)
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(self.out.with_name("answer-evidence").exists())
+        self.assertIn("Cleanup: failed: evidence", self.out.read_text())
+        self.assertEqual((outside / "secret").read_text(), "outside evidence")
+
+    def test_RESULTS_R6_signal_inside_main_exception_before_finalizing(self):
+        self.inject_launcher(f'''
+import os, pathlib, signal, sys
+original = pathlib.Path.read_text
+class Refusal(RuntimeError):
+    pass
+def read(self, *args, **kwargs):
+    if self == pathlib.Path({str(self.brief)!r}):
+        raise Refusal("brief failure")
+    return original(self, *args, **kwargs)
+pathlib.Path.read_text = read
+def trace(frame, event, arg):
+    if (frame.f_code.co_name == "main" and event == "line"
+            and isinstance(frame.f_locals.get("error"), Refusal)
+            and not frame.f_locals["result"].finalizing):
+        sys.settrace(None)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return trace
+sys.settrace(trace)
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertIn("Result: interrupted\n", self.out.read_text())
+        self.assertNotIn("Result: running", self.out.read_text())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_RESULTS_R6_signal_after_final_finish_matches_file(self):
+        self.inject_launcher('''
+import os, signal, sys
+original = os.close
+def close(fd):
+    value = original(fd)
+    frame = sys._getframe(1)
+    if frame.f_code.co_name == "cleanup_step":
+        frame = frame.f_back
+        if frame.f_code.co_name == "main" and fd == frame.f_locals.get("held_lock"):
+            os.kill(os.getpid(), signal.SIGTERM)
+    return value
+os.close = close
+''')
+        for agent_code in (0, 7):
+            with self.subTest(agent_code=agent_code):
+                self.env["SESSION_EXIT"] = str(agent_code)
+                result = self.launch()
+                output = self.out.read_text()
+                self.assertEqual(result.returncode, agent_code, result.stderr)
+                self.assertIn(f"Exit code: {agent_code}\n", output)
+                self.assertNotIn("Signal:", output)
+
+    def test_RESULTS_R6_signal_at_claim_keeps_stem_lock(self):
+        lock_state = self.base / "lock-state"
+        self.inject_launcher(f'''
+import fcntl, os, pathlib, signal, sys
+def setattr(self, name, value):
+    object.__setattr__(self, name, value)
+    if name == "claimed" and value:
+        os.kill(os.getpid(), signal.SIGTERM)
+def trace(frame, event, arg):
+    if frame.f_code.co_name == "claim" and event == "call":
+        type(frame.f_locals["self"]).__setattr__ = setattr
+        sys.settrace(None)
+    return trace
+sys.settrace(trace)
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if b"Result: interrupted\\n" in pathlib.Path(source).read_bytes():
+        with pathlib.Path({str(self.out.with_suffix('.lock'))!r}).open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                state = "held"
+            else:
+                state = "unlocked"
+            pathlib.Path({str(lock_state)!r}).write_text(state)
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(lock_state.read_text(), "held")
+        self.assertIn("Result: interrupted\n", self.out.read_text())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_RESULTS_R6_non_utf8_log_tail_is_not_cleanup_failure(self):
+        self.env["SESSION_EXIT"] = "7"
+        self.agent_extra('''
+os.write(2, b"binary stderr\\xff\\n")
+''')
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/run.py"), "--role", "builder",
+             "--family", "codex", "--brief", str(self.brief), "--out", str(self.out),
+             "--repo", str(self.repo), "--method", str(self.method), "--private", str(self.private)],
+            env=self.env, cwd=self.repo, capture_output=True)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn(b"binary stderr\xff\n", result.stderr)
+        self.assertIn("Cleanup: ok\n", self.out.read_text())
+        self.assertNotIn("Cleanup failed:", result.stderr.decode(errors="replace"))
+
+    def test_RESULTS_R6_cannot_write_failure_reports_kept_folder_on_stderr(self):
+        self.inject_launcher(f'''
+import os, pathlib
+original_replace, original_open = os.replace, os.open
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: running\\n" not in pathlib.Path(source).read_bytes()):
+        raise OSError("forced result write failure")
+    return original_replace(source, destination, *args, **kwargs)
+def open(path, flags, *args, **kwargs):
+    if pathlib.Path(path) == pathlib.Path({str(self.out)!r}):
+        raise OSError("forced terminal write failure")
+    return original_open(path, flags, *args, **kwargs)
+os.replace, os.open = replace, open
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertTrue(session.is_dir())
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
+        self.assertIn("Result: failed: cannot save answer: forced result write failure; "
+                      f"answer left in {session}\n", result.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+
     def assert_unsaved_answer(self, result, reason):
         self.assertEqual(result.returncode, 1, result.stderr)
         output = self.out.read_text()
@@ -6028,7 +6196,11 @@ os.replace = replace
         self.assertEqual(output.count("End UTC:"), 1)
         self.assertNotIn("launch refused", output)
         self.assertIn("Exit code: 1\n", output)
-        self.assertFalse(Path(json.loads(self.record.read_text())["tmpdir"]).parent.exists())
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertTrue(session.is_dir())
+        self.assertIn(f"; answer left in {session}\n", output)
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+        return session
 
     def test_RESULTS_R3_replace_failure_keeps_binary_answer(self):
         self.env["SESSION_EXIT"] = "7"
@@ -6046,16 +6218,13 @@ def replace(source, destination, *args, **kwargs):
 os.replace = replace
 ''')
         result = self.launch()
-        self.assert_unsaved_answer(result, "forced answer replace failure")
-        fallbacks = list(self.out.parent.glob("answer.unsaved-*.md"))
-        self.assertEqual(len(fallbacks), 1)
-        self.assertRegex(fallbacks[0].name, r"^answer\.unsaved-\d+\.md$")
-        self.assertEqual(fallbacks[0].read_bytes(), b"answer\x00\xff\n")
+        session = self.assert_unsaved_answer(result, "forced answer replace failure")
+        self.assertEqual((session / "answer").read_bytes(), b"answer\x00\xff\n")
         self.assertEqual(list(self.out.parent.glob("answer.saving-*")), [])
         # A later claim must keep the only saved copy of this failed answer.
         self.env.pop("PYTHONPATH")
         self.assertEqual(self.launch().returncode, 7)
-        self.assertEqual(fallbacks[0].read_bytes(), b"answer\x00\xff\n")
+        self.assertEqual((session / "answer").read_bytes(), b"answer\x00\xff\n")
 
     def test_RESULTS_R3_unreadable_answer_is_preserved_after_agent(self):
         self.agent_extra('''
@@ -6063,25 +6232,20 @@ pathlib.Path(args[args.index("-o") + 1]).chmod(0)
 ''')
         self.inject_launcher('''
 import os, pathlib
-original = pathlib.Path.read_bytes
 original_open = os.open
-def read(self):
-    if self.name == "answer" and self.parent.parent.name == "am":
-        raise PermissionError("forced answer read failure")
-    return original(self)
 def open(path, flags, *args, **kwargs):
     path = pathlib.Path(path)
     if path.name == "answer" and path.parent.parent.name == "am":
         raise PermissionError("forced answer read failure")
     return original_open(path, flags, *args, **kwargs)
-pathlib.Path.read_bytes = read
 os.open = open
 ''')
         result = self.launch()
-        self.assert_unsaved_answer(result, "forced answer read failure")
-        fallbacks = list(self.out.parent.glob("answer.unsaved-*.md"))
-        self.assertEqual(len(fallbacks), 1)
-        self.assertEqual(fallbacks[0].read_bytes(), b"answer\n  unchanged\n")
+        session = self.assert_unsaved_answer(result, "forced answer read failure")
+        answer = session / "answer"
+        self.assertEqual(stat.S_IMODE(answer.stat().st_mode), 0)
+        answer.chmod(0o600)
+        self.assertEqual(answer.read_bytes(), b"answer\n  unchanged\n")
 
     def test_RESULTS_R3_write_failure_keeps_answer(self):
         self.inject_launcher('''
@@ -6105,19 +6269,18 @@ def temporary(*args, **kwargs):
 tempfile.NamedTemporaryFile = temporary
 ''')
         result = self.launch()
-        self.assert_unsaved_answer(result, "forced answer write failure: disk full")
-        fallback, = self.out.parent.glob("answer.unsaved-*.md")
-        self.assertEqual(fallback.read_bytes(), b"answer\n  unchanged\n")
+        session = self.assert_unsaved_answer(result, "forced answer write failure: disk full")
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
 
-    def test_RESULTS_R3_readonly_destination_keeps_answer_on_stderr(self):
+    def test_RESULTS_R3_readonly_destination_keeps_answer_in_session(self):
         self.agent_extra(f'''
 pathlib.Path({str(self.out.parent)!r}).chmod(0o555)
 ''')
         self.addCleanup(self.out.parent.chmod, 0o755)
         result = self.launch()
-        self.assert_unsaved_answer(result, "[Errno 13] Permission denied")
-        self.assertIn("Unsaved answer follows on stderr:\nanswer\n  unchanged\n", result.stderr)
-        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
+        session = self.assert_unsaved_answer(result, "[Errno 13] Permission denied")
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
+        self.assertIn(f"; answer left in {session}\n", result.stderr)
 
     def test_RESULTS_R3_signal_inside_popen_stops_spawned_scope(self):
         self.env["SLEEP"] = "1"
@@ -6212,7 +6375,7 @@ os.replace = replace
                     self.assertIn("Result: launch refused\n", output)
                     self.assertIn("allowed only for verifiers", output)
                 else:
-                    self.assertIn("Result: failed: cannot save answer: forced save failure\n", output)
+                    self.assertIn("Result: failed: cannot save answer: forced save failure; answer left in ", output)
                 if outcome == "cleanup":
                     self.assertIn("Cleanup: failed:", output)
 
@@ -6239,15 +6402,6 @@ os.replace = replace
 answer = pathlib.Path(args[args.index("-o") + 1])
 answer.unlink()
 answer.symlink_to({str(secret)!r})
-''')
-        self.inject_launcher('''
-import pathlib
-original = pathlib.Path.read_bytes
-def read(self):
-    if self.name == "answer" and self.parent.parent.name == "am":
-        raise PermissionError("forced answer read failure")
-    return original(self)
-pathlib.Path.read_bytes = read
 ''')
         result = self.launch()
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -6350,23 +6504,12 @@ def rmtree(path, *args, **kwargs):
         raise RuntimeError("secondary cleanup error")
     return original_rmtree(path, *args, **kwargs)
 subprocess.Popen, shutil.rmtree = spawn, rmtree
-original_read, original_exists = pathlib.Path.read_bytes, pathlib.Path.exists
-def read(self):
-    if self.name == "answer" and self.parent.parent.name == "am":
-        raise RuntimeError("secondary answer error")
-    return original_read(self)
-def exists(self):
-    if self.name == "answer" and self.parent.parent.name == "am":
-        return True
-    return original_exists(self)
-pathlib.Path.read_bytes, pathlib.Path.exists = read, exists
 ''')
         result = self.launch()
         self.assertEqual(result.returncode, 2, result.stderr)
         output = self.out.read_text()
         self.assertIn("Reason: original launch refusal\n", output)
         self.assertIn("Cleanup: failed:", output)
-        self.assertNotIn("secondary answer error", output)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_RESULTS_R5_first_signal_during_main_exception_keeps_original_reason(self):
@@ -6586,8 +6729,9 @@ os.replace = replace
         self.assertEqual(result.returncode, 143, result.stderr)
         self.assertIn("Result: failed: cannot save answer:", self.out.read_text())
         self.assertEqual(self.out.read_text().count("End UTC:"), 1)
-        fallback, = self.out.parent.glob("answer.unsaved-*.md")
-        self.assertEqual(fallback.read_bytes(), b"answer\n  unchanged\n")
+        session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
+        self.assertEqual(list(self.out.parent.glob("answer.unsaved-*")), [])
 
     def test_RESULTS_R3_interrupted_header_and_double_signal_are_complete(self):
         self.inject_launcher(f'''
