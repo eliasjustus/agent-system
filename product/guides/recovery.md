@@ -28,8 +28,9 @@ Send all open findings together, grouped into one repair plan per cause, not per
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios before the repair, and have the builder exercise them before handing back,
 rather than letting verification find them one at a time. When a second case of the same failure
-appears, first write down the expected result for each case that shares the cause (not every state of the
-system), including what must keep working, as a table or an executable reference the verifier may challenge; then repair. After a
+appears, first write down the expected result for each case that shares the cause (not every
+state of the system), including what must keep working, as a table or an executable reference the
+verifier may challenge; then repair. After a
 repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was
 mistaken.
