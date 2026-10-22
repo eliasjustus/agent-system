@@ -142,8 +142,10 @@ def diagnostic(message, *, end="\n"):
 
 
 def header_value(value):
-    return "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
-                   for char in str(value))
+    rendered = "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
+                       for char in str(value))
+    # Keep all launcher fields, including a refusal's Result, within the 64 KiB scan.
+    return rendered if len(rendered) <= 4096 else rendered[:4093] + "..."
 
 
 def wait_for_room():
@@ -227,6 +229,60 @@ def open_result(path, flags, mode):
         raise
 
 
+def verifier_round(out):
+    count, newest = 0, 0
+    decision = out.parent / "round-decision.md"
+    # Read the preceding answer before claim() archives it or writes our marker.
+    for path in out.parent.iterdir():
+        if (path == decision or path.name.endswith("-evidence") or ".saving-" in path.name
+                or path.suffix in (".log", ".lock")):
+            continue
+        try:
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError("not a regular, singly linked result file")
+            with open_result(path, os.O_RDONLY, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if info.st_nlink != 1:
+                    raise OSError("not a singly linked result file")
+                fields, remaining = {}, 65536
+                while remaining:
+                    line = stream.readline(remaining)
+                    remaining -= len(line)
+                    if line in (b"", b"\n", b"\r\n"):
+                        break
+                    key, separator, value = line.rstrip(b"\r\n").partition(b": ")
+                    if separator:
+                        fields.setdefault(key, value)
+                else:
+                    raise OSError("header does not end within 65536 bytes")
+            if fields.get(b"Role") == b"verifier" and fields.get(b"Result") != b"launch refused":
+                count += 1
+                newest = max(newest, info.st_mtime_ns)
+        except OSError as error:
+            diagnostic(f"Warning: cannot read round result {path}: {error}")
+    if count < 2:
+        return ""
+    try:
+        if stat.S_ISREG(decision.lstat().st_mode):
+            with open_result(decision, os.O_RDONLY, "r") as stream:
+                if (os.fstat(stream.fileno()).st_mtime_ns > newest
+                        and any(chunk.strip() for chunk in iter(partial(stream.read, 65536), ""))):
+                    return f"Round: {count + 1}; decision: round-decision.md\n"
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError) as error:
+        diagnostic(f"Warning: cannot read round decision {decision}: {error}")
+    raise ValueError(
+        f"{decision} must be a regular file (not a symlink), non-empty after stripping whitespace, "
+        "and modified after the newest counted verifier result. Write one of: the table of cases "
+        "for the failure class (expected result per case, including what must keep working); "
+        "a re-scope or redesign (reducing scope needs the user's yes, per recovery.md); "
+        "or a retry with its reason (environment, contention, flaky check).")
+
+
 def cleanup_failed(what, error):
     if CLEANUP_FAILURES is not None:
         CLEANUP_FAILURES.append(header_value(f"{what}: {error}"))
@@ -255,11 +311,15 @@ class ResultDestination:
         self.signal_code = None
         self.spawning = False
         self.keep_session = False
+        self.round_header = ""
+        self.round_error = None
         mask = os.umask(0)
         os.umask(mask)
         self.mode = 0o666 & ~mask
 
     def claim(self, args):
+        if self.out.name == "round-decision.md":
+            raise ValueError("--out must not replace round-decision.md")
         if self.out == self.out.with_name(self.out.stem + ".lock"):
             raise ValueError("--out must differ from its stem lock path")
         if self.out == self.out.with_suffix(".log"):
@@ -274,6 +334,7 @@ class ResultDestination:
         lockpath = self.out.with_name(self.out.stem + ".lock")
         self.lock = os.fdopen(os.open(lockpath, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
                                       | os.O_NONBLOCK, 0o666), "a")
+        directory_lock = None
         try:
             if not stat.S_ISREG(os.fstat(self.lock.fileno()).st_mode):
                 raise OSError(f"non-regular result lock: {lockpath}")
@@ -283,6 +344,10 @@ class ResultDestination:
                 raise BlockingIOError(f"another launcher owns {self.out}") from None
             if not os.path.samestat(os.fstat(self.lock.fileno()), lockpath.lstat()):
                 raise OSError(f"result lock changed: {lockpath}")
+            # Different stems share the round count. Hold the directory itself
+            # until our marker is visible, including while archiving old results.
+            directory_lock = os.open(self.out.parent, os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(directory_lock, fcntl.LOCK_EX)
             self.start = utc()
             self.header = ((f"Role: {args.role}\n" if args.role is not None else "")
                            + f"Family: {args.family}\n"
@@ -294,6 +359,11 @@ class ResultDestination:
                 if (re.fullmatch(re.escape(self.out.stem) + r"\.saving-[a-z0-9_]{8}", path.name)
                         and not path.is_dir()):
                     path.unlink()
+            if args.role == "verifier":
+                try:
+                    self.round_header = verifier_round(self.out)
+                except ValueError as error:
+                    self.round_error = error
             paths = (self.out, self.out.with_suffix(".log"),
                      self.out.with_name(self.out.stem + "-evidence"))
             # All launchers sharing these siblings hold the same stem lock.
@@ -316,6 +386,9 @@ class ResultDestination:
             if not self.claimed:
                 self.lock.close()
             raise
+        finally:
+            if directory_lock is not None:
+                os.close(directory_lock)
 
     def write(self, contents):
         # A sibling temporary file keeps replacement on the same filesystem.
@@ -422,7 +495,7 @@ class ResultDestination:
                 status = ""
                 if self.pending_cleanup or CLEANUP_FAILURES:
                     cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
-                    status += f"\nCleanup: {cleanup}"
+                    status += f"\nCleanup: {header_value(cleanup)}"
                 if self.signal_code is not None:
                     status += f"\nSignal: {self.signal_code - 128}"
                 before, separator, after = header.rpartition("\nExit code:")
@@ -1325,6 +1398,10 @@ def launch(parser, args, result):
         parser.error("--timeout must be positive")
     if args.role == "verifier" and args.before is None:
         parser.error("verifier requires --before <commit> or --before none")
+    if result.round_error is not None:
+        raise result.round_error
+    round_header = result.round_header
+    result.header += round_header
     brief = args.brief.expanduser().read_text()
     private = Path(args.private).expanduser().resolve()
     repo, out = args.repo.expanduser().resolve(), result.out
@@ -1428,7 +1505,7 @@ def launch(parser, args, result):
     leases = []
     admission = wait_for_room() if args.role in ("builder", "verifier") else ""
     if admission:
-        result.header += admission + "\n"
+        result.header += header_value(admission) + "\n"
     root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -1458,7 +1535,8 @@ def launch(parser, args, result):
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
-                             f"Executable: {header_value(executable)}\n"
+                             + round_header
+                             + f"Executable: {header_value(executable)}\n"
                              + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
                                 f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
@@ -1468,10 +1546,10 @@ def launch(parser, args, result):
                              + (f"Snapshot commit: {snapshot}\n" if review else "")
                              + (header_value(checkout_note) + "\n" if checkout_note else "")
                              + (header_value(before_note) + "\n" if before_note else "")
-                             + (f"Preflight: {preflight}\n" if args.role == "verifier" else "")
-                             + (untracked_note + "\n" if untracked_note else "")
-                             + (admission + "\n" if admission else "")
-                             + (f"Skipped untracked (>5 MB): {', '.join(header_value(path) for path in skipped)}\n" if skipped else "")
+                             + (f"Preflight: {header_value(preflight)}\n" if args.role == "verifier" else "")
+                             + (header_value(untracked_note) + "\n" if untracked_note else "")
+                             + (header_value(admission) + "\n" if admission else "")
+                             + (f"Skipped untracked (>5 MB): {header_value(', '.join(skipped))}\n" if skipped else "")
                              + f"Write bytes: {writes}\nStart UTC: {start}\n")
         update_header()
         def supervised(command):
