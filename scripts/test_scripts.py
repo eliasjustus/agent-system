@@ -143,6 +143,11 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_MODEL", None)
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
+        # Ordinary launcher tests must not depend on this host's current load.
+        for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
+                            "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
+                            "MAX_WAIT": "0"}.items():
+            self.env["AGENT_ADMISSION_" + name] = value
         self.configure_scope()
 
     def configure_scope(self, present=True):
@@ -275,6 +280,370 @@ class ScriptsTest(unittest.TestCase):
                      if path.is_file())
         os.utime(decision, ns=(newest + 1, newest + 1))
 
+    def install_preflight(self, body):
+        path = self.repo / ".agents/preflight"
+        path.parent.mkdir(exist_ok=True)
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        path.write_text(f"#!{sys.executable}\nimport json, os, pathlib, subprocess, sys, time\n" + body + "\n")
+        path.chmod(0o755)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "preflight fixture")
+        return path
+
+    def assert_preflight_refused(self, result, reason):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        answer = self.out.read_text()
+        self.assertIn("Result: launch refused\n", answer)
+        self.assertIn(f"Reason: {reason}\n", answer)
+        self.assertFalse(self.record.exists(), "verifier started after refused preflight")
+        for lockpath in self.pool_root().glob("slot-*.lock"):
+            with lockpath.open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def blocking_preflight(self):
+        marker = self.base / "preflight.json"
+        self.install_preflight(f'''
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+pathlib.Path({str(marker)!r}).write_text(json.dumps({{
+    "pids": [os.getpid(), child.pid], "cwd": str(pathlib.Path.cwd()), "tmpdir": os.environ["TMPDIR"]}}))
+time.sleep(60)
+''')
+        return marker
+
+    def wait_preflight(self, marker):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if marker.exists():
+                try:
+                    return json.loads(marker.read_text())
+                except json.JSONDecodeError:
+                    pass
+            time.sleep(0.02)
+        self.fail("preflight did not start")
+
+    def test_PREFLIGHT_P1_failure_saves_full_log_last_50_lines_and_releases_leases(self):
+        self.install_preflight('''
+for number in range(80):
+    print(f"line {number}", file=sys.stdout if number % 2 else sys.stderr, flush=True)
+sys.exit(7)
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--before", "HEAD")
+        self.assert_preflight_refused(result, ".agents/preflight exited 7")
+        lines = [f"line {number}" for number in range(80)]
+        self.assertEqual(self.out.with_suffix(".log").read_text().splitlines(), lines)
+        self.assertEqual(self.out.read_text().split("\n\n", 1)[1].splitlines(), lines[-50:])
+        self.assertEqual(list((self.home / ".cache/am").iterdir()), [])
+
+    def test_PREFLIGHT_P2_pass_preserves_build_output_checkout_and_temporary_folder(self):
+        marker = self.base / "preflight.json"
+        self.install_preflight(f'''
+import fcntl
+with pathlib.Path.cwd().with_suffix(".lock").open("a+b") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError("preflight ran without a lease")
+pathlib.Path("ignored").write_text("built by preflight")
+pathlib.Path({str(marker)!r}).write_text(json.dumps({{
+    "cwd": str(pathlib.Path.cwd()), "tmpdir": os.environ["TMPDIR"]}}))
+print("preflight stdout", flush=True)
+print("preflight stderr", file=sys.stderr, flush=True)
+''')
+        self.agent_extra('record["built"] = (cwd / "ignored").read_text()\n'
+                         'pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))')
+        self.env["SESSION_STDERR"] = "agent stderr"
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family)
+                built = json.loads(marker.read_text())
+                self.assertEqual(record["built"], "built by preflight")
+                self.assertEqual((record["cwd"], record["tmpdir"]), (built["cwd"], built["tmpdir"]))
+                self.assertNotEqual(record["cwd"], str(self.repo))
+                self.assertRegex(self.out.read_text(), r"(?m)^Preflight: passed in [0-9.]+ s$")
+                self.assertEqual(self.out.with_suffix(".log").read_text().splitlines(),
+                                 ["preflight stdout", "preflight stderr", "agent stderr"])
+                self.assertFalse((self.repo / "ignored").exists())
+
+    def test_PREFLIGHT_P3_P5_absent_candidate_ignores_untracked_preflight(self):
+        path = self.repo / ".agents/preflight"
+        path.parent.mkdir()
+        path.write_text(f"#!{sys.executable}\nraise SystemExit(9)\n")
+        path.chmod(0o755)
+        record = self.verifier()
+        self.assertIn("Preflight: none\n", self.out.read_text())
+        self.assertIn("'.agents/preflight'", self.out.read_text())
+        self.assertFalse((Path(record["cwd"]) / ".agents/preflight").exists())
+
+    def test_PREFLIGHT_P2_planted_answer_links_are_never_truncated(self):
+        target = self.base / "answer-target"
+        for family in ("codex", "claude"):
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(family=family, kind=kind):
+                    target.write_text("keep these bytes")
+                    self.record.unlink(missing_ok=True)
+                    self.install_preflight(f'''
+session = pathlib.Path(os.environ["TMPDIR"]).parent
+if {kind!r} == "symlink":
+    (session / "answer").symlink_to({str(target)!r})
+else:
+    os.link({str(target)!r}, session / "answer")
+''')
+                    result = self.launch("verifier", family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(target.read_text(), "keep these bytes")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Result: launch refused\n", self.out.read_text())
+                    self.assertIn("File exists:", self.out.read_text())
+                    self.assertFalse(self.record.exists())
+
+    def test_PREFLIGHT_P1_header_like_output_keeps_late_signal_in_header(self):
+        output = "preflight output\nExit code: 7\nSignal: 1\nCleanup: forged\n"
+        self.install_preflight(f'print({output!r}, end="", flush=True)\nsys.exit(7)')
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    contents = pathlib.Path(source).read_bytes() if ".saving-" in str(source) else b""
+    value = original(source, destination, *args, **kwargs)
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in contents):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return value
+os.replace = replace
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        header, body = self.out.read_text().split("\n\n", 1)
+        self.assertIn("\nSignal: 15\nExit code: 2", header)
+        self.assertIn("Result: launch refused\nReason: .agents/preflight exited 7\n", header)
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(body, output)
+        self.assertEqual(self.out.with_suffix(".log").read_text(), output)
+        self.assertFalse(self.record.exists())
+
+    def test_PREFLIGHT_P2_planted_log_links_cannot_redirect_agent_writes(self):
+        target = self.base / "log-target"
+        marker = self.base / "preflight-ran"
+        self.env["SESSION_STDERR"] = "agent stderr"
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                target.write_text("keep these bytes")
+                marker.unlink(missing_ok=True)
+                self.install_preflight(f'''
+path = pathlib.Path({str(self.out.with_suffix('.log'))!r})
+path.unlink()
+if {kind!r} == "symlink":
+    path.symlink_to({str(target)!r})
+else:
+    os.link({str(target)!r}, path)
+pathlib.Path({str(marker)!r}).touch()
+''')
+                self.verifier()
+                self.assertTrue(marker.exists(), "preflight did not run")
+                self.assertEqual(target.read_text(), "keep these bytes")
+
+    def test_PREFLIGHT_P4_timeout_stops_detached_descendants(self):
+        marker = self.blocking_preflight()
+        self.env["AGENT_PREFLIGHT_TIMEOUT"] = "0.5"
+        process = self.start_launcher("--timeout", "10")
+        record = self.wait_preflight(marker)
+        _, stderr = process.communicate(timeout=10)
+        self.assert_preflight_refused(subprocess.CompletedProcess([], process.returncode, stderr=stderr),
+                                      ".agents/preflight timed out after 0.5 s")
+        for pid in record["pids"]:
+            self.assertFalse(Path(f"/proc/{pid}").exists(), "preflight descendant survived timeout")
+
+    def test_PREFLIGHT_P4_agent_timeout_excludes_preflight_time(self):
+        self.install_preflight('time.sleep(0.5)\nprint("finished preflight")')
+        self.verifier("codex", "--timeout", "0.3")
+        self.assertRegex(self.out.read_text(), r"Preflight: passed in [0-9.]+ s")
+
+    def test_PREFLIGHT_P5_committed_script_runs_after_source_changes_during_lease(self):
+        marker = self.base / "committed-script"
+        path = self.install_preflight(f'pathlib.Path({str(marker)!r}).write_text(str(pathlib.Path.cwd()))')
+        self.inject_launcher(f'''
+import pathlib, subprocess
+original = subprocess.check_output
+def change_source(command, *args, **kwargs):
+    if "worktree" in command and "add" in command:
+        pathlib.Path({str(path)!r}).write_text("#!{sys.executable}\\nraise SystemExit(8)\\n")
+    return original(command, *args, **kwargs)
+subprocess.check_output = change_source
+''')
+        record = self.verifier()
+        self.assertTrue(marker.exists(), "committed preflight did not run")
+        self.assertEqual(marker.read_text(), record["cwd"])
+        self.assertIn("raise SystemExit(8)", path.read_text())
+
+    def test_PREFLIGHT_P6_signals_hold_lease_until_descendants_are_gone(self):
+        marker = self.blocking_preflight()
+        for scoped in (True, False):
+            self.configure_scope(present=scoped)
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGKILL):
+                with self.subTest(scoped=scoped, signal=sig):
+                    marker.unlink(missing_ok=True)
+                    process = self.start_launcher()
+                    record = self.wait_preflight(marker)
+                    slot = Path(record["cwd"])
+                    with slot.with_suffix(".lock").open("a+b") as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        process.send_signal(sig)
+                        deadline = time.monotonic() + 10
+                        while True:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except BlockingIOError:
+                                if time.monotonic() >= deadline:
+                                    self.fail("preflight did not release lease after signal")
+                                time.sleep(0.02)
+                        for pid in record["pids"]:
+                            self.assertFalse(Path(f"/proc/{pid}").exists(),
+                                             "preflight descendant survived lease release")
+                    process.communicate(timeout=10)
+                    self.assertFalse(self.record.exists())
+                    if sig != signal.SIGKILL:
+                        self.assertEqual(process.returncode, 128 + sig)
+                        self.assertIn(f"Signal: {sig}\n", self.out.read_text())
+                    deadline = time.monotonic() + 5
+                    while Path(record["tmpdir"]).parent.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(Path(record["tmpdir"]).parent.exists())
+
+    def test_PREFLIGHT_P6_sigkill_fallback_supervises_descendants_too(self):
+        marker = self.blocking_preflight()
+        self.busy_pool()
+        self.configure_scope(present=False)
+        process = self.start_launcher()
+        record = self.wait_preflight(marker)
+        process.kill()
+        process.communicate(timeout=10)
+        deadline = time.monotonic() + 5
+        while Path(record["tmpdir"]).parent.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        for pid in record["pids"]:
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+        self.assertFalse(Path(record["tmpdir"]).parent.exists())
+        self.assertFalse(self.record.exists())
+
+    def test_PREFLIGHT_P7_other_roles_never_run_project_preflight(self):
+        marker = self.base / "preflight-ran"
+        self.install_preflight(f'pathlib.Path({str(marker)!r}).touch()')
+        for role in ("builder", "investigator", "challenger", "reviewer"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    extra = ("--author-family", "claude" if family == "codex" else "codex")
+                    result = self.launch(role, family, *extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(marker.exists())
+                    self.assertNotIn("Preflight:", self.out.read_text())
+        self.verifier()
+        self.assertTrue(marker.exists(), "verifier did not run preflight")
+
+    def test_PREFLIGHT_P8_tracked_or_index_changes_refuse_agent(self):
+        for change in (
+                'pathlib.Path("tracked").write_text("rewritten")',
+                'subprocess.check_call(["git", "update-index", "--assume-unchanged", "tracked"])\n'
+                'pathlib.Path("tracked").write_text("rewritten")',
+                'pathlib.Path("added").write_text("new tracked file")\n'
+                'subprocess.check_call(["git", "add", "added"])',
+                'subprocess.check_call(["git", "read-tree", "--empty"])',
+                'subprocess.check_call(["git", "checkout", "--detach", "HEAD^"])',
+                'pathlib.Path("tracked").chmod(0o755)',
+                'pathlib.Path("tracked").rename("ignored")\n'
+                'pathlib.Path("tracked").symlink_to("ignored")',
+                'os.link("tracked", "ignored")',
+                'pathlib.Path(".agents").rename("ignored")\n'
+                'pathlib.Path(".agents").symlink_to("ignored", target_is_directory=True)'):
+            with self.subTest(change=change):
+                self.install_preflight(change)
+                result = self.launch("verifier", "codex", "--author-family", "claude", "--clean-checkout")
+                self.assert_preflight_refused(result, "preflight changed tracked files")
+
+    def test_PREFLIGHT_P9_existing_refusals_precede_project_commands(self):
+        marker = self.base / "preflight-ran"
+        self.install_preflight(f'pathlib.Path({str(marker)!r}).touch()')
+        (self.repo / "tracked").write_text("uncommitted")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("commit first", self.out.read_text())
+        self.assertFalse(marker.exists())
+        (self.repo / "tracked").write_text("original")
+        for extra, reason in ((("--timeout", "0"), "--timeout must be positive"),
+                              (("--unknown",), "unrecognized arguments")):
+            result = self.launch("verifier", "codex", "--author-family", "claude", *extra)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(reason, self.out.read_text())
+            self.assertFalse(marker.exists())
+        executable = self.env["AGENT_CODEX_CMD"]
+        self.env["AGENT_CODEX_CMD"] = str(self.base / "missing")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Cannot find agent executable", self.out.read_text())
+        self.assertFalse(marker.exists())
+        self.env["AGENT_CODEX_CMD"] = executable
+        unborn = self.base / "unborn"
+        subprocess.check_call(["git", "init", "-q", str(unborn)], env=self.env)
+        shutil.copytree(self.repo / ".agents", unborn / ".agents")
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--repo", str(unborn))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("committed candidate", self.out.read_text())
+        self.assertFalse(marker.exists())
+        self.verifier()
+        self.assertTrue(marker.exists(), "valid candidate's preflight did not run")
+
+    def test_PREFLIGHT_P10_nonexecutable_symlink_and_directory_are_refused(self):
+        for kind, reason in (("nonexecutable", "is not executable"),
+                             ("symlink", "is not a regular file"),
+                             ("directory", "is not a regular file")):
+            with self.subTest(kind=kind):
+                path = self.install_preflight("raise SystemExit(99)")
+                if kind == "nonexecutable":
+                    path.chmod(0o644)
+                elif kind == "symlink":
+                    path.unlink()
+                    path.symlink_to(self.env["AGENT_CODEX_CMD"])
+                else:
+                    path.unlink()
+                    path.mkdir()
+                    (path / "child").touch()
+                self.git("add", "-A")
+                self.git("commit", "-qm", kind)
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assert_preflight_refused(result, f".agents/preflight {reason}")
+
+    def test_PREFLIGHT_P11_all_lease_routes_run_only_candidate(self):
+        marker = self.base / "preflight-runs"
+        self.install_preflight(f'''
+with pathlib.Path({str(marker)!r}).open("a") as stream:
+    stream.write(str(pathlib.Path.cwd()) + "\\n")
+pathlib.Path("ignored").write_text("candidate build")
+''')
+        record = self.verifier("codex", "--before", "HEAD")
+        self.assertTrue(marker.exists(), "fresh candidate did not run preflight")
+        self.assertEqual(marker.read_text().splitlines(), [record["cwd"]])
+        before = Path(next(line.split(": ", 1)[1].split(" (")[0] for line in self.out.read_text().splitlines()
+                           if line.startswith("Before checkout:")))
+        self.assertFalse((before / "ignored").exists(), "before checkout ran preflight")
+        slot = Path(record["cwd"])
+        self.hold_other_pool_slots(slot)
+        for extra, note in (((), "warm reset"), (("--clean-checkout",), "deep clean")):
+            record = self.verifier("codex", *extra)
+            self.assertIn(note, self.out.read_text())
+            self.assertEqual(record["cwd"], str(slot))
+        with slot.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = self.verifier()
+            self.assertIn("pool busy or slots unusable", self.out.read_text())
+            self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
+        runs = marker.read_text().splitlines()
+        self.assertEqual(runs, [str(slot)] * 3 + [record["cwd"]])
+
     def seed_pool(self, commits):
         slots = []
         with ExitStack() as held:
@@ -294,6 +663,197 @@ record["status"] = subprocess.check_output(["git", "status", "--porcelain", "--i
 record["files"] = sorted(str(p.relative_to(cwd)) for p in cwd.rglob("*") if p.is_file())
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
+
+    def admission_fixture(self, phases, *, hook="", max_wait="1800"):
+        for name in list(self.env):
+            if name.startswith("AGENT_ADMISSION_"):
+                del self.env[name]
+        self.env["AGENT_ADMISSION_MAX_WAIT"] = max_wait
+        self.admission_events = self.base / "admission-events.json"
+        self.inject_launcher(f'''
+import json, pathlib, subprocess, time
+phases = {phases!r}
+clock = [0]
+events = []
+events_path = pathlib.Path({str(self.admission_events)!r})
+events_path.write_text(json.dumps(events))
+original_read = pathlib.Path.read_text
+def read(path, *args, **kwargs):
+    name = str(path)
+    if name.startswith(("/proc/pressure/", "/sys/fs/cgroup/")) or name in ("/proc/meminfo", "/proc/self/cgroup"):
+        value = phases[min(len(events), len(phases) - 1)].get(name)
+        if value is None:
+            raise PermissionError(name)
+        return value
+    return original_read(path, *args, **kwargs)
+pathlib.Path.read_text = read
+time.monotonic = lambda: clock[0]
+def sleep(seconds):
+    events.append(seconds)
+    events_path.write_text(json.dumps(events))
+    clock[0] += seconds
+{textwrap.indent(textwrap.dedent(hook), '    ')}
+time.sleep = sleep
+''')
+
+    def test_ADMISSION_A1_low_pressure_starts_immediately(self):
+        self.admission_fixture([{"/proc/pressure/memory": "some avg10=0\nfull avg10=0\n"}])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Admission: waited 0 s\n", self.out.read_text())
+        self.assertEqual(json.loads(self.admission_events.read_text()), [])
+
+    def test_ADMISSION_A2_each_threshold_waits_until_all_are_below(self):
+        service = "/user.slice/user-4242.slice/user@4242.service"
+        slice_path = "/sys/fs/cgroup" + service + "/agents.slice/"
+        readings = [
+            {"/proc/pressure/memory": "some avg10=5\n"},
+            {"/proc/pressure/memory": "full avg10=2\n"},
+            {"/proc/pressure/io": "full avg10=10\n"},
+            {"/proc/meminfo": "MemAvailable: 8388607 kB\n"},
+            {"/proc/meminfo": "SwapTotal: 100 kB\nSwapFree: 9 kB\n"},
+            {"/proc/self/cgroup": "0::" + service + "/agents.slice/agent.scope\n",
+             slice_path + "memory.high": str(8 * 1024**3),
+             slice_path + "memory.current": str(4 * 1024**3 + 1)},
+        ]
+        low = {"/proc/pressure/memory": "some avg10=4.99\nfull avg10=1.99\n",
+               "/proc/pressure/io": "full avg10=9.99\n",
+               "/proc/meminfo": "MemAvailable: 8388608 kB\nSwapTotal: 100 kB\nSwapFree: 10 kB\n",
+               "/proc/self/cgroup": "0::" + service + "/agent.scope\n",
+               slice_path + "memory.high": str(8 * 1024**3),
+               slice_path + "memory.current": str(4 * 1024**3)}
+        for reading in readings:
+            with self.subTest(reading=reading):
+                # Retain the service discovery path in the first sample too.
+                first = dict(low, **reading)
+                self.admission_fixture([first, first, low])
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()), [10, 10])
+                self.assertIn("Admission: waited 20 s\n", self.out.read_text())
+
+    def test_ADMISSION_A2_threshold_overrides_and_cgroup_fallback(self):
+        slice_path = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/agents.slice/"
+        cases = [("MEMORY_SOME", {"/proc/pressure/memory": "some avg10=1\n"}, "0.5"),
+                 ("MEMORY_FULL", {"/proc/pressure/memory": "full avg10=1\n"}, "0.5"),
+                 ("IO_FULL", {"/proc/pressure/io": "full avg10=1\n"}, "0.5"),
+                 ("MEM_AVAILABLE", {"/proc/meminfo": "MemAvailable: 1 kB\n"}, "2048"),
+                 ("SWAP_FREE", {"/proc/meminfo": "SwapTotal: 100 kB\nSwapFree: 50 kB\n"}, "60"),
+                 ("CGROUP_HEADROOM", {slice_path + "memory.high": "4096",
+                                       slice_path + "memory.current": "2048"}, "4096")]
+        for name, reading, limit in cases:
+            with self.subTest(name=name):
+                self.admission_fixture([reading], max_wait="10")
+                self.env["AGENT_ADMISSION_" + name] = limit
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+                self.assertIn("Admission: started under pressure after 10 s (" + name + "=", self.out.read_text())
+
+    def test_ADMISSION_A3_deadline_does_not_restart_when_readings_fluctuate(self):
+        first = {"/proc/pressure/memory": "some avg10=7\n"}
+        second = {"/proc/pressure/io": "full avg10=11\n"}
+        self.admission_fixture([first, second, first, second], max_wait="25")
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10, 10, 5])
+        self.assertIn("Admission: started under pressure after 25 s (IO_FULL=11)\n", self.out.read_text())
+        self.admission_fixture([first])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(json.loads(self.admission_events.read_text())), 1800)
+        self.assertIn("Admission: started under pressure after 1800 s (MEMORY_SOME=7)\n", self.out.read_text())
+
+    def test_ADMISSION_A4_missing_malformed_and_partial_information(self):
+        for reading in ({}, {"/proc/pressure/memory": "some avg10=garbage\nfull avg10=nan\n",
+                              "/proc/meminfo": "MemAvailable: broken kB\n"}):
+            with self.subTest(reading=reading):
+                self.admission_fixture([reading])
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Admission: unavailable\n", self.out.read_text())
+                self.assertEqual(json.loads(self.admission_events.read_text()), [])
+        self.admission_fixture([{"/proc/pressure/memory": "some avg10=broken\nfull avg10=2\n"},
+                                {"/proc/meminfo": "SwapTotal: 0 kB\nSwapFree: 0 kB\nMemAvailable: 8388608 kB\n"}])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+
+    def test_ADMISSION_A5_wait_has_no_leases_or_pool_changes(self):
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--before", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pool = self.pool_root()
+        snapshot = {str(path): path.read_bytes() for path in pool.rglob("*") if path.is_file()}
+        self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                {"/proc/pressure/io": "full avg10=0\n"}], hook=f'''
+import fcntl
+assert not pathlib.Path({str(self.record)!r}).exists(), "agent started while waiting"
+pool = pathlib.Path({str(pool)!r})
+assert {{str(path): path.read_bytes() for path in pool.rglob("*") if path.is_file()}} == {snapshot!r}
+for path in pool.glob("*.lock"):
+    with path.open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+''')
+        self.record.unlink()
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--before", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+        self.assertIn("Before checkout:", self.out.read_text())
+
+    def test_ADMISSION_A6_signals_while_waiting_record_interruption(self):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            for role in ("builder", "verifier"):
+                with self.subTest(sig=sig, role=role):
+                    if role == "verifier":
+                        self.round_decision()
+                    self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"}],
+                                           hook=f"import os, signal\nos.kill(os.getpid(), {int(sig)})")
+                    result = self.launch(role, "codex", *(["--author-family", "claude", "--before", "HEAD"]
+                                                         if role == "verifier" else []))
+                    self.assertEqual(result.returncode, 128 + sig, result.stderr)
+                    output = self.out.read_text()
+                    self.assertIn("Result: interrupted\n", output)
+                    self.assertIn(f"Signal: {sig}\n", output)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(self.pool_root().exists())
+
+    def test_ADMISSION_A7_only_builders_and_verifiers_wait(self):
+        for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+            with self.subTest(role=role):
+                self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                        {"/proc/pressure/io": "full avg10=0\n"}])
+                result = self.launch(role, "codex", *(["--author-family", "claude"]
+                                                     if role in ("verifier", "challenger", "reviewer") else []))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()),
+                                 [10] if role in ("builder", "verifier") else [])
+
+    def test_ADMISSION_A8_wait_does_not_spend_agent_timeout(self):
+        self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                {"/proc/pressure/io": "full avg10=0\n"}])
+        result = self.launch("builder", "codex", "--timeout", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+        self.assertIn("answer\n  unchanged\n", self.out.read_text())
+
+    def test_ADMISSION_A9_standalone_gate_reports_and_exits_zero(self):
+        cases = [([{}], "1800", "Admission: unavailable\n"),
+                 ([{"/proc/pressure/io": "full avg10=0\n"}], "1800", "Admission: waited 0 s\n"),
+                 ([{"/proc/pressure/io": "full avg10=10\n"}, {"/proc/pressure/io": "full avg10=0\n"}],
+                  "1800", "Admission: waited 10 s\n"),
+                 ([{"/proc/pressure/io": "full avg10=10\n"}], "10",
+                  "Admission: started under pressure after 10 s (IO_FULL=10)\n")]
+        for phases, maximum, expected in cases:
+            with self.subTest(expected=expected):
+                self.admission_fixture(phases, max_wait=maximum)
+                result = self.run_script("run.py", "--wait-for-room")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, expected)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.pool_root().exists())
 
     def test_POOL_S1_reset_removes_previous_files_and_keeps_ignored_output(self):
         for name in ("gone", "ignored-later"):
@@ -5899,10 +6459,16 @@ for i in range(35):
         self.assertEqual({p.name: p.stat().st_mtime_ns for p in self.pool_root().iterdir()}, pool)
 
     def test_ROUND_R2_refusal_precedes_leasing_and_explains_options(self):
+        marker = self.base / "preflight-ran"
+        self.install_preflight(f'pathlib.Path({str(marker)!r}).touch()')
         self.round_results("Role: verifier\n\nanswer", "Role: verifier\nResult: interrupted\n")
+        self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"}],
+                               hook='raise AssertionError("admission waited before round refusal")')
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assert_launch_refused(result, "round-decision.md")
         self.assertFalse(self.pool_root().exists())
+        self.assertFalse(marker.exists())
+        self.assertEqual(json.loads(self.admission_events.read_text()), [])
         for phrase in ("regular file (not a symlink)", "non-empty after stripping whitespace",
                        "modified after the newest counted verifier result", "table of cases",
                        "expected result per case", "what must keep working", "re-scope or redesign",

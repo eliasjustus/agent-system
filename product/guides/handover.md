@@ -6,6 +6,7 @@ Give the work to **Codex** when the outcome, design and acceptance checks are se
 assignment is self-contained. Otherwise give it to a **Claude** builder. Above the floor you never
 build yourself. Builders never delegate further, commit, push or publish, and never read the
 private folder.
+Builders run the project's `.agents/preflight`, if present, before handing back.
 
 ## Briefs
 
@@ -18,8 +19,12 @@ Verifiers, challengers and reviewers run in their own session, from the other mo
 the author of what they check. Commit the candidate before sending a verifier: the launcher
 `{{METHOD}}/run.py` refuses tracked changes, leases a clean detached checkout at the committed
 HEAD captured at startup, and leaves untracked files out, naming them in the answer's header.
-A forgotten file must fail. Never relay a review through yourself or summarise it before reading
-it in full.
+It runs the candidate's committed `.agents/preflight`, if present, before starting the verifier,
+in the same checkout with build output kept. The file must be regular and executable; a failure,
+timeout or tracked change refuses the launch. The header records `Preflight: passed in <s> s` or
+`Preflight: none`. Full output is in the sibling `.log`, with the last 50 lines in a refusal.
+Preflight has its own 900-second timeout (`AGENT_PREFLIGHT_TIMEOUT`); `--timeout` applies to the
+agent. Only the candidate checkout runs it. Never relay or summarise a review before reading it in full.
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
@@ -54,7 +59,14 @@ Servers also stay enabled when their names cannot be written as bare keys (ASCII
 `_` and `-`); stderr and the header list those names. Other Codex roles keep the user's configured
 environment. Claude sessions use a fixed tool list and no MCP servers.
 
-`--timeout` applies to the agent session. Server discovery adds at most 30 seconds before it.
+Builders and verifiers wait for memory and IO room before taking checkout leases or slot locks;
+investigators, challengers and reviewers never wait. The launcher polls every 10 seconds, waits at
+most 1800 seconds (`AGENT_ADMISSION_MAX_WAIT`), then starts under pressure and records why in the
+`Admission:` header. Missing readings are ignored; without any readings it starts immediately.
+Project build gates use `python3 {{METHOD}}/run.py --wait-for-room` with no other arguments; it
+prints one status line to stderr and exits 0 when room is available, after the maximum wait, or
+when readings are unavailable. Admission does not count against `--timeout`, which applies to the
+agent session. Server discovery adds at most 30 seconds before it.
 The header records the executable and, for Codex, `Requested sandbox:`, `Network:` and
 `Requested environment:`. The requested environment is `restricted` (with any MCP fallback reason)
 or `user configuration`. If snapshot or worktree creation fails before discovery, it is
@@ -63,7 +75,9 @@ alongside the agent's stderr.
 
 For a committed candidate, you can instead create a detached worktree at the exact commit:
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family
-there, give it the role contract and the brief (and `guides/verification.md` for a verifier), and
+there; before a verifier session, run `.agents/preflight` if present, requiring an executable
+regular file, exit 0 and tracked files still matching the candidate. Keep its build output.
+Give the session the role contract and the brief (and `guides/verification.md` for a verifier), and
 save its full answer unedited in the task folder's `results/`. Give a verifier an evidence folder
 and keep its evidence too. A manually started third verification, and each later one, needs the
 same written decision before starting. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for

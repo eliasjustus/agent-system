@@ -79,7 +79,32 @@ answer's header explain that MCP servers were not disabled. Role contracts and t
 (ASCII letters, digits, `_` and `-`); stderr and the header list those names. Other Codex roles
 keep the user's configured environment. Claude sessions use a fixed tool list and no MCP servers.
 
-`--timeout` applies to the agent session. Server discovery adds at most 30 seconds before it.
+Builders and verifiers wait for memory and IO room before leasing checkouts or starting agents,
+polling every 10 seconds. Investigators, challengers and reviewers start without this wait.
+Admission waits at most 1800 seconds (`AGENT_ADMISSION_MAX_WAIT`), then starts under pressure;
+fluctuating readings do not reset the deadline. Missing or malformed readings are ignored, and
+without any readings the session starts immediately. The header records `Admission: waited <s> s`,
+`Admission: unavailable`, or `Admission: started under pressure after <s> s (<reading>)`.
+Project build gates can run `python3 <method>/run.py --wait-for-room` with no other arguments:
+it uses the same wait, prints one status line to stderr, and exits 0 even after the maximum wait
+or when readings are unavailable. `--timeout` applies only to the agent session; admission and
+server discovery (at most 30 seconds) happen before it.
+
+The provisional thresholds below each have an `AGENT_ADMISSION_<NAME>` override. Waiting ends
+when all available readings are below the pressure thresholds or at least the free-space limits.
+Invalid overrides use the defaults; overrides must be finite nonnegative numbers.
+
+| Name | Wait while |
+| --- | --- |
+| `MEMORY_SOME` | `/proc/pressure/memory` some avg10 >= 5 |
+| `MEMORY_FULL` | `/proc/pressure/memory` full avg10 >= 2 |
+| `IO_FULL` | `/proc/pressure/io` full avg10 >= 10 |
+| `MEM_AVAILABLE` | `/proc/meminfo` MemAvailable < 8589934592 bytes (8 GiB) |
+| `SWAP_FREE` | SwapFree < 10 percent of SwapTotal, when SwapTotal > 0 |
+| `CGROUP_HEADROOM` | agents.slice memory.high minus memory.current < 4294967296 bytes (4 GiB), when memory.high is numeric |
+
+The agents slice is found through `/proc/self/cgroup`'s user service, falling back to
+`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
 
 For Codex builders and verifiers, add `--network` when checks need local servers, child processes
 from Node or network access. Without it, the user's network configuration applies. Add
@@ -90,7 +115,7 @@ open extra directories. There is no full-access option because these cover the k
 Challengers and reviewers run on a snapshot of committed, staged and uncommitted files, including
 untracked files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
 the answer's header. Check that list before trusting a review. The answer and its header are saved
-at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
+at `--out`, agent stderr and preflight output in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
 Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
@@ -156,6 +181,18 @@ values are capped at 4 KiB so classification fits within that bound. Symlinks, h
 files and unreadable files are skipped and named on stderr. `--out` cannot name `round-decision.md`:
 that destination is refused on stderr before anything is written or archived.
 See [Recovery](product/guides/recovery.md) for repair briefs and decisions.
+
+If the candidate contains `.agents/preflight`, the launcher runs it in the candidate checkout
+after admission and checkout leasing, before starting the verifier, with the session's temporary folder.
+The round gate refuses before admission or any lease. Use this executable regular file
+for the project's cheap checks. A symlink, directory or nonexecutable file refuses the launch.
+Exit 0 records `Preflight: passed in <s> s`; the verifier receives the same checkout and build
+output. A nonzero exit, timeout or changed tracked files refuses the launch with exit 2, without
+starting an agent. Combined stdout/stderr stays in the sibling `.log`; refusals include its last
+50 lines. The default timeout is 900 seconds (`AGENT_PREFLIGHT_TIMEOUT`), separate from `--timeout`.
+Preflight descendants are stopped before verification or lease release, including after launcher
+signals or death. The before checkout and other roles never run it. Without a committed preflight,
+launching is unchanged and the verifier header says `Preflight: none`.
 
 Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repository hash>/`,
 where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash
@@ -234,7 +271,7 @@ supervisor stops the agent and its descendants, keeps its leases until they are 
 the orphaned session folder. A launcher killed before its lease guard starts can leave its session
 folder under `<cache>/am`; reset Git children inherit its locks and hold them until they exit.
 Sessions without a lease guard (builders, investigators, challengers, reviewers, and verifiers
-using only fresh fallback checkouts) killed outright can also leave their folder and worktree
+using only fresh fallback checkouts without preflight) killed outright can also leave their folder and worktree
 registrations. After confirming their processes have stopped, delete the specific session folder,
 then run `git -C /path/to/project worktree prune` in its repository. Check for unrelated stale
 registrations before pruning.
@@ -276,6 +313,9 @@ For a committed candidate, the manual route is a detached worktree at its exact 
 git worktree add --detach /path/to/checkout COMMIT
 ```
 
+Before a manual verifier session, run `.agents/preflight` if present in that checkout; require an
+executable regular file, exit 0 and tracked files still matching the candidate. Keep its build output
+for verification. Builders also run the project's preflight before handing back.
 Start a fresh session of the other model family in that checkout. Give it the appropriate installed
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
@@ -294,6 +334,7 @@ challenger or reviewer snapshot.
 | `AGENT_CODEX_EFFORT` | Codex reasoning effort; default `high`. Values pass through to the CLI, which rejects unsupported values. |
 | `AGENT_CLAUDE_CMD` | Claude executable name or path; default `claude` |
 | `AGENT_CODEX_CMD` | Codex executable name or path; default `codex` |
+| `AGENT_PREFLIGHT_TIMEOUT` | Verifier preflight timeout in seconds; positive finite number, default `900`. Does not count against `--timeout`. |
 | `XDG_CACHE_HOME` | Session and pool cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `am/<8 random characters>/` beneath it. |
 
 Set the model variable when running setup to change generated Claude builder definitions; rerun
