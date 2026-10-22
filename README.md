@@ -79,7 +79,32 @@ answer's header explain that MCP servers were not disabled. Role contracts and t
 (ASCII letters, digits, `_` and `-`); stderr and the header list those names. Other Codex roles
 keep the user's configured environment. Claude sessions use a fixed tool list and no MCP servers.
 
-`--timeout` applies to the agent session. Server discovery adds at most 30 seconds before it.
+Builders and verifiers wait for memory and IO room before leasing checkouts or starting agents,
+polling every 10 seconds. Investigators, challengers and reviewers start without this wait.
+Admission waits at most 1800 seconds (`AGENT_ADMISSION_MAX_WAIT`), then starts under pressure;
+fluctuating readings do not reset the deadline. Missing or malformed readings are ignored, and
+without any readings the session starts immediately. The header records `Admission: waited <s> s`,
+`Admission: unavailable`, or `Admission: started under pressure after <s> s (<reading>)`.
+Project build gates can run `python3 <method>/run.py --wait-for-room` with no other arguments:
+it uses the same wait, prints one status line to stderr, and exits 0 even after the maximum wait
+or when readings are unavailable. `--timeout` applies only to the agent session; admission and
+server discovery (at most 30 seconds) happen before it.
+
+The provisional thresholds below each have an `AGENT_ADMISSION_<NAME>` override. Waiting ends
+when all available readings are below the pressure thresholds or at least the free-space limits.
+Invalid overrides use the defaults; overrides must be finite nonnegative numbers.
+
+| Name | Wait while |
+| --- | --- |
+| `MEMORY_SOME` | `/proc/pressure/memory` some avg10 >= 5 |
+| `MEMORY_FULL` | `/proc/pressure/memory` full avg10 >= 2 |
+| `IO_FULL` | `/proc/pressure/io` full avg10 >= 10 |
+| `MEM_AVAILABLE` | `/proc/meminfo` MemAvailable < 8589934592 bytes (8 GiB) |
+| `SWAP_FREE` | SwapFree < 10 percent of SwapTotal, when SwapTotal > 0 |
+| `CGROUP_HEADROOM` | agents.slice memory.high minus memory.current < 4294967296 bytes (4 GiB), when memory.high is numeric |
+
+The agents slice is found through `/proc/self/cgroup`'s user service, falling back to
+`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
 
 For Codex builders and verifiers, add `--network` when checks need local servers, child processes
 from Node or network access. Without it, the user's network configuration applies. Add

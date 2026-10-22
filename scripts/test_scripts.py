@@ -143,6 +143,11 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_MODEL", None)
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
+        # Ordinary launcher tests must not depend on this host's current load.
+        for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
+                            "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
+                            "MAX_WAIT": "0"}.items():
+            self.env["AGENT_ADMISSION_" + name] = value
         self.configure_scope()
 
     def configure_scope(self, present=True):
@@ -638,6 +643,195 @@ record["status"] = subprocess.check_output(["git", "status", "--porcelain", "--i
 record["files"] = sorted(str(p.relative_to(cwd)) for p in cwd.rglob("*") if p.is_file())
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
+
+    def admission_fixture(self, phases, *, hook="", max_wait="1800"):
+        for name in list(self.env):
+            if name.startswith("AGENT_ADMISSION_"):
+                del self.env[name]
+        self.env["AGENT_ADMISSION_MAX_WAIT"] = max_wait
+        self.admission_events = self.base / "admission-events.json"
+        self.inject_launcher(f'''
+import json, pathlib, subprocess, time
+phases = {phases!r}
+clock = [0]
+events = []
+events_path = pathlib.Path({str(self.admission_events)!r})
+events_path.write_text(json.dumps(events))
+original_read = pathlib.Path.read_text
+def read(path, *args, **kwargs):
+    name = str(path)
+    if name.startswith(("/proc/pressure/", "/sys/fs/cgroup/")) or name in ("/proc/meminfo", "/proc/self/cgroup"):
+        value = phases[min(len(events), len(phases) - 1)].get(name)
+        if value is None:
+            raise PermissionError(name)
+        return value
+    return original_read(path, *args, **kwargs)
+pathlib.Path.read_text = read
+time.monotonic = lambda: clock[0]
+def sleep(seconds):
+    events.append(seconds)
+    events_path.write_text(json.dumps(events))
+    clock[0] += seconds
+{textwrap.indent(textwrap.dedent(hook), '    ')}
+time.sleep = sleep
+''')
+
+    def test_ADMISSION_A1_low_pressure_starts_immediately(self):
+        self.admission_fixture([{"/proc/pressure/memory": "some avg10=0\nfull avg10=0\n"}])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Admission: waited 0 s\n", self.out.read_text())
+        self.assertEqual(json.loads(self.admission_events.read_text()), [])
+
+    def test_ADMISSION_A2_each_threshold_waits_until_all_are_below(self):
+        service = "/user.slice/user-4242.slice/user@4242.service"
+        slice_path = "/sys/fs/cgroup" + service + "/agents.slice/"
+        readings = [
+            {"/proc/pressure/memory": "some avg10=5\n"},
+            {"/proc/pressure/memory": "full avg10=2\n"},
+            {"/proc/pressure/io": "full avg10=10\n"},
+            {"/proc/meminfo": "MemAvailable: 8388607 kB\n"},
+            {"/proc/meminfo": "SwapTotal: 100 kB\nSwapFree: 9 kB\n"},
+            {"/proc/self/cgroup": "0::" + service + "/agents.slice/agent.scope\n",
+             slice_path + "memory.high": str(8 * 1024**3),
+             slice_path + "memory.current": str(4 * 1024**3 + 1)},
+        ]
+        low = {"/proc/pressure/memory": "some avg10=4.99\nfull avg10=1.99\n",
+               "/proc/pressure/io": "full avg10=9.99\n",
+               "/proc/meminfo": "MemAvailable: 8388608 kB\nSwapTotal: 100 kB\nSwapFree: 10 kB\n",
+               "/proc/self/cgroup": "0::" + service + "/agent.scope\n",
+               slice_path + "memory.high": str(8 * 1024**3),
+               slice_path + "memory.current": str(4 * 1024**3)}
+        for reading in readings:
+            with self.subTest(reading=reading):
+                # Retain the service discovery path in the first sample too.
+                first = dict(low, **reading)
+                self.admission_fixture([first, first, low])
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()), [10, 10])
+                self.assertIn("Admission: waited 20 s\n", self.out.read_text())
+
+    def test_ADMISSION_A2_threshold_overrides_and_cgroup_fallback(self):
+        slice_path = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/agents.slice/"
+        cases = [("MEMORY_SOME", {"/proc/pressure/memory": "some avg10=1\n"}, "0.5"),
+                 ("MEMORY_FULL", {"/proc/pressure/memory": "full avg10=1\n"}, "0.5"),
+                 ("IO_FULL", {"/proc/pressure/io": "full avg10=1\n"}, "0.5"),
+                 ("MEM_AVAILABLE", {"/proc/meminfo": "MemAvailable: 1 kB\n"}, "2048"),
+                 ("SWAP_FREE", {"/proc/meminfo": "SwapTotal: 100 kB\nSwapFree: 50 kB\n"}, "60"),
+                 ("CGROUP_HEADROOM", {slice_path + "memory.high": "4096",
+                                       slice_path + "memory.current": "2048"}, "4096")]
+        for name, reading, limit in cases:
+            with self.subTest(name=name):
+                self.admission_fixture([reading], max_wait="10")
+                self.env["AGENT_ADMISSION_" + name] = limit
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+                self.assertIn("Admission: started under pressure after 10 s (" + name + "=", self.out.read_text())
+
+    def test_ADMISSION_A3_deadline_does_not_restart_when_readings_fluctuate(self):
+        first = {"/proc/pressure/memory": "some avg10=7\n"}
+        second = {"/proc/pressure/io": "full avg10=11\n"}
+        self.admission_fixture([first, second, first, second], max_wait="25")
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10, 10, 5])
+        self.assertIn("Admission: started under pressure after 25 s (IO_FULL=11)\n", self.out.read_text())
+        self.admission_fixture([first])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(json.loads(self.admission_events.read_text())), 1800)
+        self.assertIn("Admission: started under pressure after 1800 s (MEMORY_SOME=7)\n", self.out.read_text())
+
+    def test_ADMISSION_A4_missing_malformed_and_partial_information(self):
+        for reading in ({}, {"/proc/pressure/memory": "some avg10=garbage\nfull avg10=nan\n",
+                              "/proc/meminfo": "MemAvailable: broken kB\n"}):
+            with self.subTest(reading=reading):
+                self.admission_fixture([reading])
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Admission: unavailable\n", self.out.read_text())
+                self.assertEqual(json.loads(self.admission_events.read_text()), [])
+        self.admission_fixture([{"/proc/pressure/memory": "some avg10=broken\nfull avg10=2\n"},
+                                {"/proc/meminfo": "SwapTotal: 0 kB\nSwapFree: 0 kB\nMemAvailable: 8388608 kB\n"}])
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+
+    def test_ADMISSION_A5_wait_has_no_leases_or_pool_changes(self):
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--before", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pool = self.pool_root()
+        snapshot = {str(path): path.read_bytes() for path in pool.rglob("*") if path.is_file()}
+        self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                {"/proc/pressure/io": "full avg10=0\n"}], hook=f'''
+import fcntl
+assert not pathlib.Path({str(self.record)!r}).exists(), "agent started while waiting"
+pool = pathlib.Path({str(pool)!r})
+assert {{str(path): path.read_bytes() for path in pool.rglob("*") if path.is_file()}} == {snapshot!r}
+for path in pool.glob("*.lock"):
+    with path.open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+''')
+        self.record.unlink()
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--before", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.admission_events.read_text()), [10])
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+        self.assertIn("Before checkout:", self.out.read_text())
+
+    def test_ADMISSION_A6_signals_while_waiting_record_interruption(self):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            for role in ("builder", "verifier"):
+                with self.subTest(sig=sig, role=role):
+                    self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"}],
+                                           hook=f"import os, signal\nos.kill(os.getpid(), {int(sig)})")
+                    result = self.launch(role, "codex", *(["--author-family", "claude", "--before", "HEAD"]
+                                                         if role == "verifier" else []))
+                    self.assertEqual(result.returncode, 128 + sig, result.stderr)
+                    output = self.out.read_text()
+                    self.assertIn("Result: interrupted\n", output)
+                    self.assertIn(f"Signal: {sig}\n", output)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(self.pool_root().exists())
+
+    def test_ADMISSION_A7_only_builders_and_verifiers_wait(self):
+        for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+            with self.subTest(role=role):
+                self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                        {"/proc/pressure/io": "full avg10=0\n"}])
+                result = self.launch(role, "codex", *(["--author-family", "claude"]
+                                                     if role in ("verifier", "challenger", "reviewer") else []))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.admission_events.read_text()),
+                                 [10] if role in ("builder", "verifier") else [])
+
+    def test_ADMISSION_A8_wait_does_not_spend_agent_timeout(self):
+        self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
+                                {"/proc/pressure/io": "full avg10=0\n"}])
+        result = self.launch("builder", "codex", "--timeout", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Admission: waited 10 s\n", self.out.read_text())
+        self.assertIn("answer\n  unchanged\n", self.out.read_text())
+
+    def test_ADMISSION_A9_standalone_gate_reports_and_exits_zero(self):
+        cases = [([{}], "1800", "Admission: unavailable\n"),
+                 ([{"/proc/pressure/io": "full avg10=0\n"}], "1800", "Admission: waited 0 s\n"),
+                 ([{"/proc/pressure/io": "full avg10=10\n"}, {"/proc/pressure/io": "full avg10=0\n"}],
+                  "1800", "Admission: waited 10 s\n"),
+                 ([{"/proc/pressure/io": "full avg10=10\n"}], "10",
+                  "Admission: started under pressure after 10 s (IO_FULL=10)\n")]
+        for phases, maximum, expected in cases:
+            with self.subTest(expected=expected):
+                self.admission_fixture(phases, max_wait=maximum)
+                result = self.run_script("run.py", "--wait-for-room")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, expected)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.pool_root().exists())
 
     def test_POOL_S1_reset_removes_previous_files_and_keeps_ignored_output(self):
         for name in ("gone", "ignored-later"):
