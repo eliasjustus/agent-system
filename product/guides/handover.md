@@ -48,7 +48,14 @@ Servers also stay enabled when their names cannot be written as bare keys (ASCII
 `_` and `-`); stderr and the header list those names. Other Codex roles keep the user's configured
 environment. Claude sessions use a fixed tool list and no MCP servers.
 
-`--timeout` applies to the agent session. Server discovery adds at most 30 seconds before it.
+Builders and verifiers wait for memory and IO room before taking checkout leases or slot locks;
+investigators, challengers and reviewers never wait. The launcher polls every 10 seconds, waits at
+most 1800 seconds (`AGENT_ADMISSION_MAX_WAIT`), then starts under pressure and records why in the
+`Admission:` header. Missing readings are ignored; without any readings it starts immediately.
+Project build gates use `python3 {{METHOD}}/run.py --wait-for-room` with no other arguments; it
+prints one status line to stderr and exits 0 when room is available, after the maximum wait, or
+when readings are unavailable. Admission does not count against `--timeout`, which applies to the
+agent session. Server discovery adds at most 30 seconds before it.
 The header records the executable and, for Codex, `Requested sandbox:`, `Network:` and
 `Requested environment:`. The requested environment is `restricted` (with any MCP fallback reason)
 or `user configuration`. If snapshot or worktree creation fails before discovery, it is

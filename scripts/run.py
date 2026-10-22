@@ -12,6 +12,7 @@ from functools import partial
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,11 +22,18 @@ import signal
 import stat
 import subprocess
 import tempfile
+import time
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 POOL_SLOTS = 5
 POOL_USES = 20
+# Provisional admission thresholds; free-space limits are bytes, swap is percent.
+ADMISSION_DEFAULTS = {
+    "MEMORY_SOME": 5, "MEMORY_FULL": 2, "IO_FULL": 10,
+    "MEM_AVAILABLE": 8 * 1024**3, "SWAP_FREE": 10,
+    "CGROUP_HEADROOM": 4 * 1024**3, "MAX_WAIT": 1800,
+}
 GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.splitIndex=false")
 CHECKOUT_CONFIG = ("-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false",
                    "-c", "index.sparse=false", "-c", "core.hooksPath=/dev/null",
@@ -136,6 +144,76 @@ def diagnostic(message, *, end="\n"):
 def header_value(value):
     return "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
                    for char in str(value))
+
+
+def wait_for_room():
+    """Wait without owning checkout resources; missing readings do not block."""
+    def number(value):
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError("not a finite nonnegative number")
+        return parsed
+
+    limits = {}
+    for name, default in ADMISSION_DEFAULTS.items():
+        try:
+            limits[name] = number(os.environ.get("AGENT_ADMISSION_" + name, default))
+        except ValueError:
+            limits[name] = default
+
+    def read(path):
+        try:
+            return Path(path).read_text()
+        except (OSError, UnicodeError):
+            return ""
+
+    cgroup = re.search(r"(/user\.slice/user-\d+\.slice/user@\d+\.service)(?:/|$)",
+                       read("/proc/self/cgroup"))
+    service = (cgroup[1] if cgroup else
+               f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service")
+    slice_path = "/sys/fs/cgroup" + service + "/agents.slice/"
+    started = time.monotonic()
+    while True:
+        readings = {}
+        for resource, kind, name in (("memory", "some", "MEMORY_SOME"),
+                                     ("memory", "full", "MEMORY_FULL"),
+                                     ("io", "full", "IO_FULL")):
+            for line in read("/proc/pressure/" + resource).splitlines():
+                fields = line.split()
+                if fields and fields[0] == kind:
+                    try:
+                        values = dict(field.split("=", 1) for field in fields[1:])
+                        readings[name] = number(values["avg10"])
+                    except (ValueError, KeyError):
+                        pass
+        memory = {}
+        for line in read("/proc/meminfo").splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[2] == "kB":
+                try:
+                    memory[fields[0].removesuffix(":")] = number(fields[1]) * 1024
+                except ValueError:
+                    pass
+        if "MemAvailable" in memory:
+            readings["MEM_AVAILABLE"] = memory["MemAvailable"]
+        if memory.get("SwapTotal", 0) > 0 and "SwapFree" in memory:
+            readings["SWAP_FREE"] = 100 * memory["SwapFree"] / memory["SwapTotal"]
+        try:
+            readings["CGROUP_HEADROOM"] = (number(read(slice_path + "memory.high"))
+                                            - number(read(slice_path + "memory.current")))
+        except ValueError:
+            pass
+        if not readings:
+            return "Admission: unavailable"
+        pressure = [f"{name}={value:g}" for name, value in readings.items()
+                    if (value < limits[name] if name in ("MEM_AVAILABLE", "SWAP_FREE", "CGROUP_HEADROOM")
+                        else value >= limits[name])]
+        elapsed = time.monotonic() - started
+        if not pressure:
+            return f"Admission: waited {int(elapsed)} s"
+        if elapsed >= limits["MAX_WAIT"]:
+            return f"Admission: started under pressure after {int(elapsed)} s ({', '.join(pressure)})"
+        time.sleep(min(10, limits["MAX_WAIT"] - elapsed))
 
 
 def open_result(path, flags, mode):
@@ -1095,7 +1173,11 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
 
 def main():
     global CLEANUP_FAILURES
-    parser = argparse.ArgumentParser(description=__doc__)
+    if sys.argv[1:] == ["--wait-for-room"]:
+        diagnostic(wait_for_room())
+        return 0
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     epilog="Use --wait-for-room alone to wait for memory and IO room for a build gate.")
     parser.add_argument("--role", required=True, choices=("builder", "investigator", "verifier", "challenger", "reviewer"))
     parser.add_argument("--family", required=True, choices=("claude", "codex"))
     parser.add_argument("--brief", required=True, type=Path)
@@ -1340,6 +1422,9 @@ def launch(parser, args, result):
             untracked_note += f"; {len(untracked) - 20} more"
     before = None
     leases = []
+    admission = wait_for_room() if args.role in ("builder", "verifier") else ""
+    if admission:
+        result.header += admission + "\n"
     root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -1376,6 +1461,7 @@ def launch(parser, args, result):
                              + (header_value(checkout_note) + "\n" if checkout_note else "")
                              + (header_value(before_note) + "\n" if before_note else "")
                              + (untracked_note + "\n" if untracked_note else "")
+                             + (admission + "\n" if admission else "")
                              + (f"Skipped untracked (>5 MB): {', '.join(header_value(path) for path in skipped)}\n" if skipped else "")
                              + f"Write bytes: {writes}\nStart UTC: {start}\n")
         update_header()
