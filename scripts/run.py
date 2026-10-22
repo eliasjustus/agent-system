@@ -279,7 +279,7 @@ def verifier_round(out):
         f"{decision} must be a regular file (not a symlink), non-empty after stripping whitespace, "
         "and modified after the newest counted verifier result. Write one of: the table of cases "
         "for the failure class (expected result per case, including what must keep working); "
-        "a re-scope or redesign (reducing scope needs the user's yes, per recovery.md); "
+        "a re-scope or redesign, with its reason, named in the delivery; "
         "or a retry with its reason (environment, contention, flaky check).")
 
 

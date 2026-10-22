@@ -34,7 +34,7 @@ Outcome: ... Boundary and exclusions: ... Design: ... Escalate if: ...
 
 ## Scenarios (above the floor; delete below)
 
-Agreed: pending  <!-- the user's words, date -->
+Settled: pending  <!-- date; date the user was told; any reply word for word -->
 
 | ID | Kind | Scenario | Evidence |
 | --- | --- | --- | --- |

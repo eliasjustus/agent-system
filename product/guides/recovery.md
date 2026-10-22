@@ -2,8 +2,8 @@
 
 A failed or inconclusive check stays attached to its scenario in the task record, with an owner and
 a next action. The builder owns progress; the verifier judges whether a check is valid. A
-consequential question about intent goes to the orchestrator, and to the user if it changes what
-was agreed.
+consequential question about intent goes to the orchestrator, and to the user only if the intent
+itself is unclear.
 
 ## Diagnose
 
@@ -18,7 +18,7 @@ results; do not silently count the retry as proof about the original failure.
 
 ## Correct a check only on evidence
 
-Only when the agreed scenario, the actual interface or a demonstrated fixture error contradicts it.
+Only when the settled scenario, the actual interface or a demonstrated fixture error contradicts it.
 Keep the old result and say which assumption changed. Builder and verifier agreeing does not make a
 check wrong. Where feasible, the corrected check still rejects the original defect.
 
@@ -34,7 +34,7 @@ After two verifier launches into one results folder (the `--out` directory), the
 another before leasing a checkout unless `round-decision.md` there is a regular file, not a symlink,
 non-empty after stripping whitespace, and modified after the newest counted result. Write one of:
 the table of cases for the failure class, with the expected result per case and what must keep
-working; a re-scope or redesign (reducing scope still needs the user's yes); or a retry with its reason
+working; a re-scope or redesign, with its reason, named in the delivery; or a retry with its reason
 (environment, contention, flaky check). The launcher checks the file, not the decision's contents.
 Each result whose header says `Role: verifier` counts once, including `.attempt-N` archives,
 interrupted and failed runs, and `Result: running` markers even after their launcher was killed
@@ -61,7 +61,8 @@ estimate and tell the user.
 ## Continue or stop
 
 Ordinary technical recovery needs no approval. If recovery cannot finish now, write down the blocker
-and what would let it resume, and offer the user a reviewable candidate or a verified subset with its
-known gaps. Reducing scope or accepting a risk is the user's choice and never turns missing
-verification into a pass. Above the floor, a round limit or a stop time never permits building it
+and what would let it resume, and deliver a reviewable candidate or a verified subset with its
+known gaps. Reducing scope is your decision, recorded with its reason and named in the delivery as a
+limit; it never turns missing verification into a pass, and a known security or data-loss defect
+never ships. Above the floor, a round limit or a stop time never permits building it
 yourself; at any depth it never permits weakening a scenario: stop and report instead.
