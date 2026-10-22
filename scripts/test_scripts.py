@@ -1696,7 +1696,8 @@ original_output = subprocess.check_output
 acquired = False
 def locked(fd, operation):
     global acquired
-    if not os.readlink(f"/proc/self/fd/{fd.fileno()}").split("/")[-1].startswith("slot-"):
+    descriptor = fd if isinstance(fd, int) else fd.fileno()
+    if not os.readlink(f"/proc/self/fd/{descriptor}").split("/")[-1].startswith("slot-"):
         return original_flock(fd, operation)
     result = original_flock(fd, operation)
     acquired = True
@@ -1726,7 +1727,8 @@ acquired = False
 ranking_diffs = 0
 def locked(fd, operation):
     global acquired
-    if not os.readlink(f"/proc/self/fd/{fd.fileno()}").split("/")[-1].startswith("slot-"):
+    descriptor = fd if isinstance(fd, int) else fd.fileno()
+    if not os.readlink(f"/proc/self/fd/{descriptor}").split("/")[-1].startswith("slot-"):
         return original_flock(fd, operation)
     result = original_flock(fd, operation)
     if not acquired:
@@ -1878,7 +1880,8 @@ original_output = subprocess.check_output
 acquired = False
 def race(fd, operation):
     global acquired
-    if not os.readlink(f"/proc/self/fd/{fd.fileno()}").split("/")[-1].startswith("slot-"):
+    descriptor = fd if isinstance(fd, int) else fd.fileno()
+    if not os.readlink(f"/proc/self/fd/{descriptor}").split("/")[-1].startswith("slot-"):
         return original_flock(fd, operation)
     if not acquired:
         path = pathlib.Path(os.readlink(f"/proc/self/fd/{fd.fileno()}"))
@@ -6088,6 +6091,59 @@ os.fdopen = fdopen
         self.assertEqual(reads[str(body)], len("Role: builder\n\n"))
         self.assertEqual(reads[str(long)], 65536)
         self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R9_concurrent_different_stems_cannot_race_past_gate(self):
+        self.round_results("Role: verifier\nResult: done\n")
+        # Overlap the bounded header scans, as in the reported reproducer.
+        for number in range(80):
+            (self.out.parent / f"noise-{number:03d}").write_bytes(b"x\n" * 32768)
+        self.env["EVIDENCE"] = "1"
+        self.agent_extra("time.sleep(0.5)")
+        release = self.base / "launch-all"
+        self.inject_launcher(f'''
+import pathlib, time
+while not pathlib.Path({str(release)!r}).exists():
+    time.sleep(0.01)
+''')
+        outputs = [self.out.with_name(f"parallel-{i}.md") for i in range(4)]
+        records = [self.base / f"parallel-{i}.json" for i in range(4)]
+        processes = []
+        for out, record in zip(outputs, records):
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / "scripts/run.py"), "--role", "verifier",
+                 "--family", "codex", "--author-family", "claude", "--before", "none",
+                 "--brief", str(self.brief), "--out", str(out), "--repo", str(self.repo),
+                 "--method", str(self.method), "--private", str(self.private)],
+                env=dict(self.env, RECORD=str(record)), cwd=self.repo,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(self.reap_launcher, process)
+            processes.append(process)
+        release.touch()
+        errors = [process.communicate(timeout=20)[1] for process in processes]
+        self.assertEqual(sorted(process.returncode for process in processes), [0, 2, 2, 2], errors)
+        for process, out, record in zip(processes, outputs, records):
+            if process.returncode == 2:
+                self.assertIn("Result: launch refused\n", out.read_text())
+                self.assertIn("round-decision.md", out.read_text())
+                self.assertFalse(record.exists(), "refused launch started an agent")
+            else:
+                self.assertTrue(record.exists())
+                self.assertTrue(out.read_text().endswith("answer\n  unchanged\n"))
+                self.assertEqual((out.with_name(out.stem + "-evidence") / "proof.txt").read_text(),
+                                 "proof")
+        self.assertEqual(len(list(self.scope_state.glob("*.stop"))), 1,
+                         "only the admitted launch may lease a checkout and start a scope")
+        self.assertEqual(list(self.out.parent.glob("*.attempt-*")), [
+            self.out.parent / "review-0.attempt-7.txt"])
+        self.assertEqual({path.name for path in self.out.parent.iterdir()},
+                         {"review-0.attempt-7.txt"}
+                         | {f"noise-{i:03d}" for i in range(80)}
+                         | {out.name for out in outputs}
+                         | {out.with_suffix(".lock").name for out in outputs}
+                         | {out.with_suffix(".log").name for out, process in zip(outputs, processes)
+                            if process.returncode == 0}
+                         | {out.stem + "-evidence" for out, process in zip(outputs, processes)
+                            if process.returncode == 0})
 
     def test_RESULTS_S1_refusals_record_reason_before_start(self):
         cases = (

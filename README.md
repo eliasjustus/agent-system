@@ -143,6 +143,8 @@ case and what must keep working; a re-scope or redesign (reducing scope needs th
 `recovery.md`); or a retry with its reason (environment, contention, flaky check). The launcher does
 not judge its contents. An accepted decision adds `Round: <n>; decision: round-decision.md` to the
 header. Every later launch needs a decision newer than the newest counted result.
+Concurrent launches in that folder serialize counting and writing their running markers, even
+when they use different output stems.
 
 Each regular result file whose header says `Role: verifier` counts once, whatever its stem or
 suffix, including `.attempt-N` archives and interrupted or failed runs. `Result: launch refused`,

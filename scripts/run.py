@@ -242,6 +242,7 @@ class ResultDestination:
         lockpath = self.out.with_name(self.out.stem + ".lock")
         self.lock = os.fdopen(os.open(lockpath, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
                                       | os.O_NONBLOCK, 0o666), "a")
+        directory_lock = None
         try:
             if not stat.S_ISREG(os.fstat(self.lock.fileno()).st_mode):
                 raise OSError(f"non-regular result lock: {lockpath}")
@@ -251,6 +252,10 @@ class ResultDestination:
                 raise BlockingIOError(f"another launcher owns {self.out}") from None
             if not os.path.samestat(os.fstat(self.lock.fileno()), lockpath.lstat()):
                 raise OSError(f"result lock changed: {lockpath}")
+            # Different stems share the round count. Hold the directory itself
+            # until our marker is visible, including while archiving old results.
+            directory_lock = os.open(self.out.parent, os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(directory_lock, fcntl.LOCK_EX)
             self.start = utc()
             self.header = ((f"Role: {args.role}\n" if args.role is not None else "")
                            + f"Family: {args.family}\n"
@@ -289,6 +294,9 @@ class ResultDestination:
             if not self.claimed:
                 self.lock.close()
             raise
+        finally:
+            if directory_lock is not None:
+                os.close(directory_lock)
 
     def write(self, contents):
         # A sibling temporary file keeps replacement on the same filesystem.
