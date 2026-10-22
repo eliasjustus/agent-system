@@ -164,8 +164,8 @@ decision. Before a third or later launch leases any checkout, `round-decision.md
 be a regular file, not a symlink, non-empty after stripping whitespace, and modified after the newest
 counted result. Otherwise the launcher writes `Result: launch refused` with a reason and exits 2.
 The decision records one of: a table of cases for the failure class, with the expected result per
-case and what must keep working; a re-scope or redesign (reducing scope needs the user's yes, per
-`recovery.md`); or a retry with its reason (environment, contention, flaky check). The launcher does
+case and what must keep working; a re-scope or redesign, with its reason, named in the delivery;
+or a retry with its reason (environment, contention, flaky check). The launcher does
 not judge its contents. An accepted decision adds `Round: <n>; decision: round-decision.md` to the
 header. Every later launch needs a decision newer than the newest counted result.
 Concurrent launches in that folder serialize counting and writing their running markers, even

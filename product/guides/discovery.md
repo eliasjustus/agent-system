@@ -20,7 +20,7 @@ folder's first import get no collection while later scans do", not "small change
 find another owner of the state, the design changes, or a check fails for an unexplained reason.
 **Moving above:** stop dependent work, keep what is valid and add the missing safeguards; work you
 built yourself goes to a separate builder and full verification. **Moving below** needs another
-agent to confirm the trigger never applied. Agreed scenarios are never removed by a depth change.
+agent to confirm the trigger never applied. Settled scenarios are never removed by a depth change.
 
 ## Scenarios (above the floor)
 
@@ -32,22 +32,21 @@ Draft them yourself, never the builder.
 - Mark each **deliver** or **must not break**. Must not break is only for behavior that works today.
 - Then run the challenger (`guides/handover.md`) and adopt or reject each of its cases with a reason.
 
-## Ask the user once
+## Tell the user once, then proceed
 
-One message, at most about 250 words:
+One message, at most about 250 words, and do not wait for a reply:
 
 1. What you found, in two or three sentences of plain behavior.
 2. **What I'll deliver:** a numbered list in the user's terms, with the scenario IDs.
 3. **What stays as it is:** one line summarising the must-not-break list.
-4. **Decisions:** numbered, each with your recommendation and its consequence.
+4. **Decisions I made:** numbered, each with its reason and consequence, so the user can reverse it.
 5. **Estimate:** a time range.
-6. "Reply 'agreed' to accept my recommendations."
 
-Record the user's reply word for word in the task record with the date. After that, change an agreed
-scenario only with the user's yes; until they say yes, the original stands. Never drop or weaken a
-scenario to make a check pass.
+Ask only where the entry's "Deciding" section reserves the decision for the user, above all an
+unclear intent; then wait only for that. Change a settled scenario only with a reason recorded in the
+task record and named in the delivery. Never drop or weaken a scenario to make a check pass.
 
-Below the floor, write the short contract instead and ask only if a consequential question is open.
+Below the floor, write the short contract instead.
 
 ## Design
 

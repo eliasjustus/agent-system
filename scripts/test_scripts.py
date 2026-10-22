@@ -6472,7 +6472,7 @@ for i in range(35):
         for phrase in ("regular file (not a symlink)", "non-empty after stripping whitespace",
                        "modified after the newest counted verifier result", "table of cases",
                        "expected result per case", "what must keep working", "re-scope or redesign",
-                       "user's yes, per recovery.md", "retry with its reason",
+                       "with its reason, named in the delivery", "retry with its reason",
                        "environment, contention, flaky check"):
             self.assertIn(phrase, self.out.read_text())
 

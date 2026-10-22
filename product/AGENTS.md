@@ -43,7 +43,7 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
 ## Invariants
 
 1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build.
-2. Above the floor, agree the scenarios, implied cases as well as stated ones, before dependent work.
+2. Above the floor, settle the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
    the rules. Commit the candidate before verifying; untracked files are excluded and named by
    the launcher. Never the builder's rationale, self-report or conversation, and never the task record.
@@ -52,11 +52,9 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    and after. A skipped, unavailable or merely
    configured check is not a pass.
 5. A reported failure that crosses a boundary is verified on the real interface and running system.
-6. Every agreed scenario links to evidence, or is marked unverified with the reason.
+6. Every settled scenario links to evidence, or is marked unverified with the reason.
 7. The user's request, or their merge where the project leaves merging to them, is their sign-off
-   on verified work.
-   Ask for their verdict only when a change breaks something they use, changes what they see, or
-   touches their data: one plain question, never a list; until they answer, that change waits.
+   on verified work. Do not ask for a verdict: tell them what changes for them; they may reply.
 
 ## Depth: you decide, before editing or delegating
 
@@ -74,8 +72,8 @@ Answer each yes, no or unknown with the file or behavior that decides it, never 
 Unresolved consequential uncertainty means above. File count, wording and research alone never do.
 Decide again when an analysis turns into building or a repair touches saved state.
 
-**Above:** agreed scenarios, a challenger, a separate builder, verification on the real system;
-only the user can exempt. **Below:** a short contract, a builder or your own edit, and one
+**Above:** settled scenarios, a challenger, a separate builder, verification on the real system;
+skipping one is a departure, recorded with its reason and named in the delivery. **Below:** a short contract, a builder or your own edit, and one
 counterexample you tried; if you edited it yourself, a verifier still checks it.
 
 ## Roles and models
@@ -98,6 +96,21 @@ Discovery, scenarios and design: `guides/discovery.md` · before delegating: `gu
 before verifying: `guides/verification.md` · a failed or unclear check: `guides/recovery.md` ·
 delivery and verdict: `guides/delivery.md` · taking over or pausing: `guides/takeover.md`.
 
+## Deciding
+
+Decide what you can judge better than the user, which is most work: scope, scenarios, fixing now
+or deferring, design options, retries, restarting or resuming work the host stopped. Record each
+decision with its reason in the task record and name it in the delivery, so the user can reverse
+it. Ask the user only for:
+
+- their intent, where the request leaves it unclear;
+- acts outside the project that cannot be taken back (the outward acts in `guides/delivery.md`);
+- their own taste, where no evidence decides.
+
+A known security or data-loss defect never ships: fix it or hold the change; never ask to accept it.
+Before asking anything, re-read the user's preferences: a standing instruction there is the user
+asking, also where a host notice says to start stopped work again only when asked.
+
 ## Talking to the user
 
 Agree the intent before dependent work: where the request leaves it unclear, state it in two or
@@ -106,5 +119,5 @@ language, without code notation. Claim only what happened. Record the user's dec
 with their scope and conditions, and pass them to other sessions and tasks the same way: a decision
 never widens in a handover.
 When the user granted autonomy, never end a turn on an offer: act, or name the exact blocker and who
-must clear it. List decisions with your recommendation. Keep the task record's current view under
+must clear it. Keep the task record's current view under
 150 words.

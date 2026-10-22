@@ -13,7 +13,7 @@ project has its own publication rules (for example, proof in a review comment ra
 request body), they decide where each part goes:
 
 1. **What changed and why**, in the words of a future commit message.
-2. **Proof:** each agreed scenario with its result, or `unverified: <reason>`, with the verifier's
+2. **Proof:** each settled scenario with its result, or `unverified: <reason>`, with the verifier's
    report table and the decisive output for each scenario pasted in (short excerpts, secrets
    removed), so a reviewer can judge it without the private folder. Full outputs stay in the task
    folder, linked from the task record; nothing in the pull request names the private folder. Say
@@ -21,10 +21,9 @@ request body), they decide where each part goes:
 3. **Limits:** anything unverified, deferred or newly risky, and any departure from these rules.
 4. **Cost:** the estimate and the actual effort.
 
-A failed agreed scenario stays failed here. It may also be recorded as a finding, but accepting the
-failure or narrowing the outcome needs the user's yes, in their words. List every scenario that did
-not pass (failed, inconclusive or unverified) with its owner and the user's words that let it ship;
-without them it does not ship. A pass of a narrower check (one component, test intent, a partial
+A failed scenario stays failed here. You may ship with it or narrow the outcome when you can judge
+that better than the user, except that a known security or data-loss defect never ships. List every
+scenario that did not pass (failed, inconclusive or unverified) with its owner and why it ships. A pass of a narrower check (one component, test intent, a partial
 recheck) is named as such and is not the scenario passing. A user decision applied to another task
 keeps its conditions.
 
@@ -44,9 +43,10 @@ One message, at most about 250 words, in plain language:
 2. **What you'll see:** the delivered behavior, as the user would try it.
 3. **How it was checked:** one or two lines.
 4. **Limits.**
-5. Only if the change breaks something the user uses, changes what they see, or touches their
-   data: one question, is the behavior right? Otherwise ask nothing: the request, or the user's
-   merge where the project leaves merging to them, is the sign-off.
+5. **Decisions I made**, if any, each with its reason, so the user can reverse it.
+
+Ask nothing: the request, or the user's merge where the project leaves merging to them, is the
+sign-off. A decision the entry reserves for the user is asked before acting, not here.
 
 Claim only what happened. Never promise future behavior. Settle interpretation before building, or
 state it as a limit the user can correct. Leave out internal bookkeeping.
@@ -58,9 +58,9 @@ is recorded, do not commit and say so.
 
 ## On the verdict
 
-Work that needed no question is signed off by its request once it is verified and delivered, or by
-the user's merge where the project leaves merging to them: record that, then finish as for accepted
-work. Where you asked, keep only that change waiting (a draft pull request, the question in the
+Verified and delivered work is signed off by its request, or by the user's merge where the project
+leaves merging to them: record that, then finish as for accepted work. Where you asked a reserved
+question, keep only that change waiting (a draft pull request, the question in the
 task record's `Open for user`) and carry on with the rest. The question is asked once: in the
 delivery message, or, if the user was not in the conversation then, in their next one, one question,
 never a list of pending items. Do not repeat it on later turns or in later conversations, such as
