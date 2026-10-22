@@ -264,14 +264,17 @@ class ResultDestination:
             return self.code
         self.write_terminal((self.header + f"Result: launch refused\nReason: {header_value(reason)}\n"
                              f"End UTC: {utc()}\nExit code: 2\n"
-                             + ("\n" + output if output else "")).encode("utf-8", errors="backslashreplace"), 2)
+                             + ("\n" if output else "")).encode("utf-8", errors="backslashreplace"),
+                            2, output.encode("utf-8", errors="backslashreplace"))
         diagnostic(reason)
         return 2
 
-    def write_terminal(self, contents, code):
+    def write_terminal(self, contents, code, answer=b""):
         self.finalizing = True
         if self.saved is not None:
             return
+        header = contents.decode("utf-8")
+        contents += answer
         try:
             self.write(contents)
         except Exception:
@@ -298,7 +301,7 @@ class ResultDestination:
                     diagnostic(f"Cannot remove stale result {self.out}: {remove_error}")
                 diagnostic(f"Cannot record result in {self.out}: {report_error}")
                 diagnostic(contents, end="")
-        self.saved = (contents.decode("utf-8"), b"")
+        self.saved = (header, answer)
         self.code = code
         self.rendered = contents
 
@@ -1645,6 +1648,9 @@ def launch(parser, args, result):
                     command += ["--add-dir", str(temporary)]
             command = supervised(command)
             update_header()
+            if args.family == "codex" and preflight_log is not None:
+                with open_result(answer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb"):
+                    pass
             with (open_result(answer, os.O_WRONLY | os.O_CREAT
                               | (os.O_EXCL if preflight_log is not None else os.O_TRUNC), "wb")
                   if args.family == "claude" else open(os.devnull, "wb")) as stdout:

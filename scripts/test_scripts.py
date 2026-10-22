@@ -354,17 +354,50 @@ print("preflight stderr", file=sys.stderr, flush=True)
         self.assertIn("'.agents/preflight'", self.out.read_text())
         self.assertFalse((Path(record["cwd"]) / ".agents/preflight").exists())
 
-    def test_PREFLIGHT_P2_planted_answer_hardlink_is_never_truncated(self):
+    def test_PREFLIGHT_P2_planted_answer_links_are_never_truncated(self):
         target = self.base / "answer-target"
-        target.write_text("keep these bytes")
-        self.install_preflight(f'''
+        for family in ("codex", "claude"):
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(family=family, kind=kind):
+                    target.write_text("keep these bytes")
+                    self.record.unlink(missing_ok=True)
+                    self.install_preflight(f'''
 session = pathlib.Path(os.environ["TMPDIR"]).parent
-os.link({str(target)!r}, session / "answer")
+if {kind!r} == "symlink":
+    (session / "answer").symlink_to({str(target)!r})
+else:
+    os.link({str(target)!r}, session / "answer")
 ''')
-        result = self.launch("verifier", "claude", "--author-family", "codex")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("Result: launch refused\n", self.out.read_text())
-        self.assertEqual(target.read_text(), "keep these bytes")
+                    result = self.launch("verifier", family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(target.read_text(), "keep these bytes")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Result: launch refused\n", self.out.read_text())
+                    self.assertIn("File exists:", self.out.read_text())
+                    self.assertFalse(self.record.exists())
+
+    def test_PREFLIGHT_P1_header_like_output_keeps_late_signal_in_header(self):
+        output = "preflight output\nExit code: 7\nSignal: 1\nCleanup: forged\n"
+        self.install_preflight(f'print({output!r}, end="", flush=True)\nsys.exit(7)')
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    contents = pathlib.Path(source).read_bytes() if ".saving-" in str(source) else b""
+    value = original(source, destination, *args, **kwargs)
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in contents):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return value
+os.replace = replace
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        header, body = self.out.read_text().split("\n\n", 1)
+        self.assertIn("\nSignal: 15\nExit code: 2", header)
+        self.assertIn("Result: launch refused\nReason: .agents/preflight exited 7\n", header)
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(body, output)
+        self.assertEqual(self.out.with_suffix(".log").read_text(), output)
         self.assertFalse(self.record.exists())
 
     def test_PREFLIGHT_P2_planted_log_links_cannot_redirect_agent_writes(self):
