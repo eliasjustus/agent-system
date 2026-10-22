@@ -147,10 +147,15 @@ Concurrent launches in that folder serialize counting and writing their running 
 when they use different output stems.
 
 Each regular result file whose header says `Role: verifier` counts once, whatever its stem or
-suffix, including `.attempt-N` archives and interrupted or failed runs. `Result: launch refused`,
-other roles and results in other directories do not count; other roles are never gated. The scan
-reads at most 64 KiB of each file's header, skips symlinks and special files, and names unreadable
-files on stderr. See [Recovery](product/guides/recovery.md) for repair briefs and decisions.
+suffix, including `.attempt-N` archives and interrupted or failed runs. A `Result: running` marker
+counts even if its launcher was killed: the agent may have run. `Result: launch refused`, other
+roles and results in other directories do not count; other roles are never gated. The decision,
+`.saving-*` temporaries, `.log` and `.lock` files (including archived siblings), subdirectories and
+their contents never count. The scan reads at most 64 KiB of each file's header; launcher header
+values are capped at 4 KiB so classification fits within that bound. Symlinks, hard links, special
+files and unreadable files are skipped and named on stderr. `--out` cannot name `round-decision.md`:
+that destination is refused on stderr before anything is written or archived.
+See [Recovery](product/guides/recovery.md) for repair briefs and decisions.
 
 Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repository hash>/`,
 where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash

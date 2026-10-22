@@ -37,8 +37,13 @@ the table of cases for the failure class, with the expected result per case and 
 working; a re-scope or redesign (reducing scope still needs the user's yes); or a retry with its reason
 (environment, contention, flaky check). The launcher checks the file, not the decision's contents.
 Each result whose header says `Role: verifier` counts once, including `.attempt-N` archives,
-interrupted and failed runs; `Result: launch refused` does not count. Other roles and other results
-folders do not count. Each later verification needs a decision newer than the newest counted result.
+interrupted and failed runs, and `Result: running` markers even after their launcher was killed
+(the agent may have run). `Result: launch refused`, other roles and other results folders do not
+count. Neither do the decision itself, `.saving-*` temporaries, `.log` and `.lock` files and their
+archived siblings, subdirectories or their contents, symlinks, hard links, special files or unreadable
+files. Skipped links, special files and unreadable files are named on stderr. The decision cannot be
+used as `--out`; the launcher refuses that destination before writing or archiving anything.
+Each later verification needs a decision newer than the newest counted result.
 
 After a repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was

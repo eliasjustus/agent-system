@@ -134,8 +134,10 @@ def diagnostic(message, *, end="\n"):
 
 
 def header_value(value):
-    return "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
-                   for char in str(value))
+    rendered = "".join(char if char.isascii() and char.isprintable() else ascii(char)[1:-1]
+                       for char in str(value))
+    # Keep all launcher fields, including a refusal's Result, within the 64 KiB scan.
+    return rendered if len(rendered) <= 4096 else rendered[:4093] + "..."
 
 
 def open_result(path, flags, mode):
@@ -154,11 +156,19 @@ def verifier_round(out):
     decision = out.parent / "round-decision.md"
     # Read the preceding answer before claim() archives it or writes our marker.
     for path in out.parent.iterdir():
+        if (path == decision or ".saving-" in path.name
+                or path.suffix in (".log", ".lock")):
+            continue
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
                 continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError("not a regular, singly linked result file")
             with open_result(path, os.O_RDONLY, "rb") as stream:
                 info = os.fstat(stream.fileno())
+                if info.st_nlink != 1:
+                    raise OSError("not a singly linked result file")
                 fields, remaining = {}, 65536
                 while remaining:
                     line = stream.readline(remaining)
@@ -228,6 +238,8 @@ class ResultDestination:
         self.mode = 0o666 & ~mask
 
     def claim(self, args):
+        if self.out.name == "round-decision.md":
+            raise ValueError("--out must not replace round-decision.md")
         if self.out == self.out.with_name(self.out.stem + ".lock"):
             raise ValueError("--out must differ from its stem lock path")
         if self.out == self.out.with_suffix(".log"):
@@ -399,7 +411,7 @@ class ResultDestination:
                 status = ""
                 if self.pending_cleanup or CLEANUP_FAILURES:
                     cleanup = "failed: " + "; ".join(CLEANUP_FAILURES) if CLEANUP_FAILURES else "ok"
-                    status += f"\nCleanup: {cleanup}"
+                    status += f"\nCleanup: {header_value(cleanup)}"
                 if self.signal_code is not None:
                     status += f"\nSignal: {self.signal_code - 128}"
                 before, separator, after = header.rpartition("\nExit code:")
@@ -1439,8 +1451,8 @@ def launch(parser, args, result):
                              + (f"Snapshot commit: {snapshot}\n" if review else "")
                              + (header_value(checkout_note) + "\n" if checkout_note else "")
                              + (header_value(before_note) + "\n" if before_note else "")
-                             + (untracked_note + "\n" if untracked_note else "")
-                             + (f"Skipped untracked (>5 MB): {', '.join(header_value(path) for path in skipped)}\n" if skipped else "")
+                             + (header_value(untracked_note) + "\n" if untracked_note else "")
+                             + (f"Skipped untracked (>5 MB): {header_value(', '.join(skipped))}\n" if skipped else "")
                              + f"Write bytes: {writes}\nStart UTC: {start}\n")
         update_header()
         try:

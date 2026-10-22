@@ -3373,6 +3373,7 @@ sys.exit(result.returncode)
         self.assertEqual(warm.returncode, 0, proof.read_text() + warm.stderr)
         self.assertIn("warm reset", self.out.read_text())
         self.assertTrue((slot / "build/generated/value").exists())
+        self.round_decision()
         clean = self.launch("verifier", "codex", "--author-family", "claude", "--clean-checkout")
         self.assertNotEqual(clean.returncode, 0, proof.read_text() + clean.stderr)
         self.assertIn("build/generated/value", proof.read_text())
@@ -5921,10 +5922,28 @@ for i in range(35):
 
     def test_ROUND_R2_output_cannot_supply_its_own_decision(self):
         self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        self.round_decision()
         self.out = self.out.parent / "round-decision.md"
+        original = self.out.read_bytes()
+        entries = set(self.out.parent.iterdir())
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assert_launch_refused(result, "round-decision.md")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--out must not replace round-decision.md", result.stderr)
+        self.assertEqual(self.out.read_bytes(), original)
+        self.assertEqual(set(self.out.parent.iterdir()), entries)
+        self.assertFalse(self.record.exists())
         self.assertFalse(self.pool_root().exists())
+
+    def test_ROUND_R2_reserved_decision_output_is_refused_for_every_role(self):
+        self.out.parent.mkdir()
+        for role in ("builder", "investigator", "verifier", "reviewer", "challenger"):
+            with self.subTest(role=role):
+                self.out = self.out.parent / "round-decision.md"
+                result = self.launch(role, "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("round-decision.md", result.stderr)
+                self.assertEqual(list(self.out.parent.iterdir()), [])
+                self.assertFalse(self.record.exists())
 
     def test_ROUND_R4_each_later_launch_needs_a_newer_decision(self):
         self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
@@ -5954,6 +5973,76 @@ for i in range(35):
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Round: 5; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R5_all_started_result_statuses_count_with_any_stem_or_suffix(self):
+        self.out.parent.mkdir()
+        statuses = ("done", "blocked", "failed", "signal", "", "running")
+        for number, status in enumerate(statuses):
+            name = f"arbitrary-{number}" + (".attempt-2.data" if number % 2 else ".md")
+            (self.out.parent / name).write_text(f"Role: verifier\nResult: {status}\n\n")
+        self.round_decision()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 7; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R5_long_refusal_headers_never_count(self):
+        self.round_results("Role: verifier\nResult: done\n")
+        for _ in range(3):
+            result = self.launch("verifier", "codex", "--author-family", "claude",
+                                 "--same-family-reason", "x" * 70000, "--timeout", "0")
+            self.assert_launch_refused(result, "--timeout must be positive")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Round:", self.out.read_text())
+        for path in self.out.parent.glob("answer.attempt-*.md"):
+            header = path.read_bytes().split(b"\n\n", 1)[0]
+            self.assertLess(len(header), 65536)
+            self.assertIn(b"Result: launch refused\n", header)
+
+    def test_ROUND_R5_abandoned_running_marker_counts(self):
+        self.round_results("Role: verifier\nResult: done\n", "Role: verifier\nResult: running\n")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md")
+
+    def test_ROUND_R6_launcher_artifacts_and_non_headers_never_count(self):
+        self.round_results("Role: verifier\nResult: done\n", "Role: verifier\nResult: done\n")
+        ignored = ("other.saving-abcdefgh", "other.log", "other.lock", "other.attempt-1.log",
+                   "other.attempt-2.lock", "other.attempt-3.saving-abcdefgh")
+        for name in ignored:
+            (self.out.parent / name).write_text("Role: verifier\nResult: running\n")
+        for name in ("other-evidence", "other.attempt-1-evidence", "subdirectory"):
+            directory = self.out.parent / name
+            directory.mkdir()
+            (directory / "result.md").write_text("Role: verifier\nResult: done\n")
+        (self.out.parent / "no-header.md").write_text("Notes\n\nRole: verifier\nResult: done\n")
+        (self.out.parent / "another-role.md").write_text("Role: builder\nResult: done\n")
+        self.round_decision()
+        # Ignored artifacts cannot make an otherwise fresh decision stale.
+        for name in ignored:
+            os.utime(self.out.parent / name, ns=(time.time_ns() + 10**12,) * 2)
+        self.inject_launcher(f'''
+import os
+original = os.open
+def guarded(path, *args, **kwargs):
+    if str(path) in {tuple(str(self.out.parent / name) for name in ignored)!r}:
+        raise AssertionError("opened a launcher artifact")
+    return original(path, *args, **kwargs)
+os.open = guarded
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R6_decision_with_verifier_header_never_counts_itself(self):
+        self.round_results("Role: verifier\nResult: done\n", "Role: verifier\nResult: done\n")
+        self.round_decision()
+        decision = self.out.parent / "round-decision.md"
+        decision.write_text("Role: verifier\nResult: done\n\nRetry: restored environment.\n")
+        original = decision.read_bytes()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+        self.assertEqual(decision.read_bytes(), original)
 
     def test_ROUND_R6_other_roles_and_directories_do_not_count_or_gate(self):
         self.round_results(*(f"Role: {role}\n\nanswer" for role in
@@ -6017,7 +6106,7 @@ original = os.open
 def guarded(path, *args, **kwargs):
     if str(path) == {str(unreadable)!r}:
         raise PermissionError("forced unreadable result")
-    if str(path) in {tuple(str(self.out.parent / name) for name in ("linked.md", "pipe.md", "directory.md"))!r}:
+    if str(path) in {tuple(str(self.out.parent / name) for name in ("linked.md", "hard-linked.md", "pipe.md", "directory.md"))!r}:
         raise AssertionError("opened a planted link or special file")
     return original(path, *args, **kwargs)
 os.open = guarded
@@ -6028,7 +6117,9 @@ os.open = guarded
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(unreadable), result.stderr)
         self.assertIn("forced unreadable result", result.stderr)
-        self.assertIn("Round: 4; decision: round-decision.md\n", self.out.read_text())
+        for name in ("linked.md", "hard-linked.md", "pipe.md"):
+            self.assertIn(str(self.out.parent / name), result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
         self.assertEqual(target.stat().st_mtime_ns, original.st_mtime_ns)
         self.assertEqual(target.read_text(), "Role: verifier\n\nanswer")
 

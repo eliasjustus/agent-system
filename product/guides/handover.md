@@ -31,6 +31,7 @@ The third verifier launch into the same `--out` directory, and each later one, r
 decision options and counting rules. The file must be regular, not a symlink, non-empty after
 stripping whitespace, and modified after the newest counted result. The header records
 `Round: <n>; decision: round-decision.md` when the decision permits a launch.
+Keep the decision separate from `--out`: it is reserved and cannot be replaced by a result.
 Pool slots retain ignored build output; retry with `--clean-checkout`
 after an environment-looking failure, keeping both results. The pool has five slots per
 repository; a busy pool falls back to a temporary session worktree without waiting.
