@@ -90,7 +90,7 @@ open extra directories. There is no full-access option because these cover the k
 Challengers and reviewers run on a snapshot of committed, staged and uncommitted files, including
 untracked files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
 the answer's header. Check that list before trusting a review. The answer and its header are saved
-at `--out`, stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
+at `--out`, agent stderr and preflight output in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
 Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.
@@ -133,6 +133,17 @@ staged or unstaged tracked changes, including conflicts, refuse the session befo
 leased. Untracked files of any size stay in the source tree and are omitted from the verifier's
 checkout; the header names at most 20, then reports the remaining count. A forgotten file must fail
 verification. `Snapshot commit:` records the committed candidate, even if the builder commits again.
+
+If the candidate contains `.agents/preflight`, the launcher runs it in the candidate checkout
+before starting the verifier, with the session's temporary folder. Use this executable regular file
+for the project's cheap checks. A symlink, directory or nonexecutable file refuses the launch.
+Exit 0 records `Preflight: passed in <s> s`; the verifier receives the same checkout and build
+output. A nonzero exit, timeout or changed tracked files refuses the launch with exit 2, without
+starting an agent. Combined stdout/stderr stays in the sibling `.log`; refusals include its last
+50 lines. The default timeout is 900 seconds (`AGENT_PREFLIGHT_TIMEOUT`), separate from `--timeout`.
+Preflight descendants are stopped before verification or lease release, including after launcher
+signals or death. The before checkout and other roles never run it. Without a committed preflight,
+launching is unchanged and the verifier header says `Preflight: none`.
 
 Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repository hash>/`,
 where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash
@@ -211,7 +222,7 @@ supervisor stops the agent and its descendants, keeps its leases until they are 
 the orphaned session folder. A launcher killed before its lease guard starts can leave its session
 folder under `<cache>/am`; reset Git children inherit its locks and hold them until they exit.
 Sessions without a lease guard (builders, investigators, challengers, reviewers, and verifiers
-using only fresh fallback checkouts) killed outright can also leave their folder and worktree
+using only fresh fallback checkouts without preflight) killed outright can also leave their folder and worktree
 registrations. After confirming their processes have stopped, delete the specific session folder,
 then run `git -C /path/to/project worktree prune` in its repository. Check for unrelated stale
 registrations before pruning.
@@ -253,6 +264,9 @@ For a committed candidate, the manual route is a detached worktree at its exact 
 git worktree add --detach /path/to/checkout COMMIT
 ```
 
+Before a manual verifier session, run `.agents/preflight` if present in that checkout; require an
+executable regular file, exit 0 and tracked files still matching the candidate. Keep its build output
+for verification. Builders also run the project's preflight before handing back.
 Start a fresh session of the other model family in that checkout. Give it the appropriate installed
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
@@ -269,6 +283,7 @@ challenger or reviewer snapshot.
 | `AGENT_CODEX_EFFORT` | Codex reasoning effort; default `high`. Values pass through to the CLI, which rejects unsupported values. |
 | `AGENT_CLAUDE_CMD` | Claude executable name or path; default `claude` |
 | `AGENT_CODEX_CMD` | Codex executable name or path; default `codex` |
+| `AGENT_PREFLIGHT_TIMEOUT` | Verifier preflight timeout in seconds; positive finite number, default `900`. Does not count against `--timeout`. |
 | `XDG_CACHE_HOME` | Session and pool cache root; defaults to `~/.cache` when unset, empty or relative. Sessions use `am/<8 random characters>/` beneath it. |
 
 Set the model variable when running setup to change generated Claude builder definitions; rerun

@@ -12,6 +12,7 @@ from functools import partial
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import time
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
@@ -256,12 +258,13 @@ class ResultDestination:
             if name is not None:
                 Path(name).unlink(missing_ok=True)
 
-    def refused(self, reason):
+    def refused(self, reason, output=""):
         self.finalizing = True
         if self.saved is not None:
             return self.code
         self.write_terminal((self.header + f"Result: launch refused\nReason: {header_value(reason)}\n"
-                             f"End UTC: {utc()}\nExit code: 2\n").encode("utf-8", errors="backslashreplace"), 2)
+                             f"End UTC: {utc()}\nExit code: 2\n"
+                             + ("\n" + output if output else "")).encode("utf-8", errors="backslashreplace"), 2)
         diagnostic(reason)
         return 2
 
@@ -1361,6 +1364,10 @@ def launch(parser, args, result):
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
+        agent_started = False
+        preflight = "none"
+        preflight_log = None
+        guarded = False
         systemd = shutil.which("systemd-run")
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         def update_header():
@@ -1375,10 +1382,21 @@ def launch(parser, args, result):
                              + (f"Snapshot commit: {snapshot}\n" if review else "")
                              + (header_value(checkout_note) + "\n" if checkout_note else "")
                              + (header_value(before_note) + "\n" if before_note else "")
+                             + (f"Preflight: {preflight}\n" if args.role == "verifier" else "")
                              + (untracked_note + "\n" if untracked_note else "")
                              + (f"Skipped untracked (>5 MB): {', '.join(header_value(path) for path in skipped)}\n" if skipped else "")
                              + f"Write bytes: {writes}\nStart UTC: {start}\n")
         update_header()
+        def supervised(command):
+            if unit:
+                command = [systemd, "--user", "--scope", "--quiet", "--collect",
+                           "--slice=agents.slice", f"--unit={unit}", "--", *command]
+            else:
+                diagnostic("systemd-run unavailable; running without a scope")
+            if guarded:
+                command = [sys.executable, "-I", "-c", LEASE_GUARD, str(Path(__file__).resolve()),
+                           str(repo), str(temp), str(os.getpid()), *command]
+            return command
         try:
             cwd = repo
             if args.role == "verifier":
@@ -1499,6 +1517,74 @@ def launch(parser, args, result):
                            "nothing else in the session folder is kept.\n")
             for path in roots:
                 path.mkdir(parents=True, exist_ok=True)
+            guarded = bool(leases)
+            if args.role == "verifier":
+                entry = git(work, *CHECKOUT_CONFIG, "ls-tree", candidate, "--", ".agents/preflight")
+                if entry:
+                    preflight = "pending"
+                    update_header()
+                    mode = entry.split()[0]
+                    if mode not in ("100644", "100755"):
+                        raise ValueError(".agents/preflight is not a regular file")
+                    if mode != "100755":
+                        raise ValueError(".agents/preflight is not executable")
+                    timeout = float(os.environ.get("AGENT_PREFLIGHT_TIMEOUT", "900"))
+                    if not math.isfinite(timeout) or timeout <= 0:
+                        raise ValueError("AGENT_PREFLIGHT_TIMEOUT must be positive and finite")
+                    # Fresh fallback checkouts need the same descendant supervision
+                    # as leased slots, including when the launcher is killed outright.
+                    guarded = True
+                    preflight = "running"
+                    update_header()
+                    preflight_log = open_result(out.with_suffix(".log"),
+                                                os.O_RDWR | os.O_CREAT | os.O_EXCL, "w+b")
+                    started = time.monotonic()
+                    result.spawning = True
+                    try:
+                        process = subprocess.Popen(supervised([str(work / ".agents/preflight")]),
+                                                   cwd=work, env=agent_env, stdin=subprocess.DEVNULL,
+                                                   stdout=preflight_log, stderr=preflight_log,
+                                                   start_new_session=True,
+                                                   pass_fds=tuple(lock.fileno() for lock in leases))
+                    finally:
+                        result.spawning = False
+                    if result.signal_code is not None:
+                        raise KeyboardInterrupt(result.signal_code - 128)
+                    try:
+                        status = process.wait(timeout=timeout)
+                        preflight = f"exited {status}"
+                    except subprocess.TimeoutExpired:
+                        preflight = f"timed out after {timeout:g} s"
+                    stop_failures = len(CLEANUP_FAILURES)
+                    stop_session(unit, process, guarded=True)
+                    if len(CLEANUP_FAILURES) != stop_failures:
+                        result.keep_session = True
+                        raise ValueError("preflight cleanup failed")
+                    process = None
+                    update_header()
+                    if preflight.startswith("timed out") or status:
+                        raise ValueError(f".agents/preflight {preflight}")
+                    # Compare both the index and raw checkout bytes to the candidate;
+                    # Git status alone can miss assume-unchanged files and conversions.
+                    try:
+                        paths = git(work, *CHECKOUT_CONFIG, "ls-files", "-z", text=False).split(b"\0")
+                        check_checkout_parents(work, [path for path in paths if path])
+                        changed = (git(work, *CHECKOUT_CONFIG, "rev-parse", "HEAD") != candidate
+                                   or git(work, *CHECKOUT_CONFIG, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
+                                   or git(work, *CHECKOUT_CONFIG, "diff", "--cached", "--ignore-submodules=untracked",
+                                          "--name-only", candidate)
+                                   or checkout_mismatches(work))
+                        changes = git(work, *CHECKOUT_CONFIG, "diff", "--raw", "--no-renames",
+                                      "--ignore-submodules=untracked", "-z", candidate, text=False).split(b"\0")
+                        changed = changed or any(
+                            any(mode.lstrip(b":") == b"160000" for mode in header.split()[:2])
+                            for header in changes[::2])
+                    except (OSError, ValueError, subprocess.CalledProcessError):
+                        changed = True
+                    if changed:
+                        raise ValueError("preflight changed tracked files")
+                    preflight = f"passed in {time.monotonic() - started:.3f} s"
+                    update_header()
             writable = args.role in ("builder", "verifier")
             if writable:
                 prompt += f"\nTemporary folder: {temporary}; removed when the session ends"
@@ -1557,20 +1643,15 @@ def launch(parser, args, result):
                         command += ["--add-dir", str(before)]
                 if writable:
                     command += ["--add-dir", str(temporary)]
-            if unit:
-                command = [systemd, "--user", "--scope", "--quiet", "--collect",
-                           "--slice=agents.slice", f"--unit={unit}", "--", *command]
-            else:
-                diagnostic("systemd-run unavailable; running without a scope")
-            if leases:
-                command = [sys.executable, "-I", "-c", LEASE_GUARD, str(Path(__file__).resolve()),
-                           str(repo), str(temp), str(os.getpid()), *command]
+            command = supervised(command)
             update_header()
-            with (open_result(answer, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "wb")
+            with (open_result(answer, os.O_WRONLY | os.O_CREAT
+                              | (os.O_EXCL if preflight_log is not None else os.O_TRUNC), "wb")
                   if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 log_flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if restricted else os.O_TRUNC)
-                with open_result(out.with_suffix(".log"), log_flags, "ab" if restricted else "wb") as log:
+                with (preflight_log if preflight_log is not None else
+                      open_result(out.with_suffix(".log"), log_flags, "ab" if restricted else "wb")) as log:
                     # Defer signals until Popen returns the identity needed to stop
                     # the child, including a signal delivered inside Popen itself.
                     result.spawning = True
@@ -1578,6 +1659,7 @@ def launch(parser, args, result):
                         process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=stdout,
                                                    stderr=log, env=agent_env, start_new_session=True,
                                                    pass_fds=tuple(lock.fileno() for lock in leases))
+                        agent_started = True
                     finally:
                         result.spawning = False
                 if result.signal_code is not None:
@@ -1590,13 +1672,20 @@ def launch(parser, args, result):
         except KeyboardInterrupt as error:
             result.finalizing = True
             code = 128 + (error.args[0] if error.args else signal.SIGINT)
-            if process is None:
+            if not agent_started:
                 result.write_terminal((result.header + f"Result: interrupted\nEnd UTC: {utc()}\n"
                                        f"Exit code: {code}\n").encode("utf-8", errors="backslashreplace"), code)
         except Exception as error:
             result.finalizing = True
-            if process is None:
-                code = result.refused(str(error) or type(error).__name__)
+            if not agent_started:
+                tail = ""
+                if preflight_log is not None:
+                    try:
+                        preflight_log.seek(0)
+                        tail = b"".join(deque(preflight_log, maxlen=50)).decode("utf-8", errors="replace")
+                    except Exception as log_error:
+                        diagnostic(f"Cannot read preflight output: {log_error}")
+                code = result.refused(str(error) or type(error).__name__, tail)
             else:
                 diagnostic(f"Session failed: {error}")
                 code = 127 if isinstance(error, FileNotFoundError) else 1
@@ -1607,14 +1696,14 @@ def launch(parser, args, result):
                 CLEANUP_FAILURES = []
             stop_failures = len(CLEANUP_FAILURES)
             if process is not None:
-                cleanup_step("stop session", stop_session, unit, process, guarded=bool(leases))
+                cleanup_step("stop session", stop_session, unit, process, guarded=guarded)
             stop_failed = len(CLEANUP_FAILURES) != stop_failures
             if stop_failed:
                 result.keep_session = True
                 cleanup_failed("session retention", f"stopping agent failed; session folder kept at {temp}"
                                + (f"; evidence left in {source}" if args.role == "verifier" else ""))
             try:
-                if process is not None:
+                if agent_started:
                     answer_bytes = None
                     try:
                         try:
@@ -1657,6 +1746,8 @@ def launch(parser, args, result):
                     except Exception as error:
                         cleanup_failed("session log tail", error)
             finally:
+                if preflight_log is not None:
+                    cleanup_step("preflight log close", preflight_log.close)
                 if not stop_failed:
                     cleanup_step("session worktrees", cleanup_worktrees, repo, temp)
     finally:
