@@ -134,6 +134,22 @@ leased. Untracked files of any size stay in the source tree and are omitted from
 checkout; the header names at most 20, then reports the remaining count. A forgotten file must fail
 verification. `Snapshot commit:` records the committed candidate, even if the builder commits again.
 
+The first two verifier launches into one results folder (the `--out` directory) need no round
+decision. Before a third or later launch leases any checkout, `round-decision.md` in that folder must
+be a regular file, not a symlink, non-empty after stripping whitespace, and modified after the newest
+counted result. Otherwise the launcher writes `Result: launch refused` with a reason and exits 2.
+The decision records one of: a table of cases for the failure class, with the expected result per
+case and what must keep working; a re-scope or redesign (reducing scope needs the user's yes, per
+`recovery.md`); or a retry with its reason (environment, contention, flaky check). The launcher does
+not judge its contents. An accepted decision adds `Round: <n>; decision: round-decision.md` to the
+header. Every later launch needs a decision newer than the newest counted result.
+
+Each regular result file whose header says `Role: verifier` counts once, whatever its stem or
+suffix, including `.attempt-N` archives and interrupted or failed runs. `Result: launch refused`,
+other roles and results in other directories do not count; other roles are never gated. The scan
+reads at most 64 KiB of each file's header, skips symlinks and special files, and names unreadable
+files on stderr. See [Recovery](product/guides/recovery.md) for repair briefs and decisions.
+
 Verifier checkouts are leased without waiting from `<cache>/am-pool/<name>-<repository hash>/`,
 where `<cache>` follows `XDG_CACHE_HOME` below. The name comes from the main repository and the hash
 from its resolved Git common directory. Main trees, linked worktrees, symlinks and subdirectory
@@ -257,6 +273,8 @@ Start a fresh session of the other model family in that checkout. Give it the ap
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
 evidence. Remove the checkout with `git worktree remove /path/to/checkout` after checking.
+Manually started third and later verifications need the same fresh `round-decision.md` in the
+task's results folder before starting.
 Commit the candidate before verification. Uncommitted work may go through `run.py` for a
 challenger or reviewer snapshot.
 

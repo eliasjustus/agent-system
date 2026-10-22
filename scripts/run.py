@@ -149,6 +149,50 @@ def open_result(path, flags, mode):
         raise
 
 
+def verifier_round(out):
+    count, newest = 0, 0
+    decision = out.parent / "round-decision.md"
+    # Read the preceding answer before claim() archives it or writes our marker.
+    for path in out.parent.iterdir():
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
+            with open_result(path, os.O_RDONLY, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                fields, remaining = {}, 65536
+                while remaining:
+                    line = stream.readline(remaining)
+                    remaining -= len(line)
+                    if line in (b"", b"\n", b"\r\n"):
+                        break
+                    key, separator, value = line.rstrip(b"\r\n").partition(b": ")
+                    if separator:
+                        fields.setdefault(key, value)
+            if fields.get(b"Role") == b"verifier" and fields.get(b"Result") != b"launch refused":
+                count += 1
+                newest = max(newest, info.st_mtime_ns)
+        except OSError as error:
+            diagnostic(f"Warning: cannot read round result {path}: {error}")
+    if count < 2:
+        return ""
+    try:
+        if stat.S_ISREG(decision.lstat().st_mode):
+            with open_result(decision, os.O_RDONLY, "r") as stream:
+                if (os.fstat(stream.fileno()).st_mtime_ns > newest
+                        and any(chunk.strip() for chunk in iter(partial(stream.read, 65536), ""))):
+                    return f"Round: {count + 1}; decision: round-decision.md\n"
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError) as error:
+        diagnostic(f"Warning: cannot read round decision {decision}: {error}")
+    raise ValueError(
+        f"{decision} must be a regular file (not a symlink), non-empty after stripping whitespace, "
+        "and modified after the newest counted verifier result. Write one of: the table of cases "
+        "for the failure class (expected result per case, including what must keep working); "
+        "a re-scope or redesign (reducing scope needs the user's yes, per recovery.md); "
+        "or a retry with its reason (environment, contention, flaky check).")
+
+
 def cleanup_failed(what, error):
     if CLEANUP_FAILURES is not None:
         CLEANUP_FAILURES.append(header_value(f"{what}: {error}"))
@@ -177,6 +221,8 @@ class ResultDestination:
         self.signal_code = None
         self.spawning = False
         self.keep_session = False
+        self.round_header = ""
+        self.round_error = None
         mask = os.umask(0)
         os.umask(mask)
         self.mode = 0o666 & ~mask
@@ -216,6 +262,11 @@ class ResultDestination:
                 if (re.fullmatch(re.escape(self.out.stem) + r"\.saving-[a-z0-9_]{8}", path.name)
                         and not path.is_dir()):
                     path.unlink()
+            if args.role == "verifier":
+                try:
+                    self.round_header = verifier_round(self.out)
+                except ValueError as error:
+                    self.round_error = error
             paths = (self.out, self.out.with_suffix(".log"),
                      self.out.with_name(self.out.stem + "-evidence"))
             # All launchers sharing these siblings hold the same stem lock.
@@ -1239,6 +1290,10 @@ def launch(parser, args, result):
         parser.error("--timeout must be positive")
     if args.role == "verifier" and args.before is None:
         parser.error("verifier requires --before <commit> or --before none")
+    if result.round_error is not None:
+        raise result.round_error
+    round_header = result.round_header
+    result.header += round_header
     brief = args.brief.expanduser().read_text()
     private = Path(args.private).expanduser().resolve()
     repo, out = args.repo.expanduser().resolve(), result.out
@@ -1365,7 +1420,8 @@ def launch(parser, args, result):
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
-                             f"Executable: {header_value(executable)}\n"
+                             + round_header
+                             + f"Executable: {header_value(executable)}\n"
                              + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
                                 f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")

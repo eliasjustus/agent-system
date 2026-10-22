@@ -26,6 +26,11 @@ it in full.
 Verifiers require `--before <commit>` to lease a second writable checkout for the baseline, or
 `--before none` to start without one. If a before state is needed after all, the verifier makes
 an ad-hoc shared clone inside $TMPDIR and builds it into its own build folder.
+The third verifier launch into the same `--out` directory, and each later one, requires a fresh
+`round-decision.md` there before any checkout is leased. See `guides/recovery.md` for the three
+decision options and counting rules. The file must be regular, not a symlink, non-empty after
+stripping whitespace, and modified after the newest counted result. The header records
+`Round: <n>; decision: round-decision.md` when the decision permits a launch.
 Pool slots retain ignored build output; retry with `--clean-checkout`
 after an environment-looking failure, keeping both results. The pool has five slots per
 repository; a busy pool falls back to a temporary session worktree without waiting.
@@ -59,7 +64,8 @@ For a committed candidate, you can instead create a detached worktree at the exa
 `git worktree add --detach <checkout> <commit>`. Start a fresh session of the other model family
 there, give it the role contract and the brief (and `guides/verification.md` for a verifier), and
 save its full answer unedited in the task folder's `results/`. Give a verifier an evidence folder
-and keep its evidence too. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
+and keep its evidence too. A manually started third verification, and each later one, needs the
+same written decision before starting. Remove the worktree when checking is finished. Uncommitted or untracked candidates may go through `run.py` for
 challenger or reviewer snapshots.
 
 Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.

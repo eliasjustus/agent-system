@@ -178,6 +178,8 @@ class ScriptsTest(unittest.TestCase):
         self.env["PYTHONPATH"] = str(site)
 
     def start_launcher(self, *extra, role="verifier", out=None, record=None):
+        if role == "verifier":
+            self.round_decision(out)
         if role == "verifier" and "--before" not in extra:
             extra = ("--before", "none", *extra)
         env = dict(self.env, RECORD=str(record or self.record))
@@ -258,10 +260,20 @@ class ScriptsTest(unittest.TestCase):
                                *extra)
 
     def verifier(self, family="codex", *extra):
+        self.round_decision()
         result = self.launch("verifier", family, "--author-family",
                              "claude" if family == "codex" else "codex", *extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(self.record.read_text())
+
+    def round_decision(self, out=None):
+        directory = (out or self.out).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        decision = directory / "round-decision.md"
+        decision.write_text("Retry: exercise the next preservation case.\n")
+        newest = max(path.stat().st_mtime_ns for path in directory.iterdir()
+                     if path.is_file())
+        os.utime(decision, ns=(newest + 1, newest + 1))
 
     def seed_pool(self, commits):
         slots = []
@@ -1350,6 +1362,7 @@ fcntl.flock = fail_lock
                         for number in range(2, 6):
                             lock = held.enter_context((pool / f"slot-{number}.lock").open("a+b"))
                             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.round_decision()
                     result = self.launch("verifier", "codex", "--author-family", "claude",
                                          "--before", "HEAD", "--clean-checkout")
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -1521,6 +1534,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         metadata.write_text(json.dumps(state))
         (slot / "ignored").write_text("keep until limit")
         self.env["SESSION_EXIT"] = "7"
+        self.round_decision()
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 7)
         self.assertEqual(json.loads(metadata.read_text())["uses"], 20)
@@ -2599,6 +2613,7 @@ subprocess.check_output = fail_remove
                     # Ignored leftover files survive a warm reset.
                     slot = Path(self.verifier()["cwd"])
                     (slot / "signal.py").write_text(payload)
+                self.round_decision()
                 result = self.launch("verifier", "codex", "--author-family", "claude")
                 self.assertFalse(marker.exists(), "guard imported signal.py from the slot")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -3077,6 +3092,7 @@ def interrupt(command, *args, **kwargs):
     return original(command, *args, **kwargs)
 subprocess.check_output = interrupt
 ''')
+        self.round_decision()
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assertEqual(result.returncode, 143, result.stderr)
         self.assertFalse(slot.with_suffix(".json").exists())
@@ -4713,6 +4729,7 @@ if "model_reasoning_effort=unsupported-test-value" in args:
 record["files"] = sorted(p.name for p in pathlib.Path(os.environ["TMPDIR"]).parent.iterdir())
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
+                self.round_decision()
                 result = self.launch("verifier", "codex", "--author-family", "claude")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.record.read_text())
@@ -5521,6 +5538,7 @@ target = pathlib.Path(os.environ["LINK_TARGET"])
                     elif kind == "file-link":
                         destination.write_text("untouched")
                     kept.symlink_to(destination, target_is_directory=kind == "directory-link")
+                self.round_decision()
                 result = self.launch("verifier", "codex", "--author-family", "claude")
                 self.assertEqual(result.returncode, 7, result.stderr)
                 self.assertFalse(kept.is_symlink())
@@ -5558,6 +5576,7 @@ shutil.copytree = fail_evidence
                     self.env["SLEEP"] = "1"
                 else:
                     self.env.pop("SLEEP", None)
+                self.round_decision()
                 result = self.launch("verifier", "codex", "--author-family", "claude",
                                      *(("--timeout", "0.4") if code == 124 else ()))
                 self.assertEqual(result.returncode, code or 3, result.stderr)
@@ -5855,6 +5874,221 @@ for i in range(35):
         self.assertFalse(self.record.exists())
         self.assertEqual(set(self.scope_state.iterdir()), set(scopes))
 
+    def round_results(self, *headers):
+        self.out.parent.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for number, header in enumerate(headers):
+            path = self.out.parent / f"review-{number}.attempt-7.txt"
+            path.write_text(header)
+            paths.append(path)
+        return paths
+
+    def test_ROUND_R1_first_two_launches_run_then_third_is_refused(self):
+        for _ in range(2):
+            result = self.launch("verifier", "codex", "--author-family", "claude")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.record.unlink()
+        scopes = set(self.scope_state.iterdir())
+        pool = {p.name: p.stat().st_mtime_ns for p in self.pool_root().iterdir()}
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md", scopes)
+        self.assertEqual({p.name: p.stat().st_mtime_ns for p in self.pool_root().iterdir()}, pool)
+
+    def test_ROUND_R2_refusal_precedes_leasing_and_explains_options(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\nResult: interrupted\n")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md")
+        self.assertFalse(self.pool_root().exists())
+        for phrase in ("regular file (not a symlink)", "non-empty after stripping whitespace",
+                       "modified after the newest counted verifier result", "table of cases",
+                       "expected result per case", "what must keep working", "re-scope or redesign",
+                       "user's yes, per recovery.md", "retry with its reason",
+                       "environment, contention, flaky check"):
+            self.assertIn(phrase, self.out.read_text())
+
+    def test_ROUND_R3_fresh_decision_runs_and_records_round(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        self.round_decision()
+        decision = self.out.parent / "round-decision.md"
+        decision.write_text("The launcher does not judge this text.\n")
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+        self.assertTrue(self.record.exists())
+
+    def test_ROUND_R2_output_cannot_supply_its_own_decision(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        self.out = self.out.parent / "round-decision.md"
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md")
+        self.assertFalse(self.pool_root().exists())
+
+    def test_ROUND_R4_each_later_launch_needs_a_newer_decision(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        self.round_decision()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = self.out.parent / "round-decision.md"
+        newest = self.out.stat().st_mtime_ns
+        os.utime(decision, ns=(newest, newest))
+        self.record.unlink()
+        scopes = set(self.scope_state.iterdir())
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md", scopes)
+        self.round_decision()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 4; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R5_counts_each_result_archive_failure_and_interruption_once(self):
+        paths = self.round_results("Role: verifier\n\nanswer", "Role: verifier\nResult: interrupted\n",
+                                  "Role: verifier\nRole: verifier\nResult: failed: cannot save answer\n",
+                                  "Role: verifier\nResult: running\n",
+                                  "Role: verifier\nResult: launch refused\n")
+        self.round_decision()
+        future = time.time_ns() + 10**12
+        os.utime(paths[-1], ns=(future, future))
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 5; decision: round-decision.md\n", self.out.read_text())
+
+    def test_ROUND_R6_other_roles_and_directories_do_not_count_or_gate(self):
+        self.round_results(*(f"Role: {role}\n\nanswer" for role in
+                             ("builder", "investigator", "reviewer", "challenger")))
+        elsewhere = self.base / "another-task"
+        elsewhere.mkdir()
+        for number in range(3):
+            (elsewhere / f"verifier-{number}.md").write_text("Role: verifier\n\nanswer")
+        for _ in range(2):
+            result = self.launch("verifier", "codex", "--author-family", "claude")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for role in ("builder", "investigator", "reviewer", "challenger"):
+            result = self.launch(role, "codex", "--author-family", "claude")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.record.unlink()
+        scopes = set(self.scope_state.iterdir())
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md", scopes)
+
+    def test_ROUND_R7_empty_whitespace_symlink_and_special_decisions_are_refused(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        decision = self.out.parent / "round-decision.md"
+        target = self.base / "decision-target"
+        target.write_text("Retry: environment restored.\n")
+        original = target.stat()
+        for kind in ("empty", "whitespace", "unicode-whitespace", "symlink", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    decision.symlink_to(target)
+                elif kind == "fifo":
+                    os.mkfifo(decision)
+                elif kind == "directory":
+                    decision.mkdir()
+                else:
+                    decision.write_text({"empty": "", "whitespace": " \n\t\r",
+                                         "unicode-whitespace": "\u2003\u00a0\n"}[kind])
+                try:
+                    result = self.launch("verifier", "codex", "--author-family", "claude")
+                    self.assert_launch_refused(result, "round-decision.md")
+                finally:
+                    if kind == "directory":
+                        decision.rmdir()
+                    else:
+                        decision.unlink()
+        self.assertEqual(target.read_text(), "Retry: environment restored.\n")
+        self.assertEqual(target.stat().st_mtime_ns, original.st_mtime_ns)
+
+    def test_ROUND_R8_skips_links_special_files_and_unreadable_results(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        target = self.base / "linked-result"
+        target.write_text("Role: verifier\n\nanswer")
+        (self.out.parent / "linked.md").symlink_to(target)
+        os.link(target, self.out.parent / "hard-linked.md")
+        os.mkfifo(self.out.parent / "pipe.md")
+        (self.out.parent / "directory.md").mkdir()
+        unreadable = self.out.parent / "unreadable.md"
+        unreadable.write_text("Role: verifier\n\nanswer")
+        self.inject_launcher(f'''
+import os
+original = os.open
+def guarded(path, *args, **kwargs):
+    if str(path) == {str(unreadable)!r}:
+        raise PermissionError("forced unreadable result")
+    if str(path) in {tuple(str(self.out.parent / name) for name in ("linked.md", "pipe.md", "directory.md"))!r}:
+        raise AssertionError("opened a planted link or special file")
+    return original(path, *args, **kwargs)
+os.open = guarded
+''')
+        original = target.stat()
+        self.round_decision()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(unreadable), result.stderr)
+        self.assertIn("forced unreadable result", result.stderr)
+        self.assertIn("Round: 4; decision: round-decision.md\n", self.out.read_text())
+        self.assertEqual(target.stat().st_mtime_ns, original.st_mtime_ns)
+        self.assertEqual(target.read_text(), "Role: verifier\n\nanswer")
+
+    def test_ROUND_R8_unreadable_decision_never_grants_launch(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        self.round_decision()
+        decision = self.out.parent / "round-decision.md"
+        self.inject_launcher(f'''
+import os
+original = os.open
+def guarded(path, *args, **kwargs):
+    if str(path) == {str(decision)!r}:
+        raise PermissionError("forced unreadable decision")
+    return original(path, *args, **kwargs)
+os.open = guarded
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assert_launch_refused(result, "round-decision.md")
+        self.assertIn("forced unreadable decision", result.stderr)
+
+    def test_ROUND_R8_reads_only_bounded_headers(self):
+        self.round_results("Role: verifier\n\nanswer", "Role: verifier\n\nanswer")
+        body = self.out.parent / "body.txt"
+        body.write_text("Role: builder\n\nRole: verifier\n" + "x" * 100000)
+        long = self.out.parent / "long.txt"
+        long.write_text("x" * 100000 + "\nRole: verifier\n")
+        marker = self.base / "read-sizes.json"
+        self.inject_launcher(f'''
+import os, json
+original = os.fdopen
+reads = {{}}
+class HeaderReader:
+    def __init__(self, stream, path):
+        self.stream, self.path = stream, path
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return self.stream.__exit__(*args)
+    def readline(self, size=-1):
+        assert 0 < size <= 65536, size
+        line = self.stream.readline(size)
+        reads[self.path] = reads.get(self.path, 0) + len(line)
+        assert reads[self.path] <= 65536, reads
+        with open({str(marker)!r}, "w") as report:
+            json.dump(reads, report)
+        return line
+def fdopen(fd, *args, **kwargs):
+    stream = original(fd, *args, **kwargs)
+    path = os.readlink(f"/proc/self/fd/{{fd}}")
+    return HeaderReader(stream, path) if path in ({str(body)!r}, {str(long)!r}) else stream
+os.fdopen = fdopen
+''')
+        self.round_decision()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists(), "result headers were not scanned")
+        reads = json.loads(marker.read_text())
+        self.assertEqual(reads[str(body)], len("Role: builder\n\n"))
+        self.assertEqual(reads[str(long)], 65536)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+
     def test_RESULTS_S1_refusals_record_reason_before_start(self):
         cases = (
             ("builder", "--before", "HEAD", "allowed only for verifiers"),
@@ -5910,6 +6144,7 @@ pathlib.Path.mkdir = mkdir
         (self.out.parent / "answer.attempt-1.log").write_bytes(b"reserved\x00\xff")
         for number, outcome in enumerate(("success", "failure", "empty", "timeout", "refusal", "interrupt"), 2):
             with self.subTest(outcome=outcome):
+                self.round_decision()
                 self.env.update(SESSION_EXIT="7" if outcome == "failure" else "0",
                                 NO_ANSWER="1" if outcome == "empty" else "",
                                 SLEEP="1" if outcome in ("timeout", "interrupt") else "",
