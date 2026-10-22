@@ -40,8 +40,10 @@ Each result whose header says `Role: verifier` counts once, including `.attempt-
 interrupted and failed runs, and `Result: running` markers even after their launcher was killed
 (the agent may have run). `Result: launch refused`, other roles and other results folders do not
 count. Neither do the decision itself, `.saving-*` temporaries, `.log` and `.lock` files and their
-archived siblings, subdirectories or their contents, symlinks, hard links, special files or unreadable
-files. Skipped links, special files and unreadable files are named on stderr. The decision cannot be
+archived siblings, entries ending in `-evidence` (files or directories, including archived siblings),
+subdirectories or their contents, symlinks, hard links, special files or unreadable files. Headers
+that do not end within the 64 KiB scan bound are skipped too. Skipped links, special files,
+unreadable files and overlong headers are named on stderr. The decision cannot be
 used as `--out`; the launcher refuses that destination before writing or archiving anything.
 Each later verification needs a decision newer than the newest counted result.
 

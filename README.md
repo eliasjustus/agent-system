@@ -175,9 +175,11 @@ Each regular result file whose header says `Role: verifier` counts once, whateve
 suffix, including `.attempt-N` archives and interrupted or failed runs. A `Result: running` marker
 counts even if its launcher was killed: the agent may have run. `Result: launch refused`, other
 roles and results in other directories do not count; other roles are never gated. The decision,
-`.saving-*` temporaries, `.log` and `.lock` files (including archived siblings), subdirectories and
-their contents never count. The scan reads at most 64 KiB of each file's header; launcher header
-values are capped at 4 KiB so classification fits within that bound. Symlinks, hard links, special
+`.saving-*` temporaries, `.log` and `.lock` files (including archived siblings), entries ending in
+`-evidence` (files or directories, including archived siblings), subdirectories and their contents
+never count. The scan reads at most 64 KiB of each file's header; headers that do not end within
+that bound are skipped and named on stderr. Launcher header values are capped at 4 KiB so
+classification fits within that bound. Symlinks, hard links, special
 files and unreadable files are skipped and named on stderr. `--out` cannot name `round-decision.md`:
 that destination is refused on stderr before anything is written or archived.
 See [Recovery](product/guides/recovery.md) for repair briefs and decisions.

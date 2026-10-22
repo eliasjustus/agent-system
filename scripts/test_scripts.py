@@ -6570,6 +6570,43 @@ for i in range(35):
         result = self.launch("verifier", "codex", "--author-family", "claude")
         self.assert_launch_refused(result, "round-decision.md")
 
+    def test_ROUND_R5_legacy_refusal_beyond_header_bound_is_skipped(self):
+        self.round_results("Role: verifier\nResult: done\n\n")
+        legacy = self.out.parent / "legacy.attempt-1.md"
+        # Earlier launchers did not cap header values; write their output directly.
+        legacy.write_text("Role: verifier\nSame-family reason: " + "x" * 70000
+                          + "\nResult: launch refused\n\n")
+        original = legacy.read_bytes()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Round:", self.out.read_text())
+        self.assertIn(str(legacy), result.stderr)
+        self.assertIn("header does not end within 65536 bytes", result.stderr)
+        self.assertEqual(legacy.read_bytes(), original)
+
+    def test_ROUND_R6_evidence_files_are_never_opened_or_counted(self):
+        self.round_results("Role: verifier\nResult: done\n\n",
+                           "Role: verifier\nResult: done\n\n")
+        evidence = [self.out.parent / name for name in
+                    ("other-evidence", "other.attempt-1-evidence")]
+        for path in evidence:
+            path.write_text("Role: verifier\nResult: running\n\n")
+        self.round_decision()
+        for path in evidence:
+            os.utime(path, ns=(time.time_ns() + 10**12,) * 2)
+        self.inject_launcher(f'''
+import os
+original = os.open
+def guarded(path, *args, **kwargs):
+    if str(path) in {tuple(map(str, evidence))!r}:
+        raise AssertionError("opened an evidence sibling")
+    return original(path, *args, **kwargs)
+os.open = guarded
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.out.read_text())
+
     def test_ROUND_R6_launcher_artifacts_and_non_headers_never_count(self):
         self.round_results("Role: verifier\nResult: done\n", "Role: verifier\nResult: done\n")
         ignored = ("other.saving-abcdefgh", "other.log", "other.lock", "other.attempt-1.log",

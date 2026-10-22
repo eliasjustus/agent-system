@@ -234,7 +234,7 @@ def verifier_round(out):
     decision = out.parent / "round-decision.md"
     # Read the preceding answer before claim() archives it or writes our marker.
     for path in out.parent.iterdir():
-        if (path == decision or ".saving-" in path.name
+        if (path == decision or path.name.endswith("-evidence") or ".saving-" in path.name
                 or path.suffix in (".log", ".lock")):
             continue
         try:
@@ -256,6 +256,8 @@ def verifier_round(out):
                     key, separator, value = line.rstrip(b"\r\n").partition(b": ")
                     if separator:
                         fields.setdefault(key, value)
+                else:
+                    raise OSError("header does not end within 65536 bytes")
             if fields.get(b"Role") == b"verifier" and fields.get(b"Result") != b"launch refused":
                 count += 1
                 newest = max(newest, info.st_mtime_ns)
