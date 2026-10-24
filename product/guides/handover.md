@@ -45,13 +45,14 @@ processes from Node or network access; otherwise the user's network configuratio
 Network access does not open extra directories. There is no full-access option because these
 cover the known needs.
 
-Codex challengers and reviewers start without plugins, skills or MCP servers; Claude sessions use
-a fixed tool list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory and IO
+Codex challengers and reviewers start without plugins, skills or MCP servers (if discovery fails,
+servers stay enabled and the header says so); Claude sessions use a fixed tool list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory and IO
 room before starting (`Admission:` header); a project's build gate can wait the same way with
 `python3 {{METHOD}}/run.py --wait-for-room`. The header records what each session was given.
 
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
-candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present, a
+candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
+(an executable regular file that exits 0 and leaves tracked files matching the candidate), a
 fresh session of the other family with the role contract, the brief and, for a verifier,
 `guides/verification.md`; its answer and evidence kept unedited in `results/`; the same written
 decision from the third verification on; the worktree removed afterwards.
