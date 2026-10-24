@@ -115,7 +115,7 @@ open extra directories. There is no full-access option because these cover the k
 Challengers and reviewers run on a snapshot of committed, staged and uncommitted files, including
 untracked files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
 the answer's header. Check that list before trusting a review. The answer and its header are saved
-at `--out`, agent stderr and preflight output in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
+at `--out`, agent stderr, preflight output and MCP discovery stderr in a sibling `.log`, and verifier evidence in a sibling `<output-stem>-evidence`
 folder. Empty answers fail. Temporary session folders and their worktrees are removed after the run;
 verifier pool slots remain for reuse.
 Use one suffix per result stem: `r.md` and `r.txt` share a lock, log and evidence.

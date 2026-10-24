@@ -59,14 +59,12 @@ is recorded, do not commit and say so.
 ## On the verdict
 
 Verified and delivered work is signed off by its request, or by the user's merge where the project
-leaves merging to them: record that, then finish as for accepted work. Where you asked a reserved
-question, keep only that change waiting (a draft pull request, the question in the
-task record's `Open for user`) and carry on with the rest. The question is asked once: in the
-delivery message, or, if the user was not in the conversation then, in their next one, one question,
-never a list of pending items. Do not repeat it on later turns or in later conversations, such as
-after a background result; ask again only when the user returns to it or its evidence or
-conditions change. A question several sessions share is asked by the session that owns it. Record
-the reply word for word in the task record with the date. Silence is not acceptance.
+leaves merging to them: record that, then finish as for accepted work. Where a reserved question
+is still open, keep only that change waiting (a draft pull request, the question in the task
+record's `Open for user`) and carry on with the rest. Ask it once, one question, never a list; if the
+user was away, in their next conversation. Do not repeat it, such as after a background result,
+unless the user returns to it or its evidence changes. A question several sessions share is asked
+by the session that owns it. Record the reply word for word with the date.
 
 - **Accepted:** finish cleanup, add the delivered scenarios to the project's `checks.md` with how to
   run them, close the task record. Reply in at most three sentences.

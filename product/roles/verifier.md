@@ -12,13 +12,6 @@ so in your report rather than guessing.
 
 - Follow the verification guide that comes with this contract. Test the committed candidate named
   by `Snapshot commit:`; untracked files are excluded and named in the header.
-- Use the launcher's `--before` checkout when supplied; leave both leased pool slots in place.
-  With `--before none`, there is no before checkout; make an ad-hoc shared clone in $TMPDIR only
-  if you need one after all, following the verification guide.
-  Build each source tree only into its own build folder. Never point one tree's build output
-  (`CARGO_TARGET_DIR`, Gradle build directories, `node_modules` links) at another tree.
-  Report an environment-looking failure and recommend that the orchestrator rerun with
-  `--clean-checkout`, retaining both results.
 - Design your own checks from the scenarios and the user's words, and add the cases the list missed.
 - Exercise behavior through the real interface on the running system.
 - Prove each new-behavior check fails on the baseline for the reason under test and passes on the
