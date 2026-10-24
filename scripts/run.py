@@ -23,6 +23,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import tomllib
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
@@ -1489,6 +1490,48 @@ def launch(parser, args, result):
     if found is None:
         return result.refused(f"Cannot find agent executable: {executable}")
     executable = os.path.abspath(found)
+    shield = ("none (investigator)" if not shielded else
+              "private folder denied (codex permission profile)" if args.family == "codex" else
+              "private folder hidden (bwrap)")
+    result.header += f"Shield: {shield}\n"
+    bwrap_prefix = []
+    session_paths = []
+    if shielded:
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").resolve()
+        session_paths = [path for path in (runtime, Path("/tmp/.X11-unix")) if path.exists()]
+    if shielded and args.family == "codex":
+        config_path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+        try:
+            with config_path.open("rb") as config_file:
+                config = tomllib.load(config_file)
+        except FileNotFoundError:
+            config = {}
+        # A legacy sandbox mode overrides permission profiles, including when
+        # selected through a user profile. Refuse rather than lose the deny.
+        if "sandbox_mode" in config or any("sandbox_mode" in profile
+                for profile in config.get("profiles", {}).values()):
+            return result.refused(f"Codex config sets sandbox_mode: {config_path}")
+    if shielded and (args.family == "claude" or (args.role == "verifier" and git(
+            repo, "ls-tree", candidate, "--", ".agents/preflight"))):
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            return result.refused("Cannot find bwrap for private folder shield")
+        bwrap_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+                         "--proc", "/proc", "--tmpfs", str(private), "--remount-ro", str(private)]
+        for path in [*session_paths, *(path for path in (
+                Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
+                Path.home() / ".codex/ipc") if path.exists())]:
+            bwrap_prefix += ["--tmpfs", str(path)]
+        # Unset inside bwrap: the outer systemd-run scope keeps its environment.
+        for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
+                     "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
+            bwrap_prefix += ["--unsetenv", name]
+        bwrap_prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
+        probe = subprocess.run([*bwrap_prefix, "true"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if probe.returncode:
+            return result.refused("Private folder shield probe failed: "
+                                  + (probe.stderr.strip() or f"exit {probe.returncode}"))
     restricted = args.family == "codex" and args.role in ("challenger", "reviewer")
     environment = ("restricted; discovery did not run"
                    if restricted else "user configuration")
@@ -1537,6 +1580,7 @@ def launch(parser, args, result):
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
                              + round_header
                              + f"Executable: {header_value(executable)}\n"
+                             + f"Shield: {shield}\n"
                              + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
                                 f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
@@ -1706,7 +1750,7 @@ def launch(parser, args, result):
                     started = time.monotonic()
                     result.spawning = True
                     try:
-                        process = subprocess.Popen(supervised([str(work / ".agents/preflight")]),
+                        process = subprocess.Popen(supervised([*bwrap_prefix, str(work / ".agents/preflight")]),
                                                    cwd=work, env=agent_env, stdin=subprocess.DEVNULL,
                                                    stdout=preflight_log, stderr=preflight_log,
                                                    start_new_session=True,
@@ -1762,15 +1806,23 @@ def launch(parser, args, result):
                                f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
             if args.family == "codex":
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
-                command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}",
-                           "-s", "workspace-write" if writable else "read-only",
-                           "-C", str(cwd), "-o", str(answer)]
+                command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
+                if shielded:
+                    filesystem = ", ".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
+                                           for path in [private, *session_paths])
+                    command += ["-c", 'default_permissions="am-shield"',
+                                "-c", 'permissions.am-shield.extends="'
+                                + (":workspace" if writable else ":read-only") + '"',
+                                "-c", f"permissions.am-shield.filesystem={{{filesystem}}}"]
+                else:
+                    command += ["-s", "read-only"]
+                command += ["-C", str(cwd), "-o", str(answer)]
                 for path in [*roots, *([source] if args.role == "verifier" else []),
                              *([before] if before else []),
                              *([temporary] if writable else [])]:
                     command += ["--add-dir", str(path)]
                 if args.network:
-                    command += ["-c", "sandbox_workspace_write.network_access=true"]
+                    command += ["-c", "permissions.am-shield.network.enabled=true"]
                 if restricted:
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
@@ -1808,7 +1860,7 @@ def launch(parser, args, result):
                         command += ["--add-dir", str(before)]
                 if writable:
                     command += ["--add-dir", str(temporary)]
-            command = supervised(command)
+            command = supervised([*(bwrap_prefix if args.family == "claude" else []), *command])
             update_header()
             if args.family == "codex" and preflight_log is not None:
                 with open_result(answer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb"):
@@ -1818,7 +1870,11 @@ def launch(parser, args, result):
                   if args.family == "claude" else open(os.devnull, "wb")) as stdout:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 log_flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if restricted else os.O_TRUNC)
-                with (preflight_log if preflight_log is not None else
+                # Reopen the held inode, not a path preflight could replace with
+                # a link. The agent must never inherit the read/write descriptor.
+                with (os.fdopen(os.open(f"/proc/self/fd/{preflight_log.fileno()}",
+                                       os.O_WRONLY | os.O_APPEND), "ab")
+                      if preflight_log is not None else
                       open_result(out.with_suffix(".log"), log_flags, "ab" if restricted else "wb")) as log:
                     # Defer signals until Popen returns the identity needed to stop
                     # the child, including a signal delivered inside Popen itself.

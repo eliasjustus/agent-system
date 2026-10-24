@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import unittest
 
 
@@ -86,6 +87,26 @@ command = args[args.index("--") + 1:]
 os.execvp(command[0], command)
 '''
 
+BWRAP = '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+command = args[args.index("--") + 1:]
+with pathlib.Path(os.environ["RECORD"] + ".bwrap").open("a") as record:
+    record.write(json.dumps({"argv": args, "scope": os.environ.get("FAKE_SCOPE_UNIT")}) + "\\n")
+if command == ["true"]:
+    if os.environ.get("BWRAP_PROBE_FAIL"):
+        print("namespace probe refused", file=sys.stderr)
+        sys.exit(23)
+    sys.exit(0)
+if os.environ.get("BWRAP_SETUP_FAIL"):
+    print("namespace setup refused", file=sys.stderr)
+    sys.exit(24)
+for i, arg in enumerate(args[:args.index("--")]):
+    if arg == "--unsetenv":
+        os.environ.pop(args[i + 1], None)
+os.execvp(command[0], command)
+'''
+
 STOP_SCOPE = '''#!/usr/bin/env python3
 import os, pathlib, signal, sys
 unit = sys.argv[-1]
@@ -143,12 +164,30 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_MODEL", None)
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
+        self.env.pop("CODEX_HOME", None)
         # Ordinary launcher tests must not depend on this host's current load.
         for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
                             "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
                             "MAX_WAIT": "0"}.items():
             self.env["AGENT_ADMISSION_" + name] = value
         self.configure_scope()
+        bwrap = self.bin / "bwrap"
+        bwrap.write_text(BWRAP)
+        bwrap.chmod(0o755)
+
+    def expected_shield_filesystem(self, private=None):
+        entries = {str(private or self.private): "deny"}
+        runtime = Path(self.env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").resolve()
+        if runtime.exists():
+            entries[str(runtime)] = "deny"
+        if Path("/tmp/.X11-unix").exists():
+            entries["/tmp/.X11-unix"] = "deny"
+        return entries
+
+    def expected_bwrap_paths(self, private=None):
+        return [*self.expected_shield_filesystem(private), *(str(path) for path in (
+            Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
+            self.home / ".codex/ipc") if path.exists())]
 
     def configure_scope(self, present=True):
         self.bin = self.base / "bin"
@@ -4164,10 +4203,17 @@ subprocess.run([sys.executable, "-c",
                     writable = role in ("builder", "verifier")
                     evidence = str(Path(record["tmpdir"]).parent / "evidence")
                     if family == "codex":
-                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
-                                    "-s", "workspace-write" if writable else "read-only",
-                                    "-C", record["cwd"], "-o",
-                                    str(Path(record["tmpdir"]).parent / "answer")]
+                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]
+                        if role == "investigator":
+                            expected += ["-s", "read-only"]
+                        else:
+                            expected += ["-c", 'default_permissions="am-shield"',
+                                         "-c", 'permissions.am-shield.extends=":workspace"',
+                                         "-c", "permissions.am-shield.filesystem={"
+                                         + ", ".join(json.dumps(path) + '="deny"' for path in
+                                                     self.expected_shield_filesystem()) + "}"]
+                        expected += ["-C", record["cwd"], "-o",
+                                     str(Path(record["tmpdir"]).parent / "answer")]
                     else:
                         settings = {"permissions": {"deny": [] if role == "investigator" else
                                     [f"{tool}(/{self.private}/**)" for tool in ("Read", "Edit")]}}
@@ -4198,12 +4244,323 @@ subprocess.run([sys.executable, "-c",
                                      "--network", "--writable", cache)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = json.loads(self.record.read_text())["argv"]
-                self.assertIn("sandbox_workspace_write.network_access=true", args)
+                self.assertIn("permissions.am-shield.network.enabled=true", args)
+                self.assertNotIn("sandbox_workspace_write.network_access=true", args)
                 self.assertIn(str(cache), args)
                 self.assertIn("Network: on\n", self.out.read_text())
                 self.assertIn("Requested sandbox: workspace-write\n", self.out.read_text())
                 self.assertIn("Requested environment: user configuration\n", self.out.read_text())
                 self.assertFalse(Path(str(self.record) + ".discovery").exists())
+
+    def test_SHIELD_S7_claude_refuses_before_leases_without_working_bwrap(self):
+        for failure in ("missing", "probe"):
+            with self.subTest(failure=failure):
+                bwrap = self.bin / "bwrap"
+                if failure == "missing":
+                    bwrap.unlink()
+                    reason = "Cannot find bwrap for private folder shield"
+                else:
+                    bwrap.write_text(BWRAP)
+                    bwrap.chmod(0o755)
+                    self.env["BWRAP_PROBE_FAIL"] = "1"
+                    reason = "Private folder shield probe failed: namespace probe refused"
+                for role in ("builder", "verifier", "challenger", "reviewer"):
+                    scopes = tuple(self.scope_state.iterdir())
+                    session_root = self.home / ".cache/am"
+                    sessions_existed = session_root.exists()
+                    result = self.launch(role, "claude", "--author-family", "codex")
+                    self.assert_launch_refused(result, reason, scopes)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(self.pool_root().exists())
+                    self.assertEqual(session_root.exists(), sessions_existed)
+                result = self.launch("investigator", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+                self.record.unlink()
+
+    def test_SHIELD_S7_codex_refuses_sandbox_mode_in_user_config(self):
+        for custom in (False, True):
+            config_home = self.home / ("custom-codex" if custom else ".codex")
+            config_home.mkdir()
+            if custom:
+                self.env["CODEX_HOME"] = str(config_home)
+            for contents in ('sandbox_mode = "workspace-write"\n',
+                             'profile = "unsafe"\n[profiles.unsafe]\nsandbox_mode = "read-only"\n'):
+                (config_home / "config.toml").write_text(contents)
+                for role in ("builder", "verifier", "challenger", "reviewer"):
+                    with self.subTest(custom=custom, contents=contents, role=role):
+                        scopes = tuple(self.scope_state.iterdir())
+                        result = self.launch(role, "codex", "--author-family", "claude")
+                        self.assert_launch_refused(result, f"Codex config sets sandbox_mode: {config_home / 'config.toml'}", scopes)
+                        self.assertFalse(self.record.exists())
+                        self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                        self.assertFalse(self.pool_root().exists())
+                result = self.launch("investigator", "codex")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+                self.record.unlink()
+            (config_home / "config.toml").write_text('sandbox_mode = [invalid TOML\n')
+            result = self.launch("builder", "codex")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("Result: launch refused\n", self.out.read_text())
+            self.assertFalse(self.record.exists())
+            (config_home / "config.toml").write_text('# sandbox_mode = "read-only"\n')
+            result = self.launch("builder", "codex")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.record.unlink()
+
+    def test_SHIELD_S9_bwrap_prefix_and_header_for_every_role(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        self.install_preflight('print("preflight ran", flush=True)')
+        for family in ("claude", "codex"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    wrapped = Path(str(self.record) + ".bwrap")
+                    wrapped.unlink(missing_ok=True)
+                    result = self.launch(role, family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    if role == "investigator" or (family == "codex" and role != "verifier"):
+                        self.assertFalse(wrapped.exists())
+                    else:
+                        self.assertTrue(wrapped.exists())
+                        calls = [json.loads(line) for line in wrapped.read_text().splitlines()]
+                        prefix = ["--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+                                  "--proc", "/proc", "--tmpfs", str(self.private),
+                                  "--remount-ro", str(self.private)]
+                        for path in self.expected_bwrap_paths()[1:]:
+                            prefix += ["--tmpfs", path]
+                        for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
+                                     "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
+                            prefix += ["--unsetenv", name]
+                        prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
+                        expected = [{"argv": prefix + ["true"], "scope": None}]
+                        if role == "verifier":
+                            expected.append({"argv": prefix + [str(Path(record["cwd"]) / ".agents/preflight")],
+                                             "scope": calls[1]["scope"]})
+                        if family == "claude":
+                            expected.append({"argv": prefix + [self.env["AGENT_CLAUDE_CMD"], *record["argv"]],
+                                             "scope": calls[-1]["scope"]})
+                        self.assertEqual(calls, expected)
+                        for call in calls[1:]:
+                            self.assertTrue(call["scope"].startswith(f"agent-{role}-"))
+                    shield = ("none (investigator)" if role == "investigator" else
+                              "private folder hidden (bwrap)" if family == "claude" else
+                              "private folder denied (codex permission profile)")
+                    self.assertIn(f"Shield: {shield}\n", self.out.read_text())
+
+    def test_SHIELD_preflight_refuses_without_working_bwrap_for_either_family(self):
+        marker = self.base / "preflight-ran"
+        self.install_preflight(f'pathlib.Path({str(marker)!r}).touch()')
+        for failure in ("missing", "probe", "setup"):
+            for family in ("claude", "codex"):
+                with self.subTest(family=family, failure=failure):
+                    bwrap = self.bin / "bwrap"
+                    bwrap.unlink(missing_ok=True)
+                    self.env.pop("BWRAP_PROBE_FAIL", None)
+                    self.env.pop("BWRAP_SETUP_FAIL", None)
+                    if failure == "missing":
+                        reason = "Cannot find bwrap for private folder shield"
+                    else:
+                        bwrap.write_text(BWRAP)
+                        bwrap.chmod(0o755)
+                        self.env["BWRAP_" + failure.upper() + "_FAIL"] = "1"
+                        reason = ("Private folder shield probe failed: namespace probe refused"
+                                  if failure == "probe" else ".agents/preflight exited 24")
+                    scopes = tuple(self.scope_state.iterdir())
+                    result = self.launch("verifier", family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assert_preflight_refused(result, reason)
+                    self.assertFalse(marker.exists())
+                    if failure != "setup":
+                        self.assertEqual(tuple(self.scope_state.iterdir()), scopes)
+                        self.assertFalse(self.pool_root().exists())
+                        self.assertFalse((self.home / ".cache/am").exists())
+
+    def test_SHIELD_S7_later_bwrap_setup_failure_is_failed_session(self):
+        self.env["BWRAP_SETUP_FAIL"] = "1"
+        result = self.launch("builder", "claude")
+        self.assertEqual(result.returncode, 24, result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertNotIn("Result: launch refused", self.out.read_text())
+        self.assertIn("Exit code: 24\n", self.out.read_text())
+        self.assertIn("namespace setup refused", self.out.with_suffix(".log").read_text())
+
+    def test_SHIELD_S10_resolved_and_unresolved_private_spellings(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        resolved = self.private
+        resolved.mkdir()
+        for spelling in ("symlink", "parent-symlink", "dotdot"):
+            if spelling == "symlink":
+                unresolved = self.home / 'alias "private"'
+                unresolved.symlink_to(resolved, target_is_directory=True)
+            elif spelling == "parent-symlink":
+                alias = self.base / "alias-home"
+                alias.symlink_to(self.home, target_is_directory=True)
+                unresolved = alias / "private"
+            else:
+                child = self.home / "child"
+                child.mkdir()
+                unresolved = child / ".." / "private"
+            for family in ("codex", "claude"):
+                with self.subTest(spelling=spelling, family=family):
+                    result = self.launch("builder", family, "--private", unresolved)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = json.loads(self.record.read_text())["argv"]
+                    if family == "codex":
+                        entry = next(args[i + 1] for i, arg in enumerate(args)
+                                     if arg == "-c" and args[i + 1].startswith("permissions.am-shield.filesystem="))
+                        self.assertEqual(tomllib.loads(entry)["permissions"]["am-shield"]["filesystem"],
+                                         self.expected_shield_filesystem(resolved))
+                    else:
+                        calls = [json.loads(line)["argv"] for line in
+                                 Path(str(self.record) + ".bwrap").read_text().splitlines()[-2:]]
+                        for call in calls:
+                            mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
+                            self.assertEqual(mounts, self.expected_bwrap_paths(resolved))
+                            self.assertEqual([call[i + 1] for i, arg in enumerate(call)
+                                              if arg == "--remount-ro"], [str(resolved)])
+                        settings = json.loads(args[args.index("--settings") + 1])
+                        self.assertEqual(settings["permissions"]["deny"],
+                                         [f"{tool}(/{resolved}/**)" for tool in ("Read", "Edit")])
+
+    def test_SHIELD_session_directories_are_hidden_only_when_present(self):
+        runtime_target = self.base / 'runtime "target"'
+        runtime = self.base / "runtime-link"
+        runtime.symlink_to(runtime_target, target_is_directory=True)
+        self.env["XDG_RUNTIME_DIR"] = str(runtime)
+        for runtime_present in (False, True):
+            if runtime_present:
+                runtime_target.mkdir()
+                (runtime_target / "hypr").mkdir()
+                (runtime_target / "bus").touch()
+                (runtime_target / "systemd").mkdir()
+            for x11_present in (False, True):
+                self.inject_launcher(f"""
+                    from pathlib import Path
+                    original_exists = Path.exists
+                    daemon_paths = {tuple(map(str, (Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"), self.home / ".codex/ipc")))!r}
+                    Path.exists = lambda path: (False if str(path) in daemon_paths else
+                                                {x11_present!r} if str(path) == "/tmp/.X11-unix"
+                                                else original_exists(path))
+                """)
+                expected = [str(self.private)]
+                if runtime_present:
+                    expected.append(str(runtime_target))
+                if x11_present:
+                    expected.append("/tmp/.X11-unix")
+                for family in ("claude", "codex"):
+                    for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                        with self.subTest(runtime=runtime_present, x11=x11_present,
+                                          family=family, role=role):
+                            wrapped = Path(str(self.record) + ".bwrap")
+                            wrapped.unlink(missing_ok=True)
+                            if role == "verifier":
+                                self.round_decision()
+                            result = self.launch(role, family, "--author-family",
+                                                 "codex" if family == "claude" else "claude")
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            args = json.loads(self.record.read_text())["argv"]
+                            if family == "claude":
+                                if role == "investigator":
+                                    self.assertFalse(wrapped.exists())
+                                    continue
+                                calls = [json.loads(line)["argv"] for line in
+                                         wrapped.read_text().splitlines()]
+                                self.assertEqual(len(calls), 2)
+                                for call in calls:
+                                    self.assertNotIn("--ro-bind", call)
+                                    self.assertEqual([call[i + 1] for i, arg in enumerate(call)
+                                                      if arg == "--tmpfs"], expected)
+                            else:
+                                entries = [args[i + 1] for i, arg in enumerate(args)
+                                           if arg == "-c" and args[i + 1].startswith(
+                                               "permissions.am-shield.filesystem=")]
+                                if role == "investigator":
+                                    self.assertEqual(entries, [])
+                                else:
+                                    self.assertEqual(len(entries), 1)
+                                    self.assertEqual(
+                                        tomllib.loads(entries[0])["permissions"]["am-shield"]["filesystem"],
+                                        {path: "deny" for path in expected})
+
+    def test_SHIELD_daemon_directories_are_hidden_only_when_present(self):
+        paths = (f"/tmp/cc-daemon-{os.getuid()}", f"/tmp/codex-daemon-{os.getuid()}",
+                 str(self.home / ".codex/ipc"))
+        for present in ((), paths[:1], paths[1:2], paths[2:], paths):
+            with self.subTest(present=present):
+                self.inject_launcher(f"""
+                    from pathlib import Path
+                    original_exists = Path.exists
+                    Path.exists = lambda path: (str(path) in {present!r} if str(path) in {paths!r}
+                                                else original_exists(path))
+                """)
+                wrapped = Path(str(self.record) + ".bwrap")
+                wrapped.unlink(missing_ok=True)
+                result = self.launch("builder", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line)["argv"] for line in wrapped.read_text().splitlines()]
+                self.assertEqual(len(calls), 2)
+                for call in calls:
+                    mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
+                    self.assertEqual(mounts, [*self.expected_shield_filesystem(), *present])
+
+    def test_SHIELD_session_environment_is_removed_only_inside_claude_shield(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        Path(self.env["XDG_RUNTIME_DIR"]).mkdir()
+        names = ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
+                 "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK")
+        values = ("unix:path=" + str(self.base / "bus"), ":1", "wayland-1",
+                  "test-hyprland-instance", str(self.base / "ssh-agent"))
+        environment = dict(zip(names, values))
+        environment["XDG_RUNTIME_DIR"] = self.env["XDG_RUNTIME_DIR"]
+        self.env.update(environment)
+        scope = self.bin / "systemd-run"
+        scope.write_text(SCOPE.replace('unit = next(', f'''
+pathlib.Path(os.environ["RECORD"] + ".scope-env").write_text(
+    json.dumps({{name: os.environ.get(name) for name in {tuple(environment)!r}}}))
+unit = next('''))
+        self.agent_extra(f'''
+record["session_env"] = {{name: os.environ.get(name) for name in {tuple(environment)!r}}}
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("claude", "codex"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    expected = dict(environment)
+                    if family == "claude" and role != "investigator":
+                        expected.update(dict.fromkeys(names))
+                    self.assertEqual(record["session_env"], expected)
+                    self.assertEqual(json.loads(Path(str(self.record) + ".scope-env").read_text()),
+                                     environment, "outer systemd-run must retain its environment")
+
+    def test_SHIELD_agent_stdout_stderr_are_write_only_after_preflight(self):
+        self.install_preflight('print("preflight secret", flush=True)')
+        self.agent_extra('''
+import fcntl
+for descriptor in (1, 2):
+    assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+    try:
+        os.pread(descriptor, 1024, 0)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("agent can read output descriptor")
+record["descriptors_checked"] = True
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family)
+                self.assertTrue(record["descriptors_checked"])
+                self.assertEqual(self.out.with_suffix(".log").read_text(), "preflight secret\n")
 
     def test_CE_S4_network_refused_before_start_for_other_roles_and_family(self):
         for family in ("codex", "claude"):
@@ -4239,7 +4596,11 @@ subprocess.run([sys.executable, "-c",
                     self.assertIn(f"Executable: {absolute}\n", self.out.read_text())
                     scope = next(p for p in self.scope_state.iterdir() if p.suffix != ".stop")
                     command = json.loads(scope.read_text())
-                    self.assertEqual(command[command.index("--") + 1], str(absolute))
+                    command = command[command.index("--") + 1:]
+                    if family == "claude":
+                        self.assertEqual(command[0], str(self.bin / "bwrap"))
+                        command = command[command.index("--") + 1:]
+                    self.assertEqual(command[0], str(absolute))
                     for path in self.scope_state.iterdir():
                         path.unlink()
                     if family == "codex":
@@ -5107,8 +5468,18 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                     if family == "codex":
                         self.assertEqual(args[:5], ["exec", "-m", "gpt-6.1-sol", "-c",
                                                    "model_reasoning_effort=high"])
-                        self.assertEqual(args[args.index("-s") + 1],
-                                         "workspace-write" if writable else "read-only")
+                        if role == "investigator":
+                            self.assertEqual(args[args.index("-s") + 1], "read-only")
+                        else:
+                            self.assertNotIn("-s", args)
+                            self.assertNotIn("--sandbox", args)
+                            config = tomllib.loads("\n".join(
+                                args[i + 1] for i, arg in enumerate(args) if arg == "-c"
+                                and args[i + 1].startswith(("default_permissions=", "permissions."))))
+                            self.assertEqual(config["default_permissions"], "am-shield")
+                            self.assertEqual(config["permissions"]["am-shield"], {
+                                "extends": ":workspace" if writable else ":read-only",
+                                "filesystem": self.expected_shield_filesystem()})
                         self.assertEqual(args[args.index("-C") + 1], record["cwd"])
                         self.assertEqual(args[-1], "-")
                         roots = [args[i + 1] for i, arg in enumerate(args) if arg == "--add-dir"]
