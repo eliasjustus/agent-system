@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+from urllib.parse import unquote
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
@@ -1404,8 +1405,7 @@ def launch(parser, args, result):
     round_header = result.round_header
     result.header += round_header
     brief = args.brief.expanduser().read_text()
-    private_spelling = Path(args.private).expanduser().absolute()
-    private = private_spelling.resolve()
+    private = Path(args.private).expanduser().resolve()
     repo, out = args.repo.expanduser().resolve(), result.out
     candidate, before_commit, untracked = "", "", []
     if args.role == "verifier":
@@ -1514,9 +1514,22 @@ def launch(parser, args, result):
             return result.refused("Cannot find bwrap for private folder shield")
         shield_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
                          "--proc", "/proc", "--tmpfs", str(private), "--remount-ro", str(private)]
-        if private_spelling != private and not private_spelling.is_symlink():
-            shield_prefix += ["--tmpfs", str(private_spelling), "--remount-ro", str(private_spelling)]
-        shield_prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        bus_paths = {runtime / "bus"}
+        for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
+            if address.startswith("unix:"):
+                for field in address.removeprefix("unix:").split(","):
+                    name, separator, value = field.partition("=")
+                    if name == "path" and separator:
+                        bus_paths.add(Path(unquote(value)))
+        for path in sorted(bus_paths):
+            if path.exists():
+                shield_prefix += ["--ro-bind", "/dev/null", str(path)]
+        if (runtime / "systemd").exists():
+            shield_prefix += ["--tmpfs", str(runtime / "systemd")]
+        # Unset inside bwrap: the outer systemd-run scope still needs the bus.
+        shield_prefix += ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS",
+                          "--cap-drop", "ALL", "--die-with-parent", "--"]
         probe = subprocess.run([*shield_prefix, "true"], stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if probe.returncode:
@@ -1798,8 +1811,7 @@ def launch(parser, args, result):
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
                 command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
                 if shielded:
-                    filesystem = ",".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
-                                          for path in dict.fromkeys((private, private_spelling)))
+                    filesystem = json.dumps(str(private), ensure_ascii=False) + '="deny"'
                     command += ["-c", 'default_permissions="am-shield"',
                                 "-c", 'permissions.am-shield.extends="'
                                 + (":workspace" if writable else ":read-only") + '"',

@@ -310,9 +310,10 @@ mounts and keeps its Read/Edit deny settings. The header says `Shield: private f
 permission profile)`, `Shield: private folder hidden (bwrap)` or `Shield: none (investigator)`.
 Missing bubblewrap, a failed namespace probe, or `sandbox_mode` in the Codex user config
 (`$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml`) refuses a shielded launch with exit 2
-and `Result: launch refused`. Preflight runs outside the shield. Outside brokers (the systemd user
-manager and external MCP/file servers in Codex user configuration), pre-existing hard links and
-bind mounts are not covered. Give checking sessions only the brief, role contract and evidence they need.
+and `Result: launch refused`. Preflight runs outside the shield. Claude sessions also hide the user
+bus socket and systemd runtime directory. External MCP/file servers in Codex user configuration
+(which run outside its sandbox), pre-existing hard links and bind mounts are not covered.
+Give checking sessions only the brief, role contract and evidence they need.
 
 For a committed candidate, the manual route is a detached worktree at its exact commit:
 

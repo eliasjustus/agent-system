@@ -101,6 +101,9 @@ if command == ["true"]:
 if os.environ.get("BWRAP_SETUP_FAIL"):
     print("namespace setup refused", file=sys.stderr)
     sys.exit(24)
+for i, arg in enumerate(args[:args.index("--")]):
+    if arg == "--unsetenv":
+        os.environ.pop(args[i + 1], None)
 os.execvp(command[0], command)
 '''
 
@@ -4292,6 +4295,8 @@ subprocess.run([sys.executable, "-c",
             self.record.unlink()
 
     def test_SHIELD_S9_bwrap_prefix_and_header_for_every_role(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         self.install_preflight('print("preflight ran", flush=True)')
         for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
             with self.subTest(role=role):
@@ -4307,7 +4312,8 @@ subprocess.run([sys.executable, "-c",
                     self.assertEqual(len(calls), 2, "preflight must not be wrapped")
                     prefix = ["--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
                               "--proc", "/proc", "--tmpfs", str(self.private),
-                              "--remount-ro", str(self.private), "--cap-drop", "ALL",
+                              "--remount-ro", str(self.private),
+                              "--unsetenv", "DBUS_SESSION_BUS_ADDRESS", "--cap-drop", "ALL",
                               "--die-with-parent", "--"]
                     self.assertEqual(calls[0], {"argv": prefix + ["true"], "scope": None})
                     record = json.loads(self.record.read_text())
@@ -4330,6 +4336,8 @@ subprocess.run([sys.executable, "-c",
         self.assertIn("namespace setup refused", self.out.with_suffix(".log").read_text())
 
     def test_SHIELD_S10_resolved_and_unresolved_private_spellings(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         resolved = self.private
         resolved.mkdir()
         for spelling in ("symlink", "parent-symlink", "dotdot"):
@@ -4353,18 +4361,75 @@ subprocess.run([sys.executable, "-c",
                         entry = next(args[i + 1] for i, arg in enumerate(args)
                                      if arg == "-c" and args[i + 1].startswith("permissions.am-shield.filesystem="))
                         self.assertEqual(tomllib.loads(entry)["permissions"]["am-shield"]["filesystem"],
-                                         {str(resolved): "deny", str(unresolved): "deny"})
+                                         {str(resolved): "deny"})
                     else:
                         calls = [json.loads(line)["argv"] for line in
                                  Path(str(self.record) + ".bwrap").read_text().splitlines()[-2:]]
                         for call in calls:
                             mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
-                            self.assertEqual(mounts, [str(resolved)] +
-                                             ([] if spelling == "symlink" else [str(unresolved)]))
+                            self.assertEqual(mounts, [str(resolved)])
                             self.assertEqual([call[i + 1] for i, arg in enumerate(call) if arg == "--remount-ro"], mounts)
                         settings = json.loads(args[args.index("--settings") + 1])
                         self.assertEqual(settings["permissions"]["deny"],
                                          [f"{tool}(/{resolved}/**)" for tool in ("Read", "Edit")])
+
+    def test_SHIELD_claude_masks_existing_user_manager_endpoints(self):
+        for present in ((), ("bus",), ("address",), ("systemd",),
+                        ("bus", "address", "systemd")):
+            with self.subTest(present=present):
+                root = self.base / ("runtime-" + "-".join(present))
+                root.mkdir()
+                runtime = root / "user"
+                runtime.mkdir()
+                bus = runtime / "bus"
+                address = root / "other bus"
+                systemd = runtime / "systemd"
+                self.env["XDG_RUNTIME_DIR"] = str(runtime)
+                self.env["DBUS_SESSION_BUS_ADDRESS"] = (
+                    "unix:path=" + str(address).replace(" ", "%20") + ",guid=test")
+                for name, path in (("bus", bus), ("address", address)):
+                    if name in present:
+                        # Fake bwrap checks arguments; no live bus is needed.
+                        path.touch()
+                if "systemd" in present:
+                    systemd.mkdir()
+                result = self.launch("builder", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line)["argv"] for line in
+                         Path(str(self.record) + ".bwrap").read_text().splitlines()[-2:]]
+                for call in calls:
+                    masks = [call[i + 1:i + 3] for i, arg in enumerate(call) if arg == "--ro-bind"]
+                    expected = [["/dev/null", str(path)] for name, path in
+                                (("address", address), ("bus", bus)) if name in present]
+                    self.assertEqual(masks, expected)
+                    mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
+                    self.assertEqual(mounts, [str(self.private)] +
+                                     ([str(systemd)] if "systemd" in present else []))
+
+    def test_SHIELD_bus_environment_is_removed_only_inside_claude_shield(self):
+        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
+        address = "unix:path=" + str(self.base / "bus")
+        self.env["DBUS_SESSION_BUS_ADDRESS"] = address
+        scope = self.bin / "systemd-run"
+        scope.write_text(SCOPE.replace('unit = next(', '''
+pathlib.Path(os.environ["RECORD"] + ".scope-env").write_text(
+    json.dumps(os.environ.get("DBUS_SESSION_BUS_ADDRESS")))
+unit = next('''))
+        self.agent_extra('''
+record["bus"] = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("claude", "codex"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    expected = None if family == "claude" and role != "investigator" else address
+                    self.assertEqual(record["bus"], expected)
+                    self.assertEqual(json.loads(Path(str(self.record) + ".scope-env").read_text()),
+                                     address, "outer systemd-run must retain its bus address")
 
     def test_SHIELD_agent_stdout_stderr_are_write_only_after_preflight(self):
         self.install_preflight('print("preflight secret", flush=True)')
