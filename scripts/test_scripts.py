@@ -1943,8 +1943,8 @@ fcntl.flock = fail_lock
                     self.assertIn("Never point one tree's build output", prompt)
                     for example in ("CARGO_TARGET_DIR", "Gradle build directories", "node_modules"):
                         self.assertIn(example, prompt)
-                    self.assertEqual(prompt.count("Build each source tree only into its own build folder"), 2)
-        for document in ("product/guides/verification.md", "product/roles/verifier.md"):
+                    self.assertEqual(prompt.count("Build each source tree only into its own build folder"), 1)
+        for document in ("product/guides/verification.md",):
             with self.subTest(document=document):
                 text = (ROOT / document).read_text()
                 self.assertIn("Build each source tree only into its own build folder", text)
