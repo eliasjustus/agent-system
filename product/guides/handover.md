@@ -45,8 +45,9 @@ processes from Node or network access; otherwise the user's network configuratio
 Network access does not open extra directories. There is no full-access option because these
 cover the known needs.
 
-Codex challengers and reviewers start without plugins, skills or MCP servers (if discovery fails,
-servers stay enabled and the header says so); Claude sessions use a fixed tool list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory and IO
+Codex challengers and reviewers start without plugins, skills or MCP servers (best effort: servers
+that cannot be disabled stay enabled and the header reports it); Claude sessions use a fixed tool
+list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory and IO
 room before starting (`Admission:` header); a project's build gate can wait the same way with
 `python3 {{METHOD}}/run.py --wait-for-room`. The header records what each session was given.
 
