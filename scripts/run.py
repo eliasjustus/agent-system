@@ -440,8 +440,11 @@ class ResultDestination:
             except Exception as report_error:
                 # Remove only our stale running marker if neither write succeeds.
                 try:
-                    if (self.written is not None
-                            and os.path.samestat(self.out.lstat(), self.written)):
+                    # Inode numbers are reused at once on tmpfs: a symlink planted in
+                    # place of our marker can carry its number, so match the type too.
+                    current = self.out.lstat()
+                    if (self.written is not None and os.path.samestat(current, self.written)
+                            and stat.S_IFMT(current.st_mode) == stat.S_IFMT(self.written.st_mode)):
                         self.out.unlink(missing_ok=True)
                     else:
                         diagnostic(f"Result path {self.out} holds a file the launcher does not own")
