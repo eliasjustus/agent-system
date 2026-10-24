@@ -165,7 +165,6 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
         self.env.pop("CODEX_HOME", None)
-        self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
         # Ordinary launcher tests must not depend on this host's current load.
         for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
                             "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
@@ -178,9 +177,17 @@ class ScriptsTest(unittest.TestCase):
 
     def expected_shield_filesystem(self, private=None):
         entries = {str(private or self.private): "deny"}
+        runtime = Path(self.env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").resolve()
+        if runtime.exists():
+            entries[str(runtime)] = "deny"
         if Path("/tmp/.X11-unix").exists():
             entries["/tmp/.X11-unix"] = "deny"
         return entries
+
+    def expected_bwrap_paths(self, private=None):
+        return [*self.expected_shield_filesystem(private), *(str(path) for path in (
+            Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
+            self.home / ".codex/ipc") if path.exists())]
 
     def configure_scope(self, present=True):
         self.bin = self.base / "bin"
@@ -4306,37 +4313,71 @@ subprocess.run([sys.executable, "-c",
         self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")
         self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         self.install_preflight('print("preflight ran", flush=True)')
-        for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
-            with self.subTest(role=role):
-                wrapped = Path(str(self.record) + ".bwrap")
-                wrapped.unlink(missing_ok=True)
-                result = self.launch(role, "claude", "--author-family", "codex")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                if role == "investigator":
-                    self.assertFalse(wrapped.exists())
-                    shield = "none (investigator)"
-                else:
-                    calls = [json.loads(line) for line in wrapped.read_text().splitlines()]
-                    self.assertEqual(len(calls), 2, "preflight must not be wrapped")
-                    prefix = ["--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
-                              "--proc", "/proc", "--tmpfs", str(self.private),
-                              "--remount-ro", str(self.private)]
-                    if Path("/tmp/.X11-unix").exists():
-                        prefix += ["--tmpfs", "/tmp/.X11-unix"]
-                    for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
-                                 "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
-                        prefix += ["--unsetenv", name]
-                    prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
-                    self.assertEqual(calls[0], {"argv": prefix + ["true"], "scope": None})
+        for family in ("claude", "codex"):
+            for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    wrapped = Path(str(self.record) + ".bwrap")
+                    wrapped.unlink(missing_ok=True)
+                    result = self.launch(role, family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     record = json.loads(self.record.read_text())
-                    self.assertEqual(calls[1]["argv"], prefix + [self.env["AGENT_CLAUDE_CMD"], *record["argv"]])
-                    self.assertTrue(calls[1]["scope"].startswith(f"agent-{role}-"))
-                    shield = "private folder hidden (bwrap)"
-                self.assertIn(f"Shield: {shield}\n", self.out.read_text())
-                result = self.launch(role, "codex", "--author-family", "claude")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                shield = "none (investigator)" if role == "investigator" else "private folder denied (codex permission profile)"
-                self.assertIn(f"Shield: {shield}\n", self.out.read_text())
+                    if role == "investigator" or (family == "codex" and role != "verifier"):
+                        self.assertFalse(wrapped.exists())
+                    else:
+                        self.assertTrue(wrapped.exists())
+                        calls = [json.loads(line) for line in wrapped.read_text().splitlines()]
+                        prefix = ["--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+                                  "--proc", "/proc", "--tmpfs", str(self.private),
+                                  "--remount-ro", str(self.private)]
+                        for path in self.expected_bwrap_paths()[1:]:
+                            prefix += ["--tmpfs", path]
+                        for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
+                                     "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
+                            prefix += ["--unsetenv", name]
+                        prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
+                        expected = [{"argv": prefix + ["true"], "scope": None}]
+                        if role == "verifier":
+                            expected.append({"argv": prefix + [str(Path(record["cwd"]) / ".agents/preflight")],
+                                             "scope": calls[1]["scope"]})
+                        if family == "claude":
+                            expected.append({"argv": prefix + [self.env["AGENT_CLAUDE_CMD"], *record["argv"]],
+                                             "scope": calls[-1]["scope"]})
+                        self.assertEqual(calls, expected)
+                        for call in calls[1:]:
+                            self.assertTrue(call["scope"].startswith(f"agent-{role}-"))
+                    shield = ("none (investigator)" if role == "investigator" else
+                              "private folder hidden (bwrap)" if family == "claude" else
+                              "private folder denied (codex permission profile)")
+                    self.assertIn(f"Shield: {shield}\n", self.out.read_text())
+
+    def test_SHIELD_preflight_refuses_without_working_bwrap_for_either_family(self):
+        marker = self.base / "preflight-ran"
+        self.install_preflight(f'pathlib.Path({str(marker)!r}).touch()')
+        for failure in ("missing", "probe", "setup"):
+            for family in ("claude", "codex"):
+                with self.subTest(family=family, failure=failure):
+                    bwrap = self.bin / "bwrap"
+                    bwrap.unlink(missing_ok=True)
+                    self.env.pop("BWRAP_PROBE_FAIL", None)
+                    self.env.pop("BWRAP_SETUP_FAIL", None)
+                    if failure == "missing":
+                        reason = "Cannot find bwrap for private folder shield"
+                    else:
+                        bwrap.write_text(BWRAP)
+                        bwrap.chmod(0o755)
+                        self.env["BWRAP_" + failure.upper() + "_FAIL"] = "1"
+                        reason = ("Private folder shield probe failed: namespace probe refused"
+                                  if failure == "probe" else ".agents/preflight exited 24")
+                    scopes = tuple(self.scope_state.iterdir())
+                    result = self.launch("verifier", family, "--author-family",
+                                         "codex" if family == "claude" else "claude")
+                    self.assert_preflight_refused(result, reason)
+                    self.assertFalse(marker.exists())
+                    if failure != "setup":
+                        self.assertEqual(tuple(self.scope_state.iterdir()), scopes)
+                        self.assertFalse(self.pool_root().exists())
+                        self.assertFalse((self.home / ".cache/am").exists())
 
     def test_SHIELD_S7_later_bwrap_setup_failure_is_failed_session(self):
         self.env["BWRAP_SETUP_FAIL"] = "1"
@@ -4379,7 +4420,7 @@ subprocess.run([sys.executable, "-c",
                                  Path(str(self.record) + ".bwrap").read_text().splitlines()[-2:]]
                         for call in calls:
                             mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
-                            self.assertEqual(mounts, list(self.expected_shield_filesystem(resolved)))
+                            self.assertEqual(mounts, self.expected_bwrap_paths(resolved))
                             self.assertEqual([call[i + 1] for i, arg in enumerate(call)
                                               if arg == "--remount-ro"], [str(resolved)])
                         settings = json.loads(args[args.index("--settings") + 1])
@@ -4401,7 +4442,9 @@ subprocess.run([sys.executable, "-c",
                 self.inject_launcher(f"""
                     from pathlib import Path
                     original_exists = Path.exists
-                    Path.exists = lambda path: ({x11_present!r} if str(path) == "/tmp/.X11-unix"
+                    daemon_paths = {tuple(map(str, (Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"), self.home / ".codex/ipc")))!r}
+                    Path.exists = lambda path: (False if str(path) in daemon_paths else
+                                                {x11_present!r} if str(path) == "/tmp/.X11-unix"
                                                 else original_exists(path))
                 """)
                 expected = [str(self.private)]
@@ -4443,6 +4486,27 @@ subprocess.run([sys.executable, "-c",
                                     self.assertEqual(
                                         tomllib.loads(entries[0])["permissions"]["am-shield"]["filesystem"],
                                         {path: "deny" for path in expected})
+
+    def test_SHIELD_daemon_directories_are_hidden_only_when_present(self):
+        paths = (f"/tmp/cc-daemon-{os.getuid()}", f"/tmp/codex-daemon-{os.getuid()}",
+                 str(self.home / ".codex/ipc"))
+        for present in ((), paths[:1], paths[1:2], paths[2:], paths):
+            with self.subTest(present=present):
+                self.inject_launcher(f"""
+                    from pathlib import Path
+                    original_exists = Path.exists
+                    Path.exists = lambda path: (str(path) in {present!r} if str(path) in {paths!r}
+                                                else original_exists(path))
+                """)
+                wrapped = Path(str(self.record) + ".bwrap")
+                wrapped.unlink(missing_ok=True)
+                result = self.launch("builder", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line)["argv"] for line in wrapped.read_text().splitlines()]
+                self.assertEqual(len(calls), 2)
+                for call in calls:
+                    mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
+                    self.assertEqual(mounts, [*self.expected_shield_filesystem(), *present])
 
     def test_SHIELD_session_environment_is_removed_only_inside_claude_shield(self):
         self.env["XDG_RUNTIME_DIR"] = str(self.base / "runtime")

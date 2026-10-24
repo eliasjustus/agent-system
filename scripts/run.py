@@ -1494,7 +1494,7 @@ def launch(parser, args, result):
               "private folder denied (codex permission profile)" if args.family == "codex" else
               "private folder hidden (bwrap)")
     result.header += f"Shield: {shield}\n"
-    shield_prefix = []
+    bwrap_prefix = []
     session_paths = []
     if shielded:
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").resolve()
@@ -1511,20 +1511,23 @@ def launch(parser, args, result):
         if "sandbox_mode" in config or any("sandbox_mode" in profile
                 for profile in config.get("profiles", {}).values()):
             return result.refused(f"Codex config sets sandbox_mode: {config_path}")
-    elif shielded:
+    if shielded and (args.family == "claude" or (args.role == "verifier" and git(
+            repo, "ls-tree", candidate, "--", ".agents/preflight"))):
         bwrap = shutil.which("bwrap")
         if bwrap is None:
             return result.refused("Cannot find bwrap for private folder shield")
-        shield_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+        bwrap_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
                          "--proc", "/proc", "--tmpfs", str(private), "--remount-ro", str(private)]
-        for path in session_paths:
-            shield_prefix += ["--tmpfs", str(path)]
+        for path in [*session_paths, *(path for path in (
+                Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
+                Path.home() / ".codex/ipc") if path.exists())]:
+            bwrap_prefix += ["--tmpfs", str(path)]
         # Unset inside bwrap: the outer systemd-run scope keeps its environment.
         for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
                      "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
-            shield_prefix += ["--unsetenv", name]
-        shield_prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
-        probe = subprocess.run([*shield_prefix, "true"], stdin=subprocess.DEVNULL,
+            bwrap_prefix += ["--unsetenv", name]
+        bwrap_prefix += ["--cap-drop", "ALL", "--die-with-parent", "--"]
+        probe = subprocess.run([*bwrap_prefix, "true"], stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if probe.returncode:
             return result.refused("Private folder shield probe failed: "
@@ -1747,7 +1750,7 @@ def launch(parser, args, result):
                     started = time.monotonic()
                     result.spawning = True
                     try:
-                        process = subprocess.Popen(supervised([str(work / ".agents/preflight")]),
+                        process = subprocess.Popen(supervised([*bwrap_prefix, str(work / ".agents/preflight")]),
                                                    cwd=work, env=agent_env, stdin=subprocess.DEVNULL,
                                                    stdout=preflight_log, stderr=preflight_log,
                                                    start_new_session=True,
@@ -1857,7 +1860,7 @@ def launch(parser, args, result):
                         command += ["--add-dir", str(before)]
                 if writable:
                     command += ["--add-dir", str(temporary)]
-            command = supervised([*shield_prefix, *command])
+            command = supervised([*(bwrap_prefix if args.family == "claude" else []), *command])
             update_header()
             if args.family == "codex" and preflight_log is not None:
                 with open_result(answer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb"):

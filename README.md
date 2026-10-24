@@ -310,7 +310,7 @@ mounts and keeps its Read/Edit deny settings. The header says `Shield: private f
 permission profile)`, `Shield: private folder hidden (bwrap)` or `Shield: none (investigator)`.
 Missing bubblewrap, a failed namespace probe, or `sandbox_mode` in the Codex user config
 (`$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml`) refuses a shielded launch with exit 2
-and `Result: launch refused`. Preflight runs outside the shield. The shield also cuts off the user's
+and `Result: launch refused`. Preflight runs inside the bubblewrap shield; the system bus is not covered. The shield also cuts off the user's
 session services through the runtime directory and X11 sockets. Services reached by abstract socket
 or localhost network port, external MCP servers in Codex user configuration, pre-existing hard links
 and bind mounts are not covered.

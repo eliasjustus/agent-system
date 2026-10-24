@@ -53,7 +53,7 @@ room before starting (`Admission:` header); a project's build gate can wait the 
 
 Every role but investigator is shut out of the private folder, shell included: Codex through a
 permission profile, Claude inside bubblewrap (`Shield:` header). A launch that cannot set this up is
-refused. The shield also cuts off the user's session services through the runtime directory and X11
+refused. Preflight runs inside the shield; the system bus is not covered. The shield also cuts off the user's session services through the runtime directory and X11
 sockets. Not covered: services reached by abstract socket or localhost network port, external MCP
 servers in Codex user configuration, pre-existing hard links and bind mounts.
 
