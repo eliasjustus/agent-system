@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import unittest
 
 
@@ -86,6 +87,23 @@ command = args[args.index("--") + 1:]
 os.execvp(command[0], command)
 '''
 
+BWRAP = '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+command = args[args.index("--") + 1:]
+with pathlib.Path(os.environ["RECORD"] + ".bwrap").open("a") as record:
+    record.write(json.dumps({"argv": args, "scope": os.environ.get("FAKE_SCOPE_UNIT")}) + "\\n")
+if command == ["true"]:
+    if os.environ.get("BWRAP_PROBE_FAIL"):
+        print("namespace probe refused", file=sys.stderr)
+        sys.exit(23)
+    sys.exit(0)
+if os.environ.get("BWRAP_SETUP_FAIL"):
+    print("namespace setup refused", file=sys.stderr)
+    sys.exit(24)
+os.execvp(command[0], command)
+'''
+
 STOP_SCOPE = '''#!/usr/bin/env python3
 import os, pathlib, signal, sys
 unit = sys.argv[-1]
@@ -143,12 +161,16 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_MODEL", None)
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
+        self.env.pop("CODEX_HOME", None)
         # Ordinary launcher tests must not depend on this host's current load.
         for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
                             "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
                             "MAX_WAIT": "0"}.items():
             self.env["AGENT_ADMISSION_" + name] = value
         self.configure_scope()
+        bwrap = self.bin / "bwrap"
+        bwrap.write_text(BWRAP)
+        bwrap.chmod(0o755)
 
     def configure_scope(self, present=True):
         self.bin = self.base / "bin"
@@ -4164,10 +4186,16 @@ subprocess.run([sys.executable, "-c",
                     writable = role in ("builder", "verifier")
                     evidence = str(Path(record["tmpdir"]).parent / "evidence")
                     if family == "codex":
-                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
-                                    "-s", "workspace-write" if writable else "read-only",
-                                    "-C", record["cwd"], "-o",
-                                    str(Path(record["tmpdir"]).parent / "answer")]
+                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]
+                        if role == "investigator":
+                            expected += ["-s", "read-only"]
+                        else:
+                            expected += ["-c", 'default_permissions="am-shield"',
+                                         "-c", 'permissions.am-shield.extends=":workspace"',
+                                         "-c", "permissions.am-shield.filesystem={"
+                                         + json.dumps(str(self.private)) + '="deny"}']
+                        expected += ["-C", record["cwd"], "-o",
+                                     str(Path(record["tmpdir"]).parent / "answer")]
                     else:
                         settings = {"permissions": {"deny": [] if role == "investigator" else
                                     [f"{tool}(/{self.private}/**)" for tool in ("Read", "Edit")]}}
@@ -4198,12 +4226,166 @@ subprocess.run([sys.executable, "-c",
                                      "--network", "--writable", cache)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = json.loads(self.record.read_text())["argv"]
-                self.assertIn("sandbox_workspace_write.network_access=true", args)
+                self.assertIn("permissions.am-shield.network.enabled=true", args)
+                self.assertNotIn("sandbox_workspace_write.network_access=true", args)
                 self.assertIn(str(cache), args)
                 self.assertIn("Network: on\n", self.out.read_text())
                 self.assertIn("Requested sandbox: workspace-write\n", self.out.read_text())
                 self.assertIn("Requested environment: user configuration\n", self.out.read_text())
                 self.assertFalse(Path(str(self.record) + ".discovery").exists())
+
+    def test_SHIELD_S7_claude_refuses_before_leases_without_working_bwrap(self):
+        for failure in ("missing", "probe"):
+            with self.subTest(failure=failure):
+                bwrap = self.bin / "bwrap"
+                if failure == "missing":
+                    bwrap.unlink()
+                    reason = "Cannot find bwrap for private folder shield"
+                else:
+                    bwrap.write_text(BWRAP)
+                    bwrap.chmod(0o755)
+                    self.env["BWRAP_PROBE_FAIL"] = "1"
+                    reason = "Private folder shield probe failed: namespace probe refused"
+                for role in ("builder", "verifier", "challenger", "reviewer"):
+                    scopes = tuple(self.scope_state.iterdir())
+                    session_root = self.home / ".cache/am"
+                    sessions_existed = session_root.exists()
+                    result = self.launch(role, "claude", "--author-family", "codex")
+                    self.assert_launch_refused(result, reason, scopes)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(self.pool_root().exists())
+                    self.assertEqual(session_root.exists(), sessions_existed)
+                result = self.launch("investigator", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+                self.record.unlink()
+
+    def test_SHIELD_S7_codex_refuses_sandbox_mode_in_user_config(self):
+        for custom in (False, True):
+            config_home = self.home / ("custom-codex" if custom else ".codex")
+            config_home.mkdir()
+            if custom:
+                self.env["CODEX_HOME"] = str(config_home)
+            for contents in ('sandbox_mode = "workspace-write"\n',
+                             'profile = "unsafe"\n[profiles.unsafe]\nsandbox_mode = "read-only"\n'):
+                (config_home / "config.toml").write_text(contents)
+                for role in ("builder", "verifier", "challenger", "reviewer"):
+                    with self.subTest(custom=custom, contents=contents, role=role):
+                        scopes = tuple(self.scope_state.iterdir())
+                        result = self.launch(role, "codex", "--author-family", "claude")
+                        self.assert_launch_refused(result, f"Codex config sets sandbox_mode: {config_home / 'config.toml'}", scopes)
+                        self.assertFalse(self.record.exists())
+                        self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                        self.assertFalse(self.pool_root().exists())
+                result = self.launch("investigator", "codex")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+                self.record.unlink()
+            (config_home / "config.toml").write_text('sandbox_mode = [invalid TOML\n')
+            result = self.launch("builder", "codex")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("Result: launch refused\n", self.out.read_text())
+            self.assertFalse(self.record.exists())
+            (config_home / "config.toml").write_text('# sandbox_mode = "read-only"\n')
+            result = self.launch("builder", "codex")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.record.unlink()
+
+    def test_SHIELD_S9_bwrap_prefix_and_header_for_every_role(self):
+        self.install_preflight('print("preflight ran", flush=True)')
+        for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+            with self.subTest(role=role):
+                wrapped = Path(str(self.record) + ".bwrap")
+                wrapped.unlink(missing_ok=True)
+                result = self.launch(role, "claude", "--author-family", "codex")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if role == "investigator":
+                    self.assertFalse(wrapped.exists())
+                    shield = "none (investigator)"
+                else:
+                    calls = [json.loads(line) for line in wrapped.read_text().splitlines()]
+                    self.assertEqual(len(calls), 2, "preflight must not be wrapped")
+                    prefix = ["--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+                              "--proc", "/proc", "--tmpfs", str(self.private),
+                              "--remount-ro", str(self.private), "--cap-drop", "ALL",
+                              "--die-with-parent", "--"]
+                    self.assertEqual(calls[0], {"argv": prefix + ["true"], "scope": None})
+                    record = json.loads(self.record.read_text())
+                    self.assertEqual(calls[1]["argv"], prefix + [self.env["AGENT_CLAUDE_CMD"], *record["argv"]])
+                    self.assertTrue(calls[1]["scope"].startswith(f"agent-{role}-"))
+                    shield = "private folder hidden (bwrap)"
+                self.assertIn(f"Shield: {shield}\n", self.out.read_text())
+                result = self.launch(role, "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shield = "none (investigator)" if role == "investigator" else "private folder denied (codex permission profile)"
+                self.assertIn(f"Shield: {shield}\n", self.out.read_text())
+
+    def test_SHIELD_S7_later_bwrap_setup_failure_is_failed_session(self):
+        self.env["BWRAP_SETUP_FAIL"] = "1"
+        result = self.launch("builder", "claude")
+        self.assertEqual(result.returncode, 24, result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertNotIn("Result: launch refused", self.out.read_text())
+        self.assertIn("Exit code: 24\n", self.out.read_text())
+        self.assertIn("namespace setup refused", self.out.with_suffix(".log").read_text())
+
+    def test_SHIELD_S10_resolved_and_unresolved_private_spellings(self):
+        resolved = self.private
+        resolved.mkdir()
+        for spelling in ("symlink", "parent-symlink", "dotdot"):
+            if spelling == "symlink":
+                unresolved = self.home / 'alias "private"'
+                unresolved.symlink_to(resolved, target_is_directory=True)
+            elif spelling == "parent-symlink":
+                alias = self.base / "alias-home"
+                alias.symlink_to(self.home, target_is_directory=True)
+                unresolved = alias / "private"
+            else:
+                child = self.home / "child"
+                child.mkdir()
+                unresolved = child / ".." / "private"
+            for family in ("codex", "claude"):
+                with self.subTest(spelling=spelling, family=family):
+                    result = self.launch("builder", family, "--private", unresolved)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = json.loads(self.record.read_text())["argv"]
+                    if family == "codex":
+                        entry = next(args[i + 1] for i, arg in enumerate(args)
+                                     if arg == "-c" and args[i + 1].startswith("permissions.am-shield.filesystem="))
+                        self.assertEqual(tomllib.loads(entry)["permissions"]["am-shield"]["filesystem"],
+                                         {str(resolved): "deny", str(unresolved): "deny"})
+                    else:
+                        calls = [json.loads(line)["argv"] for line in
+                                 Path(str(self.record) + ".bwrap").read_text().splitlines()[-2:]]
+                        for call in calls:
+                            mounts = [call[i + 1] for i, arg in enumerate(call) if arg == "--tmpfs"]
+                            self.assertEqual(mounts, [str(resolved)] +
+                                             ([] if spelling == "symlink" else [str(unresolved)]))
+                            self.assertEqual([call[i + 1] for i, arg in enumerate(call) if arg == "--remount-ro"], mounts)
+                        settings = json.loads(args[args.index("--settings") + 1])
+                        self.assertEqual(settings["permissions"]["deny"],
+                                         [f"{tool}(/{resolved}/**)" for tool in ("Read", "Edit")])
+
+    def test_SHIELD_agent_stdout_stderr_are_write_only_after_preflight(self):
+        self.install_preflight('print("preflight secret", flush=True)')
+        self.agent_extra('''
+import fcntl
+for descriptor in (1, 2):
+    assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+    try:
+        os.pread(descriptor, 1024, 0)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("agent can read output descriptor")
+record["descriptors_checked"] = True
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                record = self.verifier(family)
+                self.assertTrue(record["descriptors_checked"])
+                self.assertEqual(self.out.with_suffix(".log").read_text(), "preflight secret\n")
 
     def test_CE_S4_network_refused_before_start_for_other_roles_and_family(self):
         for family in ("codex", "claude"):
@@ -4239,7 +4421,11 @@ subprocess.run([sys.executable, "-c",
                     self.assertIn(f"Executable: {absolute}\n", self.out.read_text())
                     scope = next(p for p in self.scope_state.iterdir() if p.suffix != ".stop")
                     command = json.loads(scope.read_text())
-                    self.assertEqual(command[command.index("--") + 1], str(absolute))
+                    command = command[command.index("--") + 1:]
+                    if family == "claude":
+                        self.assertEqual(command[0], str(self.bin / "bwrap"))
+                        command = command[command.index("--") + 1:]
+                    self.assertEqual(command[0], str(absolute))
                     for path in self.scope_state.iterdir():
                         path.unlink()
                     if family == "codex":
@@ -5107,8 +5293,18 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                     if family == "codex":
                         self.assertEqual(args[:5], ["exec", "-m", "gpt-6.1-sol", "-c",
                                                    "model_reasoning_effort=high"])
-                        self.assertEqual(args[args.index("-s") + 1],
-                                         "workspace-write" if writable else "read-only")
+                        if role == "investigator":
+                            self.assertEqual(args[args.index("-s") + 1], "read-only")
+                        else:
+                            self.assertNotIn("-s", args)
+                            self.assertNotIn("--sandbox", args)
+                            config = tomllib.loads("\n".join(
+                                args[i + 1] for i, arg in enumerate(args) if arg == "-c"
+                                and args[i + 1].startswith(("default_permissions=", "permissions."))))
+                            self.assertEqual(config["default_permissions"], "am-shield")
+                            self.assertEqual(config["permissions"]["am-shield"], {
+                                "extends": ":workspace" if writable else ":read-only",
+                                "filesystem": {str(self.private): "deny"}})
                         self.assertEqual(args[args.index("-C") + 1], record["cwd"])
                         self.assertEqual(args[-1], "-")
                         roots = [args[i + 1] for i, arg in enumerate(args) if arg == "--add-dir"]

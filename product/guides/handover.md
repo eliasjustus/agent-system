@@ -51,6 +51,10 @@ list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory
 room before starting (`Admission:` header); a project's build gate can wait the same way with
 `python3 {{METHOD}}/run.py --wait-for-room`. The header records what each session was given.
 
+Every role but investigator is shut out of the private folder, shell included: Codex through a
+permission profile, Claude inside bubblewrap (`Shield:` header). A launch that cannot set this up is
+refused. Not covered: outside services a session asks to read for it, and existing hard links.
+
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
 candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
 (an executable regular file that exits 0 and leaves tracked files matching the candidate), a

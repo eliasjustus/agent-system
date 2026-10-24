@@ -141,7 +141,7 @@ status is written, further signals are ignored and the exit status matches the r
 `flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
-The header records the executable's absolute path and, for Codex, `Requested sandbox:`, `Network:`
+The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
@@ -304,10 +304,15 @@ paths. Also use `--full-checkout` whenever a Claude check needs all files; it sk
 A checkout with left-out paths skips the Git post-checkout hook. If Git checks out the listed
 paths anyway, the launcher reports a full checkout.
 
-Shielding prevents accidental leaks of the private root into briefs and through Claude's own file
-tools. It is not a security boundary: Codex sessions can read the private folder, and a writable
-Claude session has shell access. Give checking sessions only the brief, role contract and evidence
-they need.
+Every role except investigator shields the private folder, including shell access: Codex uses a
+permission profile denying its paths; Claude uses bubblewrap to hide it behind read-only empty
+mounts and keeps its Read/Edit deny settings. The header says `Shield: private folder denied (codex
+permission profile)`, `Shield: private folder hidden (bwrap)` or `Shield: none (investigator)`.
+Missing bubblewrap, a failed namespace probe, or `sandbox_mode` in the Codex user config
+(`$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml`) refuses a shielded launch with exit 2
+and `Result: launch refused`. Preflight runs outside the shield. Outside brokers (the systemd user
+manager and external MCP/file servers in Codex user configuration), pre-existing hard links and
+bind mounts are not covered. Give checking sessions only the brief, role contract and evidence they need.
 
 For a committed candidate, the manual route is a detached worktree at its exact commit:
 
@@ -416,8 +421,8 @@ for each installed family (Claude Code and Codex):
 - Check every answer is non-empty, stderr logs are saved, and session folders and worktrees are
   removed after completion.
 - Put a canary file in the throwaway private folder and a symlink to it in the throwaway repository
-  (briefs may not name the private folder). Ask a Claude session to read the symlink and confirm the
-  read is refused. This checks accidental shielding, not isolation from shell access.
+  (briefs may not name the private folder). Confirm shielded sessions cannot read it through file
+  tools, the symlink or the shell, and cannot write into the private folder.
 - Record the OS/platform and Python, Git, Claude Code, Codex and, when used, systemd versions in the
   release notes. State any skipped family or platform checks.
 
