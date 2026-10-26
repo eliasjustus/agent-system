@@ -1577,7 +1577,7 @@ def launch(parser, args, result):
                        "to create Unix sockets in it above 62 bytes; starting anyway")
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         registry = temporary / "gradle-daemons"
-        if not re.search(r"[\s'\"\\$`]", str(registry)):
+        if not re.search(r"[\s'\"\\$`;&|<>(){}*?\[\]]", str(registry)):
             agent_env["GRADLE_OPTS"] = " ".join(filter(None, (
                 agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={registry}")))
         else:
@@ -1594,7 +1594,7 @@ def launch(parser, args, result):
         if systemd:
             try:
                 help_result = subprocess.run([systemd, "--help"], stdout=subprocess.PIPE,
-                                             stderr=subprocess.DEVNULL, text=True, timeout=5)
+                                             stderr=subprocess.DEVNULL, text=True)
                 expand_environment = (help_result.returncode == 0
                                       and "--expand-environment" in help_result.stdout)
             except (OSError, subprocess.SubprocessError):

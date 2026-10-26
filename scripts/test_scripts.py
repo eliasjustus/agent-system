@@ -5876,10 +5876,10 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
-        for cache in ("cache space", "cache'quote"):
-            self.env["XDG_CACHE_HOME"] = str(self.base / cache)
+        for character in " \t\n\r\v\f'\"\\$`;&|<>(){}*?[]":
+            self.env["XDG_CACHE_HOME"] = str(self.base / f"cache{character}path")
             for inherited in (None, "", "-Xmx256m -Dorg.gradle.daemon.registry.base=/caller"):
-                with self.subTest(cache=cache, inherited=inherited):
+                with self.subTest(character=character, inherited=inherited):
                     if inherited is None:
                         self.env.pop("GRADLE_OPTS", None)
                     else:
@@ -5892,33 +5892,42 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                         "session Gradle registry not set: path has characters GRADLE_OPTS "
                         "cannot carry; daemons may be shared"])
 
+    def test_gradle_registry_survives_old_and_new_start_script_splitting(self):
+        self.env["XDG_CACHE_HOME"] = str(self.base / "cache+,:=@é")
+        self.env["GRADLE_OPTS"] = "-Xmx256m"
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        record = json.loads(self.record.read_text())
+        expected = f"-Dorg.gradle.daemon.registry.base={Path(record['tmpdir']) / 'gradle-daemons'}"
+        # Option splitting from Gradle 6.8.3 and 9.1.0 unixStartScript.txt.
+        scripts = {
+            "old eval": "eval set -- $DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS",
+            "new xargs": r'''eval "set -- $(
+                printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+                xargs -n1 |
+                sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+                tr '\n' ' '
+            )" '"$@"'
+''',
+        }
+        for form, script in scripts.items():
+            with self.subTest(form=form):
+                split = subprocess.run(
+                    ["sh", "-c", script + "\nprintf '%s\\0' \"$@\""],
+                    env=dict(os.environ, GRADLE_OPTS=record["gradle_opts"],
+                             DEFAULT_JVM_OPTS="", JAVA_OPTS=""),
+                    cwd=self.base, text=True, capture_output=True)
+                self.assertEqual(split.returncode, 0, split.stderr)
+                self.assertEqual(split.stdout.split("\0"), ["-Xmx256m", expected, ""])
+
     def test_L2_failed_systemd_help_omits_expansion_flag(self):
         scope = self.bin / "systemd-run"
         scope.write_text(SCOPE.replace("    sys.exit(0)", "    sys.exit(17)"))
-        result = self.launch()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
-                    if line.startswith("Scope: "))
-        args = json.loads((self.scope_state / unit).read_text())
-        self.assertNotIn("--expand-environment=no", args)
-        self.assertTrue(self.record.exists())
-
-    def test_L2_systemd_help_timeout_omits_expansion_flag(self):
-        scope = self.bin / "systemd-run"
-        scope.write_text(SCOPE.replace('if args == ["--help"]:', '''if args == ["--help"]:
-    import time
-    time.sleep(1)
-'''))
-        self.inject_launcher('''
-import subprocess
-original_run = subprocess.run
-def run(command, *args, **kwargs):
-    if command[1:] == ["--help"] and "timeout" in kwargs:
-        assert kwargs["timeout"] == 5
-        kwargs["timeout"] = 0.1
-    return original_run(command, *args, **kwargs)
-subprocess.run = run
-''')
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
         unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
