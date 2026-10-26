@@ -1576,8 +1576,13 @@ def launch(parser, args, result):
             diagnostic(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
                        "to create Unix sockets in it above 62 bytes; starting anyway")
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
-        agent_env["GRADLE_OPTS"] = " ".join(filter(None, (
-            agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={temporary / 'gradle-daemons'}")))
+        registry = temporary / "gradle-daemons"
+        if not re.search(r"[\s'\"\\$`]", str(registry)):
+            agent_env["GRADLE_OPTS"] = " ".join(filter(None, (
+                agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={registry}")))
+        else:
+            diagnostic("session Gradle registry not set: path has characters GRADLE_OPTS "
+                       "cannot carry; daemons may be shared")
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
         agent_started = False
@@ -1585,8 +1590,15 @@ def launch(parser, args, result):
         preflight_log = None
         guarded = False
         systemd = shutil.which("systemd-run")
-        expand_environment = bool(systemd and "--expand-environment" in subprocess.run(
-            [systemd, "--help"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout)
+        expand_environment = False
+        if systemd:
+            try:
+                help_result = subprocess.run([systemd, "--help"], stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, text=True, timeout=5)
+                expand_environment = (help_result.returncode == 0
+                                      and "--expand-environment" in help_result.stdout)
+            except (OSError, subprocess.SubprocessError):
+                pass
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"

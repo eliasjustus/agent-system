@@ -5857,6 +5857,94 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                         sessions.add(session)
                         self.assertFalse(session.exists())
 
+    def test_gradle_registry_overrides_caller_registry_setting(self):
+        inherited = "-Xmx256m -Dorg.gradle.daemon.registry.base=/caller/registry"
+        self.env["GRADLE_OPTS"] = inherited
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        registry = Path(record["tmpdir"]) / "gradle-daemons"
+        self.assertEqual(record["gradle_opts"],
+                         inherited + f" -Dorg.gradle.daemon.registry.base={registry}")
+
+    def test_gradle_registry_unsafe_cache_path_preserves_caller_options(self):
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for cache in ("cache space", "cache'quote"):
+            self.env["XDG_CACHE_HOME"] = str(self.base / cache)
+            for inherited in (None, "", "-Xmx256m -Dorg.gradle.daemon.registry.base=/caller"):
+                with self.subTest(cache=cache, inherited=inherited):
+                    if inherited is None:
+                        self.env.pop("GRADLE_OPTS", None)
+                    else:
+                        self.env["GRADLE_OPTS"] = inherited
+                    result = self.launch()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    self.assertEqual(record["gradle_opts"], inherited)
+                    self.assertEqual(result.stderr.splitlines(), [
+                        "session Gradle registry not set: path has characters GRADLE_OPTS "
+                        "cannot carry; daemons may be shared"])
+
+    def test_L2_failed_systemd_help_omits_expansion_flag(self):
+        scope = self.bin / "systemd-run"
+        scope.write_text(SCOPE.replace("    sys.exit(0)", "    sys.exit(17)"))
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
+                    if line.startswith("Scope: "))
+        args = json.loads((self.scope_state / unit).read_text())
+        self.assertNotIn("--expand-environment=no", args)
+        self.assertTrue(self.record.exists())
+
+    def test_L2_systemd_help_timeout_omits_expansion_flag(self):
+        scope = self.bin / "systemd-run"
+        scope.write_text(SCOPE.replace('if args == ["--help"]:', '''if args == ["--help"]:
+    import time
+    time.sleep(1)
+'''))
+        self.inject_launcher('''
+import subprocess
+original_run = subprocess.run
+def run(command, *args, **kwargs):
+    if command[1:] == ["--help"] and "timeout" in kwargs:
+        assert kwargs["timeout"] == 5
+        kwargs["timeout"] = 0.1
+    return original_run(command, *args, **kwargs)
+subprocess.run = run
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
+                    if line.startswith("Scope: "))
+        args = json.loads((self.scope_state / unit).read_text())
+        self.assertNotIn("--expand-environment=no", args)
+        self.assertTrue(self.record.exists())
+
+    def test_L2_systemd_help_start_failure_omits_expansion_flag(self):
+        self.inject_launcher('''
+import subprocess
+original_run = subprocess.run
+def run(command, *args, **kwargs):
+    if command[1:] == ["--help"]:
+        raise OSError("help probe could not start")
+    return original_run(command, *args, **kwargs)
+subprocess.run = run
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
+                    if line.startswith("Scope: "))
+        args = json.loads((self.scope_state / unit).read_text())
+        self.assertNotIn("--expand-environment=no", args)
+        self.assertTrue(self.record.exists())
+
     def test_T1_temporary_environment_for_every_role_and_family(self):
         inherited = self.base / "inherited temporary files"
         inherited.mkdir()
