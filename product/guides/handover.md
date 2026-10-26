@@ -44,6 +44,7 @@ processes from Node or network access; otherwise the user's network configuratio
 `--writable DIR` to open an extra directory, for example `--writable ~/.gradle` for a build cache.
 Network access does not open extra directories. There is no full-access option because these
 cover the known needs.
+Builds started through `gradle` or `gradlew` get a per-session daemon registry via `GRADLE_OPTS`, overriding any caller registry setting, so each session's first build starts a daemon and sessions never share one. A script that replaces `GRADLE_OPTS`, or a build started another way, shares daemons again. A cache path with shell-special characters skips this, with a warning.
 
 Codex challengers and reviewers start without plugins, skills or MCP servers (best effort: servers
 that cannot be disabled stay enabled and the header reports it); Claude sessions use a fixed tool

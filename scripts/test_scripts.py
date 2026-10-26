@@ -77,6 +77,15 @@ sys.exit(int(os.environ.get("SESSION_EXIT", "0")))
 SCOPE = '''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+supports_expansion = os.environ.get("SCOPE_EXPAND_ENVIRONMENT", "1") == "1"
+if args == ["--help"]:
+    print("systemd-run [OPTIONS...] COMMAND [ARGS...]")
+    if supports_expansion:
+        print("  --expand-environment=BOOL  Expand environment variables")
+    sys.exit(0)
+if not supports_expansion and "--expand-environment=no" in args:
+    print("systemd-run: unrecognized option '--expand-environment=no'", file=sys.stderr)
+    sys.exit(1)
 if os.environ.get("SCOPE_FAIL"):
     print("scope refused by test bus", file=sys.stderr)
     sys.exit(19)
@@ -3724,6 +3733,7 @@ subprocess.check_output = interrupt
             for name in ("systemd-run", "systemctl"):
                 (self.bin / name).unlink()
                 (self.bin / name).symlink_to(shutil.which(name))
+        self.env["AGENT_CODEX_MODEL"] = "literal-$HOME"
         self.agent_extra('''
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
 pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()) + " " + str(child.pid))
@@ -3735,6 +3745,7 @@ while True:
         original_record = self.base / f"killed-{scope}.json"
         process = self.start_launcher(record=original_record, out=self.base / f"killed-{scope}.md")
         record = self.wait_agent_ready(original_record)
+        self.assertEqual(record["argv"][record["argv"].index("-m") + 1], "literal-$HOME")
         slot = Path(record["cwd"])
         session = Path(record["tmpdir"]).parent
         process.kill()
@@ -4291,7 +4302,12 @@ subprocess.run([sys.executable, "-c",
                     with self.subTest(custom=custom, contents=contents, role=role):
                         scopes = tuple(self.scope_state.iterdir())
                         result = self.launch(role, "codex", "--author-family", "claude")
-                        self.assert_launch_refused(result, f"Codex config sets sandbox_mode: {config_home / 'config.toml'}", scopes)
+                        self.assert_launch_refused(result,
+                            f"Codex config sets sandbox_mode: {config_home / 'config.toml'}; "
+                            "it would override the private-folder deny. Remove sandbox_mode from "
+                            "config.toml and all profiles. For full access, start the Codex orchestrator "
+                            "with codex -s danger-full-access -a never on its own command line, "
+                            "never in config.toml or a profile.", scopes)
                         self.assertFalse(self.record.exists())
                         self.assertFalse(Path(str(self.record) + ".discovery").exists())
                         self.assertFalse(self.pool_root().exists())
@@ -5787,19 +5803,156 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertIn("above 62 bytes; starting anyway", result.stderr)
 
     def test_L2_scope_command_and_header(self):
+        self.env["AGENT_CODEX_MODEL"] = "literal-$HOME"
+        for supports_expansion in (False, True):
+            with self.subTest(supports_expansion=supports_expansion):
+                self.env["SCOPE_EXPAND_ENVIRONMENT"] = str(int(supports_expansion))
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                units = [line[7:] for line in self.out.read_text().splitlines() if line.startswith("Scope: ")]
+                self.assertEqual(len(units), 1, self.out.read_text())
+                unit = units[0]
+                self.assertTrue(unit.startswith("agent-builder-"), unit)
+                self.assertTrue(unit.endswith(".scope"), unit)
+                args = json.loads((self.scope_state / unit).read_text())
+                prefix = ["--user", "--scope", "--quiet", "--collect"]
+                if supports_expansion:
+                    prefix += ["--expand-environment=no"]
+                prefix += ["--slice=agents.slice", "--unit=" + unit]
+                self.assertEqual(args[:len(prefix)], prefix)
+                self.assertEqual(args[len(prefix):len(prefix) + 2], ["--", self.env["AGENT_CODEX_CMD"]])
+                record = json.loads(self.record.read_text())
+                self.assertEqual(record["argv"][record["argv"].index("-m") + 1], "literal-$HOME")
+                self.assertTrue((self.scope_state / (unit + ".stop")).exists())
+
+    def test_gradle_registry_is_session_local_and_preserves_caller_environment(self):
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+record["gradle_user_home"] = os.environ.get("GRADLE_USER_HOME")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        self.env["GRADLE_USER_HOME"] = str(self.base / "custom-gradle-home")
+        sessions = set()
+        for inherited in (None, "", "-Xmx256m -Dcaller=value"):
+            if inherited is None:
+                self.env.pop("GRADLE_OPTS", None)
+            else:
+                self.env["GRADLE_OPTS"] = inherited
+            for family in ("codex", "claude"):
+                for role in ("builder", "verifier", "investigator", "challenger", "reviewer"):
+                    with self.subTest(inherited=inherited, family=family, role=role):
+                        if role == "verifier":
+                            self.round_decision()
+                        result = self.launch(role, family, "--author-family",
+                                             "claude" if family == "codex" else "codex")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        record = json.loads(self.record.read_text())
+                        session = Path(record["tmpdir"]).parent
+                        expected = (inherited + " " if inherited else "") + (
+                            f"-Dorg.gradle.daemon.registry.base={session / 'tmp' / 'gradle-daemons'}")
+                        self.assertEqual(record["gradle_opts"], expected)
+                        self.assertEqual(record["gradle_user_home"], self.env["GRADLE_USER_HOME"])
+                        self.assertNotIn(session, sessions)
+                        sessions.add(session)
+                        self.assertFalse(session.exists())
+
+    def test_gradle_registry_overrides_caller_registry_setting(self):
+        inherited = "-Xmx256m -Dorg.gradle.daemon.registry.base=/caller/registry"
+        self.env["GRADLE_OPTS"] = inherited
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        registry = Path(record["tmpdir"]) / "gradle-daemons"
+        self.assertEqual(record["gradle_opts"],
+                         inherited + f" -Dorg.gradle.daemon.registry.base={registry}")
+
+    def test_gradle_registry_unsafe_cache_path_preserves_caller_options(self):
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
+        for character in " \t\n\r\v\f'\"\\$`;&|<>(){}*?[]":
+            self.env["XDG_CACHE_HOME"] = str(self.base / f"cache{character}path")
+            for inherited in (None, "", "-Xmx256m -Dorg.gradle.daemon.registry.base=/caller"):
+                with self.subTest(character=character, inherited=inherited):
+                    if inherited is None:
+                        self.env.pop("GRADLE_OPTS", None)
+                    else:
+                        self.env["GRADLE_OPTS"] = inherited
+                    result = self.launch()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    self.assertEqual(record["gradle_opts"], inherited)
+                    self.assertEqual(result.stderr.splitlines(), [
+                        "session Gradle registry not set: path has characters GRADLE_OPTS "
+                        "cannot carry; daemons may be shared"])
+
+    def test_gradle_registry_survives_old_and_new_start_script_splitting(self):
+        self.env["XDG_CACHE_HOME"] = str(self.base / "cache+,:=@é")
+        self.env["GRADLE_OPTS"] = "-Xmx256m"
+        self.agent_extra('''
+record["gradle_opts"] = os.environ.get("GRADLE_OPTS")
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''')
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
-        units = [line[7:] for line in self.out.read_text().splitlines() if line.startswith("Scope: ")]
-        self.assertEqual(len(units), 1, self.out.read_text())
-        unit = units[0]
-        self.assertTrue(unit.startswith("agent-builder-"), unit)
-        self.assertTrue(unit.endswith(".scope"), unit)
+        record = json.loads(self.record.read_text())
+        expected = f"-Dorg.gradle.daemon.registry.base={Path(record['tmpdir']) / 'gradle-daemons'}"
+        # Option splitting from Gradle 6.8.3 and 9.1.0 unixStartScript.txt.
+        scripts = {
+            "old eval": "eval set -- $DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS",
+            "new xargs": r'''eval "set -- $(
+                printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+                xargs -n1 |
+                sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+                tr '\n' ' '
+            )" '"$@"'
+''',
+        }
+        for form, script in scripts.items():
+            with self.subTest(form=form):
+                split = subprocess.run(
+                    ["sh", "-c", script + "\nprintf '%s\\0' \"$@\""],
+                    env=dict(os.environ, GRADLE_OPTS=record["gradle_opts"],
+                             DEFAULT_JVM_OPTS="", JAVA_OPTS=""),
+                    cwd=self.base, text=True, capture_output=True)
+                self.assertEqual(split.returncode, 0, split.stderr)
+                self.assertEqual(split.stdout.split("\0"), ["-Xmx256m", expected, ""])
+
+    def test_L2_failed_systemd_help_omits_expansion_flag(self):
+        scope = self.bin / "systemd-run"
+        scope.write_text(SCOPE.replace("    sys.exit(0)", "    sys.exit(17)"))
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
+                    if line.startswith("Scope: "))
         args = json.loads((self.scope_state / unit).read_text())
-        self.assertEqual(args[:6], ["--user", "--scope", "--quiet", "--collect",
-                                    "--slice=agents.slice", "--unit=" + unit])
-        self.assertEqual(args[6:8], ["--", self.env["AGENT_CODEX_CMD"]])
-        self.assertTrue((self.scope_state / (unit + ".stop")).exists())
+        self.assertNotIn("--expand-environment=no", args)
+        self.assertTrue(self.record.exists())
+
+    def test_L2_systemd_help_start_failure_omits_expansion_flag(self):
+        self.inject_launcher('''
+import subprocess
+original_run = subprocess.run
+def run(command, *args, **kwargs):
+    if command[1:] == ["--help"]:
+        raise OSError("help probe could not start")
+    return original_run(command, *args, **kwargs)
+subprocess.run = run
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = next(line.removeprefix("Scope: ") for line in self.out.read_text().splitlines()
+                    if line.startswith("Scope: "))
+        args = json.loads((self.scope_state / unit).read_text())
+        self.assertNotIn("--expand-environment=no", args)
+        self.assertTrue(self.record.exists())
 
     def test_T1_temporary_environment_for_every_role_and_family(self):
         inherited = self.base / "inherited temporary files"
