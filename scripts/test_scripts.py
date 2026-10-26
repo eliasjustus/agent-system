@@ -5796,9 +5796,10 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         self.assertTrue(unit.startswith("agent-builder-"), unit)
         self.assertTrue(unit.endswith(".scope"), unit)
         args = json.loads((self.scope_state / unit).read_text())
-        self.assertEqual(args[:6], ["--user", "--scope", "--quiet", "--collect",
+        self.assertEqual(args[:7], ["--user", "--scope", "--quiet", "--collect",
+                                    "--expand-environment=no",
                                     "--slice=agents.slice", "--unit=" + unit])
-        self.assertEqual(args[6:8], ["--", self.env["AGENT_CODEX_CMD"]])
+        self.assertEqual(args[7:9], ["--", self.env["AGENT_CODEX_CMD"]])
         self.assertTrue((self.scope_state / (unit + ".stop")).exists())
 
     def test_T1_temporary_environment_for_every_role_and_family(self):

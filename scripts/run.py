@@ -1602,6 +1602,7 @@ def launch(parser, args, result):
         def supervised(command):
             if unit:
                 command = [systemd, "--user", "--scope", "--quiet", "--collect",
+                           "--expand-environment=no",
                            "--slice=agents.slice", f"--unit={unit}", "--", *command]
             else:
                 diagnostic("systemd-run unavailable; running without a scope")
