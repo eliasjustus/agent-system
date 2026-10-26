@@ -1513,7 +1513,12 @@ def launch(parser, args, result):
         # selected through a user profile. Refuse rather than lose the deny.
         if "sandbox_mode" in config or any("sandbox_mode" in profile
                 for profile in config.get("profiles", {}).values()):
-            return result.refused(f"Codex config sets sandbox_mode: {config_path}")
+            return result.refused(
+                f"Codex config sets sandbox_mode: {config_path}; "
+                "it would override the private-folder deny. Remove sandbox_mode from "
+                "config.toml and all profiles. For full access, start the Codex orchestrator "
+                "with codex -s danger-full-access -a never on its own command line, "
+                "never in config.toml or a profile.")
     if shielded and (args.family == "claude" or (args.role == "verifier" and git(
             repo, "ls-tree", candidate, "--", ".agents/preflight"))):
         bwrap = shutil.which("bwrap")
@@ -1571,6 +1576,8 @@ def launch(parser, args, result):
             diagnostic(f"Warning: TMPDIR is {length} bytes; programs such as Chromium may fail "
                        "to create Unix sockets in it above 62 bytes; starting anyway")
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
+        agent_env["GRADLE_OPTS"] = " ".join(filter(None, (
+            agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={temp / 'gradle-daemons'}")))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
         agent_started = False
@@ -1578,6 +1585,8 @@ def launch(parser, args, result):
         preflight_log = None
         guarded = False
         systemd = shutil.which("systemd-run")
+        expand_environment = bool(systemd and "--expand-environment" in subprocess.run(
+            [systemd, "--help"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout)
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
@@ -1602,7 +1611,7 @@ def launch(parser, args, result):
         def supervised(command):
             if unit:
                 command = [systemd, "--user", "--scope", "--quiet", "--collect",
-                           "--expand-environment=no",
+                           *(["--expand-environment=no"] if expand_environment else []),
                            "--slice=agents.slice", f"--unit={unit}", "--", *command]
             else:
                 diagnostic("systemd-run unavailable; running without a scope")

@@ -111,6 +111,8 @@ from Node or network access. Without it, the user's network configuration applie
 `--writable DIR` for a directory outside the usual writable roots, for example
 `--writable ~/.gradle` for a build cache. These permissions are independent: `--network` does not
 open extra directories. There is no full-access option because these cover the known needs.
+Each session gets its own Gradle daemon registry via `GRADLE_OPTS`, so its first build starts a
+daemon and daemons are never shared across sessions. A project script that replaces `GRADLE_OPTS` loses this isolation.
 
 Challengers and reviewers run on a snapshot of committed, staged and uncommitted files, including
 untracked files up to 5 MB. Ignored files and larger untracked files are omitted; oversized files appear in
