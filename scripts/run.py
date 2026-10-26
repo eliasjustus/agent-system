@@ -1577,7 +1577,7 @@ def launch(parser, args, result):
                        "to create Unix sockets in it above 62 bytes; starting anyway")
         agent_env = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         agent_env["GRADLE_OPTS"] = " ".join(filter(None, (
-            agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={temp / 'gradle-daemons'}")))
+            agent_env.get("GRADLE_OPTS"), f"-Dorg.gradle.daemon.registry.base={temporary / 'gradle-daemons'}")))
         work, answer, source = temp / "work", temp / "answer", temp / "evidence"
         process = None
         agent_started = False

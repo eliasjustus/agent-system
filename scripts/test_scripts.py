@@ -5850,7 +5850,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                         record = json.loads(self.record.read_text())
                         session = Path(record["tmpdir"]).parent
                         expected = (inherited + " " if inherited else "") + (
-                            f"-Dorg.gradle.daemon.registry.base={session / 'gradle-daemons'}")
+                            f"-Dorg.gradle.daemon.registry.base={session / 'tmp' / 'gradle-daemons'}")
                         self.assertEqual(record["gradle_opts"], expected)
                         self.assertEqual(record["gradle_user_home"], self.env["GRADLE_USER_HOME"])
                         self.assertNotIn(session, sessions)
