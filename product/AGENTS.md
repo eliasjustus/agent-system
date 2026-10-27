@@ -23,15 +23,13 @@ repository's own contributor documents instead.
 Every action costs the user something. What is scarce: their attention and verdicts, this machine's
 CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep.
 
-1. **Estimate before starting** any task bigger than a quick answer: a time range, the start time and
-   the stop time (start plus twice the upper end), written in the task record. Every observed time in a
-   task record is UTC read from the clock (`date -u`), never estimated afterwards; the stop time is
-   computed from it, in UTC. At the stop time, write down
-   what was done, why it overran and a new estimate covering the whole task from the original
-   start, with its new stop time; tell the user in one line and carry on. Stop and wait for the
-   user only when going on needs a decision that "Deciding" reserves for them, or adds load on
-   something shared they use (CI, this machine while they work). Never carry on
-   with a new number that is not written down.
+1. **Cap the rounds, not the clock.** Write a time range for any task bigger than a quick answer in
+   the task record, for the delivery's cost line; times in a task record are UTC read from `date -u`.
+   A candidate gets at most three rounds of check and repair: before the third, write the round
+   decision (`guides/recovery.md`); after a third failed round, end that repair sequence by
+   narrowing the scope or redesigning, recorded and named in the delivery, or report the blocker.
+   Stop and wait for the user only when going on needs a decision that "Deciding" reserves for
+   them, or adds load on something shared they use (CI, this machine while they work).
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
    codebase; does the standard library do it; does an installed dependency do it; can it be one
    line; only then the minimum that works. Never cut validation at trust boundaries, error handling
@@ -42,8 +40,8 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    them unprompted when you are blocked or the forecast moves. Run only as many lanes in parallel as
    this machine and CI can carry. Never end a turn while something outside you is still pending
    (CI, a merge, a delegated session) without a background wait armed to wake you: one that ends on
-   every outcome, failure and stall as well as success, and by the stop time at the latest, through
-   the host's completion notice. Time passing alone does not wake you; a wait with nothing armed is
+   every outcome, failure and stall as well as success, with a deadline from the expected duration,
+   through the host's completion notice. Time passing alone does not wake you; a wait with nothing armed is
    stopping.
 
 ## Invariants

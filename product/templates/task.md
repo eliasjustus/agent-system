@@ -9,7 +9,7 @@
 - State: active  <!-- active | awaiting verdict | paused: <reason>; resume when <condition> | closed: <signed off by the request | accepted | abandoned | superseded by <id>> -->
 - Depth: undecided  <!-- above | below, with the three answers below -->
 - Owner: <session, date>
-- Estimate: <time range>; started <UTC time from date -u>; stop at <absolute UTC time: start + 2x upper end>  <!-- at the stop time, write a new estimate from the original start and a new stop time, and tell the user in one line; actual effort is added at close -->
+- Estimate: <time range>; started <UTC time from date -u>  <!-- actual effort is added at close -->
 - Plan:
 - Now:
 - Next:

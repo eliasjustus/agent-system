@@ -35,8 +35,7 @@ judge of your work: a verifier checks it independently.
 - something contradicts the design or the scenarios;
 - the scope would change, or needed work falls outside the assignment;
 - a check fails for a reason that is not plainly an implementation defect;
-- the same failure repeats after two different attempts;
-- the work is running well past what the assignment suggests.
+- the same failure repeats after two different attempts.
 
 ## Return
 

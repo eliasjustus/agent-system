@@ -9387,7 +9387,7 @@ pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()))
 
 class MethodSizeTest(unittest.TestCase):
     # Raising this is a reviewed decision in the pull request, not a fix for a failing test.
-    BUDGET = 7850
+    BUDGET = 7800
 
     def test_method_text_stays_within_its_word_budget(self):
         words = sum(len(path.read_text().split()) for path in sorted((ROOT / "product").rglob("*.md")))
