@@ -30,6 +30,8 @@ import json, os, pathlib, re, subprocess, sys, time
 args = sys.argv[1:]
 cwd = pathlib.Path.cwd()
 if args == ["mcp", "list", "--json"]:
+    attempts = pathlib.Path(os.environ["RECORD"] + ".discovery-attempts")
+    attempts.write_text(attempts.read_text() + "attempt\\n" if attempts.exists() else "attempt\\n")
     pathlib.Path(os.environ["RECORD"] + ".discovery").write_text(json.dumps({
         "executable": sys.argv[0], "cwd": str(cwd), "tmpdir": os.environ.get("TMPDIR"),
         "temporary": {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP")},
@@ -40,6 +42,9 @@ if args == ["mcp", "list", "--json"]:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         pathlib.Path(os.environ["RECORD"] + ".discovery-child").write_text(str(child.pid))
         time.sleep(30)
+    if os.environ.get("MCP_FAIL_FIRST") and len(attempts.read_text().splitlines()) == 1:
+        print("first attempt failed", file=sys.stderr)
+        sys.exit(9)
     print(os.environ.get("MCP_JSON", "[]"))
     sys.exit(int(os.environ.get("MCP_EXIT", "0")))
 record = {"argv": args, "cwd": str(cwd), "stdin": sys.stdin.read(),
@@ -312,11 +317,11 @@ class ScriptsTest(unittest.TestCase):
                                "--private", self.private, "--method", self.method,
                                *extra)
 
-    def verifier(self, family="codex", *extra):
+    def verifier(self, family="codex", *extra, expected_code=0):
         self.round_decision()
         result = self.launch("verifier", family, "--author-family",
                              "claude" if family == "codex" else "codex", *extra)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, expected_code, result.stderr)
         return json.loads(self.record.read_text())
 
     def round_decision(self, out=None):
@@ -327,6 +332,373 @@ class ScriptsTest(unittest.TestCase):
         newest = max(path.stat().st_mtime_ns for path in directory.iterdir()
                      if path.is_file())
         os.utime(decision, ns=(newest + 1, newest + 1))
+
+    def source_launch(self, body="", *, before="none", expected=4, extra=()):
+        self.round_decision()
+        self.agent_extra(body)
+        result = self.launch("verifier", "codex", "--author-family", "claude",
+                             "--before", before, *extra)
+        self.assertEqual(result.returncode, expected, result.stderr)
+        output = self.out.read_text()
+        self.assertEqual(output.split("\n\n", 1)[1], "answer\n  unchanged\n")
+        self.assertIn("Source check: ", output)
+        if expected == 4:
+            self.assertIn("Result: source check failed\n", output)
+        return output, json.loads(self.record.read_text())
+
+    def test_SOURCE_S1_tracked_mutations_keep_answer_and_name_paths(self):
+        mutations = {
+            "unstaged": '(cwd / "tracked").write_text("private changed contents")',
+            "staged": '(cwd / "tracked").write_text("private changed contents"); subprocess.check_call(["git", "add", "tracked"])',
+            "added": '(cwd / "added").write_text("private changed contents"); subprocess.check_call(["git", "add", "added"])',
+            "deleted": '(cwd / "tracked").unlink(); subprocess.check_call(["git", "add", "-u"])',
+            "unstaged deletion": '(cwd / "tracked").unlink()',
+            "conflicted": '''blob = subprocess.check_output(["git", "rev-parse", "HEAD:tracked"]).strip()
+subprocess.check_call(["git", "update-index", "--index-info"], stdin=subprocess.DEVNULL)
+subprocess.run(["git", "update-index", "--index-info"], check=True,
+               input=b"0 " + b"0" * len(blob) + b"\\ttracked\\n100644 " + blob + b" 1\\ttracked\\n100644 " + blob + b" 2\\ttracked\\n")''',
+        }
+        for kind, body in mutations.items():
+            with self.subTest(kind=kind):
+                output, record = self.source_launch(body)
+                self.assertIn(f"candidate changed ({record['cwd']})", output)
+                self.assertIn(repr("added" if kind == "added" else "tracked"), output)
+                self.assertIn("before not applicable", output)
+                self.assertNotIn("private changed contents", output)
+        self.assertIn("edit–test–restore", (ROOT / "README.md").read_text())
+
+    def test_SOURCE_S2_each_checkout_is_checked_even_if_candidate_is_unreadable(self):
+        for damage in ("(cwd / 'tracked').write_text('candidate edit')",
+                       "(cwd / 'tracked').chmod(0)"):
+            with self.subTest(damage=damage):
+                output, record = self.source_launch('''
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+(before / "tracked").write_text("baseline edit")
+record["before"] = str(before)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''' + damage, before="HEAD")
+                self.assertIn(f"before changed ({record['before']}): 'tracked'", output)
+                self.assertIn(f"candidate {'unconfirmed' if 'chmod' in damage else 'changed'} ({record['cwd']})", output)
+
+    def test_SOURCE_S3_identity_index_flags_modes_links_and_untracked(self):
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub/file").write_text("nested source")
+        self.git("add", ".")
+        self.git("commit", "-qm", "tracked parent")
+        baseline = self.git("rev-parse", "HEAD^")
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "file").write_text("outside untouched")
+        (outside / "identical").write_text("original")
+        mutations = {
+            "new commit": 'subprocess.check_call(["git", "commit", "--allow-empty", "-qm", "verifier commit"])',
+            "other commit": f'subprocess.check_call(["git", "checkout", "-q", "--detach", {baseline!r}])',
+            "attached HEAD": 'subprocess.check_call(["git", "checkout", "-q", "-B", "verifier-branch"])',
+            "empty index": 'subprocess.check_call(["git", "read-tree", "--empty"])',
+            "changed index": 'subprocess.check_call(["git", "update-index", "--force-remove", "tracked"])',
+            "assume unchanged": 'subprocess.check_call(["git", "update-index", "--assume-unchanged", "tracked"])',
+            "skip worktree": 'subprocess.check_call(["git", "update-index", "--skip-worktree", "tracked"])',
+            "mode": '(cwd / "tracked").chmod(0o755)',
+            "mode with filemode true": 'subprocess.check_call(["git", "config", "core.filemode", "true"]); (cwd / "tracked").chmod(0o755)',
+            "symlink": '(cwd / "tracked").unlink(); (cwd / "tracked").symlink_to("sub/file")',
+            "hardlink": f'(cwd / "tracked").unlink(); os.link({str(outside / "identical")!r}, cwd / "tracked")',
+            "parent symlink": f'(cwd / "sub").rename(cwd / "old-sub"); (cwd / "sub").symlink_to({str(outside)!r})',
+            "parent replaced": '(cwd / "sub").rename(cwd / "old-sub"); (cwd / "sub").mkdir(); (cwd / "sub/file").write_text("nested source")',
+            "checkout deleted": 'import shutil; shutil.rmtree(cwd)',
+            "checkout replaced": 'cwd.rename(cwd.with_name(cwd.name + "-old")); cwd.mkdir()',
+            "gitfile deleted": '(cwd / ".git").unlink()',
+            "gitfile replaced": 'contents = (cwd / ".git").read_bytes(); (cwd / ".git").rename(cwd / "old-git"); (cwd / ".git").write_bytes(contents)',
+            "registration replaced": '''admin = pathlib.Path(subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], text=True).strip())
+(admin / "gitdir").rename(admin / "old-gitdir"); (admin / "gitdir").write_text(str(cwd / ".git") + "\\n")''',
+            "registration deleted": '''import shutil
+admin = pathlib.Path(subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], text=True).strip())
+shutil.rmtree(admin)''',
+            "untracked": '(cwd / "untracked-source").write_text("new source")',
+            "gitlink": '''head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+subprocess.check_call(["git", "update-index", "--add", "--cacheinfo", "160000," + head + ",module"])''',
+        }
+        self.git("config", "core.filemode", "false")
+        for kind, body in mutations.items():
+            with self.subTest(kind=kind):
+                self.git("config", "core.filemode", "false")
+                output, _ = self.source_launch(body, extra=("--clean-checkout",))
+                self.assertIn("candidate changed", output)
+                self.assertEqual((outside / "file").read_text(), "outside untouched")
+
+    def test_SOURCE_S4_shutdown_child_is_reaped_before_check_and_lease_release(self):
+        child_pid = self.base / "shutdown-child"
+        child_ready = self.base / "shutdown-ready"
+        child_done = self.base / "shutdown-done"
+        code = f'''import os, pathlib, signal, time
+def stop(sig, frame):
+    pathlib.Path("tracked").write_text("shutdown edit")
+    pathlib.Path({str(child_done)!r}).touch()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+pathlib.Path({str(child_ready)!r}).touch()
+time.sleep(30)
+'''
+        # The scope stop delivers TERM and waits for the child's shutdown write
+        # before stopping the remaining processes. The guard must then reap it.
+        (self.bin / "systemctl").write_text(STOP_SCOPE.replace("found = False", f'''
+import time
+if pathlib.Path({str(child_pid)!r}).exists():
+    os.kill(int(pathlib.Path({str(child_pid)!r}).read_text()), signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while not pathlib.Path({str(child_done)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(.01)
+found = False'''))
+        self.round_decision()
+        self.agent_extra(f'''
+child = subprocess.Popen([sys.executable, "-c", {code!r}], start_new_session=True)
+pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))
+while not pathlib.Path({str(child_ready)!r}).exists():
+    time.sleep(.01)
+time.sleep(30)
+''')
+        result = self.launch("verifier", "codex", "--author-family", "claude", "--timeout", ".5")
+        self.assertEqual(result.returncode, 4, result.stderr)
+        output = self.out.read_text()
+        self.assertEqual(output.split("\n\n", 1)[1], "answer\n  unchanged\n")
+        self.assertIn("Exit code: 124\n", output)
+        self.assertIn("candidate changed", output)
+        self.assertIn("'tracked'", output)
+        self.assertTrue(child_done.exists())
+        self.assertFalse(Path(f"/proc/{child_pid.read_text()}").exists())
+
+    def test_SOURCE_S5_pins_launch_commits_while_builder_commits_again(self):
+        candidate = self.git("rev-parse", "HEAD")
+        output, _ = self.source_launch(f'''
+repo = {str(self.repo)!r}
+pathlib.Path(repo, "tracked").write_text("later builder commit")
+subprocess.check_call(["git", "-C", repo, "commit", "-qam", "builder continues"])
+''', before=candidate, expected=0)
+        self.assertIn(f"Snapshot commit: {candidate}\n", output)
+        self.assertIn("candidate unchanged", output)
+        self.assertIn("before unchanged", output)
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), candidate)
+
+    def test_SOURCE_S6_unreadable_malformed_git_and_stop_fail_closed(self):
+        cases = {
+            "unreadable": '(cwd / "tracked").chmod(0)',
+            "malformed index": '''admin = pathlib.Path(subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], text=True).strip())
+(admin / "index").write_bytes(b"invalid index")''',
+            "git failure": '',
+            "stop failure": '',
+        }
+        for kind, body in cases.items():
+            with self.subTest(kind=kind):
+                self.inject_launcher(f'''
+import pathlib, subprocess, os
+original = subprocess.check_output
+def check_output(command, *args, **kwargs):
+    if {kind!r} == "git failure" and "--cached" in command and pathlib.Path(os.environ["RECORD"]).exists():
+        raise subprocess.CalledProcessError(19, command)
+    return original(command, *args, **kwargs)
+subprocess.check_output = check_output
+''')
+                self.env["STOP_FAIL"] = "1" if kind == "stop failure" else ""
+                self.record.unlink(missing_ok=True)
+                output, record = self.source_launch(body)
+                self.assertIn("candidate unconfirmed", output)
+                self.assertIn("before not applicable", output)
+                self.assertIn("Snapshot commit:", output)
+                if kind == "stop failure":
+                    self.assertIn("session folder kept at", output)
+                    self.assertIn("evidence left in", output)
+                    session = Path(record["tmpdir"]).parent
+                    self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        self.env.pop("STOP_FAIL")
+
+    def test_SOURCE_S7_findings_archive_count_and_clean_reuse(self):
+        output, record = self.source_launch('(cwd / "tracked").write_text("edit")')
+        slot = Path(record["cwd"])
+        self.hold_other_pool_slots(slot)
+        self.assertEqual((slot / "tracked").read_text(), "edit")
+        new, clean_record = self.source_launch(expected=0)
+        self.assertEqual(clean_record["cwd"], str(slot))
+        self.assertIn("candidate unchanged", new)
+        self.assertEqual((self.out.parent / "answer.attempt-1.md").read_text(), output)
+        decision = self.out.parent / "round-decision.md"
+        decision.unlink()
+        result = self.launch("verifier", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Round: 3; decision: round-decision.md\n", self.source_launch(expected=0)[0])
+
+    def test_SOURCE_S7_save_failures_keep_source_outcome(self):
+        for mode in ("terminal", "answer"):
+            with self.subTest(mode=mode):
+                self.inject_launcher(f'''
+import os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if pathlib.Path(destination) == pathlib.Path({str(self.out)!r}) and pathlib.Path(os.environ["RECORD"]).exists():
+        raise OSError("forced save failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+                if mode == "answer":
+                    body = 'pathlib.Path(args[args.index("-o") + 1]).unlink(); pathlib.Path(args[args.index("-o") + 1]).mkdir()'
+                else:
+                    body = ''
+                self.record.unlink(missing_ok=True)
+                self.round_decision()
+                self.agent_extra('(cwd / "tracked").write_text("edit")\n' + body)
+                result = self.launch("verifier", "codex", "--author-family", "claude")
+                self.assertEqual(result.returncode, 4, result.stderr)
+                output = self.out.read_text()
+                self.assertIn("candidate changed", output)
+                self.assertIn("Result: failed: cannot save answer:", output)
+                session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+                self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+
+    def test_SOURCE_S8_all_allocations_and_mixed_pair_get_checks(self):
+        for allocation in ("first", "warm", "clean", "mixed", "fresh"):
+            with self.subTest(allocation=allocation), ExitStack() as held:
+                if allocation in ("mixed", "fresh"):
+                    pool = self.pool_root()
+                    pool.mkdir(parents=True, exist_ok=True)
+                    for number in range(2 if allocation == "mixed" else 1, 6):
+                        lock = held.enter_context((pool / f"slot-{number}.lock").open("a+b"))
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                for mutate in (False, True):
+                    output, _ = self.source_launch('(cwd / "tracked").write_text("edit")' if mutate else '',
+                        before="HEAD", expected=4 if mutate else 0,
+                        extra=("--clean-checkout",) if allocation == "clean" else ())
+                    self.assertIn("candidate changed" if mutate else "candidate unchanged", output)
+                    self.assertIn("before unchanged", output)
+                    if allocation in ("mixed", "fresh"):
+                        self.assertEqual(output.count("pool busy or slots unusable; fresh session worktree"),
+                                         1 if allocation == "mixed" else 2)
+
+    def test_SOURCE_S8_converted_bytes_and_symlink_emulation(self):
+        (self.repo / "tracked").write_bytes(b"original\n")
+        (self.repo / "encoded").write_bytes("encoded\n".encode("utf-16"))
+        (self.repo / "filtered").write_text("filtered\n")
+        (self.repo / "link").symlink_to("tracked")
+        (self.repo / ".gitattributes").write_text(
+            "tracked text eol=crlf\nencoded working-tree-encoding=UTF-16\nfiltered filter=fixture\n")
+        self.git("config", "filter.fixture.smudge", shlex.join([sys.executable, "-c",
+            "import sys; sys.stdout.write('SMUDGE:' + sys.stdin.read())"]))
+        self.git("config", "filter.fixture.clean", shlex.join([sys.executable, "-c",
+            "import sys; sys.stdout.write(sys.stdin.read().removeprefix('SMUDGE:'))"]))
+        self.git("add", ".")
+        self.git("commit", "-qm", "conversions")
+        self.git("config", "core.symlinks", "false")
+        for path in ("tracked", "encoded", "filtered", "link"):
+            with self.subTest(path=path):
+                self.assertIn("candidate unchanged", self.source_launch(expected=0)[0])
+                output, _ = self.source_launch(f'(cwd / {path!r}).write_bytes(b"changed bytes")')
+                self.assertIn(f"'{path}'", output)
+
+    def test_SOURCE_S8_fresh_candidate_and_pooled_before_both_checked(self):
+        baseline = self.git("rev-parse", "HEAD")
+        (self.repo / "tracked").write_text("candidate")
+        self.git("commit", "-qam", "candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        self.inject_launcher(f'''
+import subprocess
+original = subprocess.check_output
+def check_output(command, *args, **kwargs):
+    if any("/slot-" in str(arg) for arg in command) and command[-1] == {candidate!r} and any(
+            action in command for action in ("add", "checkout")):
+        raise subprocess.CalledProcessError(31, command)
+    return original(command, *args, **kwargs)
+subprocess.check_output = check_output
+''')
+        for mutate in (False, True):
+            body = '''before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+(before / "tracked").write_text("baseline edit")''' if mutate else ''
+            output, record = self.source_launch(body, before=baseline, expected=4 if mutate else 0)
+            self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
+            self.assertEqual(output.count("pool busy or slots unusable; fresh session worktree"), 1)
+            self.assertIn("candidate unchanged", output)
+            self.assertIn("before changed" if mutate else "before unchanged", output)
+
+    def test_SOURCE_S8_reftable_fresh_checkouts_are_checked(self):
+        probe = subprocess.run(["git", "init", "-q", "--ref-format=reftable", str(self.base / "probe")],
+                               env=self.env, capture_output=True, text=True)
+        if probe.returncode:
+            self.skipTest("installed Git does not support reftable: " + probe.stderr)
+        shutil.rmtree(self.repo / ".git")
+        self.git("init", "-q", "--ref-format=reftable")
+        self.git("add", ".")
+        self.git("commit", "-qm", "reftable candidate")
+        for mutate in (False, True):
+            output, _ = self.source_launch('(cwd / "tracked").write_text("edit")' if mutate else '',
+                                          before="HEAD", expected=4 if mutate else 0)
+            self.assertEqual(output.count("reftable; fresh session worktree"), 2)
+            self.assertIn("candidate changed" if mutate else "candidate unchanged", output)
+            self.assertIn("before unchanged", output)
+
+    def test_SOURCE_S3_committed_gitlink_worktree_changes(self):
+        head = self.git("rev-parse", "HEAD")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{head},module")
+        self.git("commit", "-qm", "gitlink")
+        (self.repo / "module").mkdir()
+        for body in ('(cwd / "module").rmdir(); (cwd / "module").write_text("file")',
+                     '(cwd / "module").rmdir(); (cwd / "module").symlink_to("tracked")',
+                     f'subprocess.check_call(["git", "update-index", "--cacheinfo", "160000,{self.git("rev-parse", "HEAD")},module"])'):
+            with self.subTest(body=body):
+                output, _ = self.source_launch(body)
+                self.assertIn("candidate changed", output)
+                self.assertIn("'module'", output)
+
+    def test_SOURCE_P1_ignored_build_output_and_evidence_are_allowed(self):
+        (self.repo / ".gitignore").write_text("build/\nnode_modules/\n.gradle/\nignored\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "ignored outputs")
+        output, _ = self.source_launch('''
+for name in ("build", "node_modules", ".gradle"):
+    (cwd / name).mkdir(exist_ok=True)
+    (cwd / name / "output").write_text("build output")
+(evidence / "proof").write_text("evidence")
+''', expected=0)
+        self.assertIn("candidate unchanged", output)
+        self.assertEqual((self.out.parent / "answer-evidence/proof").read_text(), "evidence")
+
+    def test_SOURCE_P2_agent_outcomes_keep_codes_with_unchanged_source(self):
+        for outcome, expected in (("success", 0), ("nonzero", 7), ("timeout", 124),
+                                  ("empty", 1), ("signal", 143)):
+            with self.subTest(outcome=outcome):
+                self.round_decision()
+                self.env.update(SESSION_EXIT="7" if outcome == "nonzero" else "0",
+                                NO_ANSWER="1" if outcome == "empty" else "",
+                                SLEEP="1" if outcome in ("timeout", "signal") else "")
+                if outcome == "signal":
+                    self.record.unlink(missing_ok=True)
+                    process = self.start_launcher()
+                    self.wait_record()
+                    process.terminate()
+                    _, stderr = process.communicate(timeout=10)
+                    code = process.returncode
+                else:
+                    result = self.launch("verifier", "codex", "--author-family", "claude",
+                                         *(["--timeout", ".3"] if outcome == "timeout" else []))
+                    code, stderr = result.returncode, result.stderr
+                self.assertEqual(code, expected, stderr)
+                output = self.out.read_text()
+                self.assertIn("candidate unchanged", output)
+                self.assertIn(f"Exit code: {expected}\n", output)
+                self.assertIn("Cleanup: ok\n", output)
+                self.assertNotIn("Result: source check failed", output)
+                if outcome == "signal":
+                    self.assertIn("Signal: 15\n", output)
+
+    def test_SOURCE_P5_signal_during_check_keeps_answer_and_single_line_header(self):
+        self.inject_launcher('''
+import os, pathlib, signal, subprocess
+original = subprocess.check_output
+def check_output(command, *args, **kwargs):
+    if "--cached" in command and pathlib.Path(os.environ["RECORD"]).exists():
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original(command, *args, **kwargs)
+subprocess.check_output = check_output
+''')
+        output, _ = self.source_launch('(cwd / "line\\nname").write_text("untracked")', expected=143)
+        self.assertIn("Result: source check failed\n", output)
+        self.assertIn("Signal: 15\n", output)
+        self.assertIn("'line\\nname'", output)
 
     def install_preflight(self, body):
         path = self.repo / ".agents/preflight"
@@ -726,6 +1098,9 @@ events = []
 events_path = pathlib.Path({str(self.admission_events)!r})
 events_path.write_text(json.dumps(events))
 original_read = pathlib.Path.read_text
+original_sleep, original_monotonic = time.sleep, time.monotonic
+def in_admission():
+    return sys._getframe(2).f_code.co_name == "wait_for_room"
 def read(path, *args, **kwargs):
     name = str(path)
     if name.startswith(("/proc/pressure/", "/sys/fs/cgroup/")) or name in ("/proc/meminfo", "/proc/self/cgroup"):
@@ -735,8 +1110,10 @@ def read(path, *args, **kwargs):
         return value
     return original_read(path, *args, **kwargs)
 pathlib.Path.read_text = read
-time.monotonic = lambda: clock[0]
+time.monotonic = lambda: clock[0] if in_admission() else original_monotonic()
 def sleep(seconds):
+    if not in_admission():
+        return original_sleep(seconds)
     events.append(seconds)
     events_path.write_text(json.dumps(events))
     clock[0] += seconds
@@ -872,6 +1249,17 @@ for path in pool.glob("*.lock"):
             with self.subTest(role=role):
                 self.admission_fixture([{"/proc/pressure/io": "full avg10=10\n"},
                                         {"/proc/pressure/io": "full avg10=0\n"}])
+                # Exercise subprocess polling deterministically, even if the child
+                # has already exited before Popen.wait() normally needs to sleep.
+                site = Path(self.env["PYTHONPATH"]) / "sitecustomize.py"
+                with site.open("a") as stream:
+                    stream.write(textwrap.indent(textwrap.dedent('''
+original_wait = subprocess.Popen.wait
+def polling_wait(self, *args, **kwargs):
+    time.sleep(.001)
+    return original_wait(self, *args, **kwargs)
+subprocess.Popen.wait = polling_wait
+'''), "    "))
                 result = self.launch(role, "codex", *(["--author-family", "claude"]
                                                      if role in ("verifier", "challenger", "reviewer") else []))
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1732,7 +2120,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                record = self.verifier(family, "--before", baseline)
+                record = self.verifier(family, "--before", baseline, expected_code=4)
                 self.assertTrue(Path(record["before"]).is_relative_to(self.pool_root()))
                 self.assertIn("Before checkout:", self.out.read_text())
                 self.assertEqual((self.repo / "tracked").read_text(), "candidate")
@@ -2017,7 +2405,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                record = self.verifier(family, "--before", "HEAD")
+                record = self.verifier(family, "--before", "HEAD", expected_code=4)
                 line = f"Before checkout: {record['before']} ({self.git('rev-parse', 'HEAD')});"
                 self.assertIn(line, self.out.read_text())
                 self.assertIn(line, record["stdin"])
@@ -2043,7 +2431,7 @@ assert before != cwd
 record["before"] = str(before)
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
-        record = self.verifier("codex", "--before", "HEAD")
+        record = self.verifier("codex", "--before", "HEAD", expected_code=4)
         self.assertEqual(self.out.read_text().count("pool busy or slots unusable; fresh session worktree"), 2)
         self.assertFalse(Path(record["before"]).exists())
         self.assert_session_cleaned(record)
@@ -2945,10 +3333,11 @@ subprocess.check_output = check_cache_config
     def test_POOL_R11_fresh_fallback_checks_status_without_content_recheck(self):
         self.busy_pool()
         self.inject_launcher('''
-import subprocess
+import os, pathlib, subprocess
 original = subprocess.check_output
 def no_content_recheck(command, *args, **kwargs):
-    assert not any(action in command for action in ("hash-object", "check-attr", "cat-file")), command
+    if not pathlib.Path(os.environ["RECORD"]).exists():
+        assert not any(action in command for action in ("hash-object", "check-attr", "cat-file")), command
     return original(command, *args, **kwargs)
 subprocess.check_output = no_content_recheck
 ''')
@@ -3835,7 +4224,7 @@ while True:
         self.assert_session_cleaned(first)
         self.assert_session_cleaned(second)
 
-    def deletion_build(self, files, deleted, command, build_env, error_text, marker):
+    def deletion_build(self, files, deleted, command, build_env, error_text, marker, source_change=None):
         for name, content in files.items():
             target = self.repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -3854,7 +4243,12 @@ sys.exit(result.returncode)
         output = (self.out.parent / "answer-evidence/build.txt").read_text()
         if "Could not determine a usable wildcard IP" in output:
             self.skipTest("Gradle cannot start in this sandbox: no usable wildcard IP")
-        self.assertEqual(first.returncode, 0, output + first.stderr)
+        self.assertEqual(first.returncode, 4 if source_change else 0, output + first.stderr)
+        if source_change:
+            header = self.out.read_text().split("\n\n", 1)[0]
+            self.assertIn("Exit code: 0\n", header + "\n")
+            self.assertIn(repr(source_change), header)
+            self.assertIn("Result: source check failed\n", header + "\n")
         slot = Path(json.loads(self.record.read_text())["cwd"])
         sentinel = slot / marker
         sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -4013,7 +4407,7 @@ sys.exit(result.returncode)
             "PATH": os.environ["PATH"], "RUSTC": rustc,
             "CARGO_HOME": str(self.base / "cargo-home"),
             "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
-        }, "file not found for module `removed`", "target/warm-marker")
+        }, "file not found for module `removed`", "target/warm-marker", source_change="Cargo.lock")
 
     def test_POOL_S12_cargo_deleted_binary_cannot_run_from_stale_target(self):
         cargo, rustc = shutil.which("cargo"), shutil.which("rustc")
@@ -4057,7 +4451,9 @@ sys.exit(code)
 ''')
         first = self.launch("verifier", "codex", "--author-family", "claude")
         proof = self.out.parent / "answer-evidence/build.txt"
-        self.assertEqual(first.returncode, 0, proof.read_text() + first.stderr)
+        self.assertEqual(first.returncode, 4, proof.read_text() + first.stderr)
+        self.assertIn("Exit code: 0\n", self.out.read_text())
+        self.assertIn("'Cargo.lock'", self.out.read_text())
         self.assertIn("old executable runs", proof.read_text())
         slot = Path(json.loads(self.record.read_text())["cwd"])
         self.hold_other_pool_slots(slot)
@@ -4066,7 +4462,8 @@ sys.exit(code)
         self.git("add", "-u")
         self.git("commit", "-qm", "delete executable source")
         second = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(second.returncode, 9, proof.read_text() + second.stderr)
+        self.assertEqual(second.returncode, 4, proof.read_text() + second.stderr)
+        self.assertIn("Exit code: 9\n", self.out.read_text())
         self.assertIn("removed executable absent", proof.read_text())
         self.assertFalse((slot / "target/debug/tool").exists())
         self.assertEqual(json.loads(self.record.read_text())["cwd"], str(slot))
@@ -4624,7 +5021,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                         if absolute != wrapper:
                             self.assertEqual(discovery["executable"], str(absolute))
 
-    def test_CE_S6_discovery_failure_keeps_restrictions_and_explains_fallback(self):
+    def test_CE_S6_discovery_failure_refuses_after_two_attempts(self):
         for output, exit_code, reason in (("[]", "9", "exited 9"),
                                          ("not JSON", "0", "invalid JSON"),
                                          ('{}', "0", "invalid server list"),
@@ -4635,22 +5032,18 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.env.update(MCP_JSON=output, MCP_EXIT=exit_code,
                                 MCP_STDERR="discovery diagnostic", SESSION_STDERR="agent diagnostic")
                 result = self.launch("reviewer", "codex", "--author-family", "claude")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                args = json.loads(self.record.read_text())["argv"]
-                self.assertIn("skills.include_instructions=false", args)
-                self.assertIn("plugins", args)
-                self.assertIn("apps", args)
-                self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
-                self.assertIn("MCP servers were not disabled", result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.record.exists())
+                self.assertIn("Result: launch refused\n", self.out.read_text())
                 self.assertIn(reason, result.stderr)
-                self.assertIn("Requested environment: restricted with MCP servers not disabled: discovery ",
-                              self.out.read_text())
                 self.assertIn(reason, self.out.read_text())
                 self.assertEqual(self.out.with_suffix(".log").read_text(),
-                                 "discovery diagnostic\nagent diagnostic\n")
+                                 "discovery diagnostic\ndiscovery diagnostic\n")
+                self.assertEqual(self.non_pool_worktrees().count("worktree "), 1)
 
     def test_CE_S6_empty_and_disabled_server_lists_are_successful(self):
-        for output in ('[]', '[{"name":"off","enabled":false}]'):
+        for output in ('[]', '[{"name":"off","enabled":false}]',
+                       '[{"name":"unsupported.disabled name","enabled":false}]'):
             with self.subTest(output=output):
                 self.env["MCP_JSON"] = output
                 result = self.launch("challenger", "codex", "--author-family", "claude")
@@ -4660,26 +5053,21 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 args = json.loads(self.record.read_text())["argv"]
                 self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
 
-    def test_CE_S6_unsupported_server_names_are_skipped_and_reported(self):
+    def test_CE_S6_unsupported_enabled_server_names_refuse(self):
         for name in ('dot.name', 'space name', 'quote"slash\\line\n\x00\x7f', 'café 😀', '', '\ud800'):
             with self.subTest(name=name):
                 self.env["MCP_JSON"] = json.dumps([
                     {"name": "node_repl", "enabled": True},
                     {"name": name, "enabled": True}])
                 result = self.launch("reviewer", "codex", "--author-family", "claude")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                args = json.loads(self.record.read_text())["argv"]
-                self.assertEqual([a for a in args if a.startswith("mcp_servers.")],
-                                 ["mcp_servers.node_repl.enabled=false"])
-                self.assertIn("skills.include_instructions=false", args)
-                self.assertIn("plugins", args)
-                self.assertIn("apps", args)
-                note = f"MCP servers not all disabled: unsupported server names: {ascii(name)}"
-                self.assertIn(f"Requested environment: restricted with {note}\n", self.out.read_text())
-                self.assertIn(f"MCP servers were not all disabled: unsupported server names: {ascii(name)}",
-                              result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.record.exists())
+                reason = f"unsupported server names: {ascii(name)}"
+                self.assertIn(reason, self.out.read_text())
+                self.assertIn(reason, result.stderr)
+                self.assertIn("Result: launch refused\n", self.out.read_text())
 
-    def test_CE_S6_S9_discovery_timeout_kills_group_then_runs_agent(self):
+    def test_CE_S6_S9_discovery_timeout_kills_group_then_refuses(self):
         self.env.update(MCP_SLEEP="1", MCP_STDERR="discovery timeout diagnostic",
                         SESSION_STDERR="agent diagnostic")
         self.inject_launcher('''
@@ -4693,11 +5081,12 @@ def communicate(self, *args, **kwargs):
 subprocess.Popen.communicate = communicate
 ''')
         result = self.launch("reviewer", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.record.exists())
         self.assertIn("discovery timed out after 30 seconds", result.stderr)
         self.assertEqual(self.out.with_suffix(".log").read_text(),
-                         "discovery timeout diagnostic\nagent diagnostic\n")
-        self.assertIn("MCP servers not disabled", self.out.read_text())
+                         "discovery timeout diagnostic\ndiscovery timeout diagnostic\n")
+        self.assertIn("Result: launch refused\n", self.out.read_text())
         self.assert_discovery_cleaned()
 
     def test_CE_S6_discovery_is_bounded_by_short_session_timeout(self):
@@ -4712,15 +5101,69 @@ def communicate(self, *args, **kwargs):
 subprocess.Popen.communicate = communicate
 ''')
         result = self.launch("reviewer", "codex", "--author-family", "claude", "--timeout", "0.3")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.record.exists())
         self.assertIn("discovery timed out after 0.3 seconds", result.stderr)
-        self.assertIn("MCP servers not disabled", self.out.read_text())
-        args = json.loads(self.record.read_text())["argv"]
-        self.assertIn("skills.include_instructions=false", args)
-        self.assertIn("plugins", args)
-        self.assertIn("apps", args)
-        self.assertFalse(any(a.startswith("mcp_servers.") for a in args))
+        self.assertIn("Result: launch refused\n", self.out.read_text())
         self.assert_discovery_cleaned()
+
+    def test_MCP_S9_launch_errors_retry_then_refuse_without_agent(self):
+        attempts = self.base / "launch-attempts"
+        self.inject_launcher(f'''
+import pathlib, subprocess
+original = subprocess.Popen
+def popen(command, *args, **kwargs):
+    if command[1:] == ["mcp", "list", "--json"]:
+        with pathlib.Path({str(attempts)!r}).open("a") as log:
+            log.write("attempt\\n")
+        raise OSError("discovery launch error")
+    return original(command, *args, **kwargs)
+subprocess.Popen = popen
+''')
+        result = self.launch("challenger", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(attempts.read_text().splitlines(), ["attempt", "attempt"])
+        self.assertIn("Result: launch refused\n", self.out.read_text())
+        self.assertIn("discovery launch error", self.out.read_text())
+        self.assertIn("discovery launch error", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(self.non_pool_worktrees().count("worktree "), 1)
+
+    def test_MCP_S9_successful_discovery_with_failed_cleanup_refuses(self):
+        self.env["MCP_STDERR"] = "discovery diagnostic"
+        self.inject_launcher('''
+import os
+original = os.killpg
+def killpg(pid, sig):
+    try:
+        original(pid, sig)
+    except ProcessLookupError:
+        pass
+    raise OSError("discovery cleanup error")
+os.killpg = killpg
+''')
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        output = self.out.read_text()
+        self.assertIn("Result: launch refused\n", output)
+        self.assertIn("MCP discovery cleanup failed", output)
+        self.assertIn("discovery cleanup error", output)
+        self.assertIn("discovery cleanup error", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(self.out.with_suffix(".log").read_text(), "discovery diagnostic\n")
+        self.assertEqual(self.non_pool_worktrees().count("worktree "), 1)
+
+    def test_MCP_S10_failed_first_discovery_retries_and_starts_restricted(self):
+        self.env.update(MCP_FAIL_FIRST="1", MCP_JSON='[{"name":"node_repl","enabled":true}]')
+        result = self.launch("reviewer", "codex", "--author-family", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(str(self.record) + ".discovery-attempts").read_text().splitlines(),
+                         ["attempt", "attempt"])
+        args = json.loads(self.record.read_text())["argv"]
+        for arg in ("plugins", "apps", "skills.include_instructions=false", "mcp_servers.node_repl.enabled=false"):
+            self.assertIn(arg, args)
+        self.assertIn("Requested environment: restricted\n", self.out.read_text())
+        self.assertIn("first attempt failed", self.out.with_suffix(".log").read_text())
 
     def assert_discovery_cleaned(self):
         discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
@@ -6519,7 +6962,9 @@ assert evidence.parent == pathlib.Path(os.environ["TMPDIR"]).parent and not evid
 ''')
         self.env["SLEEP"] = "1"
         result = self.launch("verifier", "codex", "--author-family", "claude", "--timeout", "0.4")
-        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("Exit code: 124\n", self.out.read_text())
+        self.assertIn("'discard.txt'", self.out.read_text())
         record = json.loads(self.record.read_text())
         evidence = Path(record["tmpdir"]).parent / "evidence"
         self.assertIn(f"Evidence folder: {evidence}; only this folder is kept; "
@@ -6755,7 +7200,7 @@ assert str(evidence) in [args[i + 1] for i, arg in enumerate(args) if arg == "--
     def test_L8_scope_cleanup_failure_keeps_status_answer_and_session_evidence(self):
         self.env.update(STOP_FAIL="1", SESSION_EXIT="7", EVIDENCE="1")
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.returncode, 4, result.stderr)
         self.assertIn("Cleanup failed:", result.stderr)
         self.assertIn("agent-verifier-", result.stderr)
         self.assertIn("scope stop refused", result.stderr)
@@ -8525,7 +8970,7 @@ def copy(source, destination, *args, **kwargs):
 subprocess.run, shutil.copytree = run, copy
 ''')
         result = self.launch("verifier", "codex", "--author-family", "claude")
-        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.returncode, 4, result.stderr)
         self.assertFalse(copied.exists())
         session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
         self.assertEqual((session / "evidence/proof.txt").read_text(), "proof")
