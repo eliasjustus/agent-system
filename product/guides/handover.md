@@ -4,7 +4,7 @@
 
 Give the work to **Codex** when the outcome, design and acceptance checks are settled and the
 assignment is self-contained. Otherwise give it to a **Claude** builder. Above the floor you never
-build yourself. Builders never delegate further, commit, push or publish, and never read the
+build yourself, except the narrow repair the entry's first invariant allows. Builders never delegate further, commit, push or publish, and never read the
 private folder.
 Builders run the project's `.agents/preflight`, if present, before handing back.
 
@@ -61,7 +61,7 @@ servers in Codex user configuration, pre-existing hard links and bind mounts.
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
 candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
 (an executable regular file that exits 0 and leaves tracked files matching the candidate), a
-fresh session of the other family with the role contract, the brief and, for a verifier,
+fresh session of the family the entry's "Roles and models" names, with the role contract, the brief and, for a verifier,
 `guides/verification.md`; its answer and evidence kept unedited in `results/`; the same written
 decision from the third verification on; the worktree removed afterwards.
 
