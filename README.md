@@ -326,7 +326,7 @@ git worktree add --detach /path/to/checkout COMMIT
 Before a manual verifier session, run `.agents/preflight` if present in that checkout; require an
 executable regular file, exit 0 and tracked files still matching the candidate. Keep its build output
 for verification. Builders also run the project's preflight before handing back.
-Start a fresh session of the other model family in that checkout. Give it the appropriate installed
+Start a fresh session in that checkout, of the other model family unless the user's `models.md` currently says otherwise. Give it the appropriate installed
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
 evidence. Remove the checkout with `git worktree remove /path/to/checkout` after checking.

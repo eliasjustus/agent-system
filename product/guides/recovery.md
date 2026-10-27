@@ -58,4 +58,4 @@ and what would let it resume, and deliver a reviewable candidate or a verified s
 known gaps. Reducing scope is your decision, recorded with its reason and named in the delivery as a
 limit; it never turns missing verification into a pass, and a known security or data-loss defect
 never ships. Above the floor, a round limit or a stop time never permits building it
-yourself; at any depth it never permits weakening a scenario: stop and report instead.
+yourself beyond the exactly specified repair the entry's first invariant allows; at any depth it never permits weakening a scenario: stop and report instead.
