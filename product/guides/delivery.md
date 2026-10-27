@@ -74,7 +74,8 @@ by the session that owns it. Record the reply word for word with the date.
   it waits. Never delete results or evidence before they are kept where the task record links them.
   Launcher pool slots are not task output.
 - **Reported wrong later:** reopen the same task record with a new candidate (and a new pull
-  request where the project uses them), and note in the delivery it escaped from what was missed.
+  request where the project uses them), and add a dated line under the delivery it escaped from
+saying what was missed.
 - **Changes requested:** continue under the same task record and the same pull request or a
   follow-up under the same number.
 

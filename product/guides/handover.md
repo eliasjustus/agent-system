@@ -18,15 +18,16 @@ Verifiers, challengers and reviewers run in their own session, from the model fa
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
-Commit the candidate first: the launcher refuses tracked changes, tests the committed HEAD in a
-clean leased checkout and names left-out untracked files in the answer's header. Verifiers need
-`--before <commit>` or `--before none`. Add `--network` or `--writable DIR` only when the work
-need them; retry with `--clean-checkout` after an environment-looking failure, keeping both
-results. The third verifier launch into one `--out` directory needs a fresh `round-decision.md`
-there (`guides/recovery.md`), so give each repair sequence its own results folder. The header
-records what each session was given; the result file decides what completed. Everything else the
-launcher does (snapshots, the private-folder shield and its limits, admission, pool slots, result
-states and exit codes) is in `run.py --help` and the launcher section of the Agent System README
+Before verification, commit the candidate: the launcher refuses tracked changes, tests the
+committed HEAD in a clean leased checkout and names left-out untracked files in the answer's
+header; challengers and reviewers read a snapshot that includes uncommitted work. Verifiers need
+`--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
+`--writable DIR` only when the work needs them; retry with `--clean-checkout` after an
+environment-looking failure, keeping both results. The third verifier launch into one `--out`
+directory needs a fresh `round-decision.md` there (`guides/recovery.md`), so give each repair
+sequence its own results folder. The header records what each session was given; the result file
+decides what completed. Everything else the launcher does, from the private-folder shield and its
+limits to result states, is in `run.py --help` and the launcher section of the Agent System README
 (github.com/eliasjustus/agent-system). Never relay or summarise a review before reading it in full.
 
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
