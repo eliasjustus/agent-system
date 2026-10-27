@@ -15,8 +15,8 @@ receives. Put nothing else in.
 
 ## Run reviews from the other family
 
-Verifiers, challengers and reviewers run in their own session, from the other model family than
-the author of what they check. Commit the candidate before sending a verifier: the launcher
+Verifiers, challengers and reviewers run in their own session, from the model family the entry's
+"Roles and models" names for them. Commit the candidate before sending a verifier: the launcher
 `{{METHOD}}/run.py` refuses tracked changes, leases a clean detached checkout at the committed
 HEAD captured at startup, and leaves untracked files out, naming them in the answer's header.
 It runs the candidate's committed `.agents/preflight`, if present, before starting the verifier;

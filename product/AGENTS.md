@@ -26,10 +26,12 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
 1. **Estimate before starting** any task bigger than a quick answer: a time range, the start time and
    the stop time (start plus twice the upper end), written in the task record. Every observed time in a
    task record is UTC read from the clock (`date -u`), never estimated afterwards; the stop time is
-   computed from it, in UTC. At the stop time,
-   stop and tell the user what was done, why it overran, the new estimate and the cheaper options.
-   Only such a stop moves the stop time: its new estimate covers the whole task from the original
-   start, and the new stop time is written down. Never just carry on with a new number.
+   computed from it, in UTC. At the stop time, write down
+   what was done, why it overran and a new estimate covering the whole task from the original
+   start, with its new stop time; tell the user in one line and carry on. Stop and wait for the
+   user only when the overrun puts a choice about the scope they asked for in front of them, or
+   adds load on something shared they use (CI, this machine while they work). Never carry on
+   with a new number that is not written down.
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
    codebase; does the standard library do it; does an installed dependency do it; can it be one
    line; only then the minimum that works. Never cut validation at trust boundaries, error handling
@@ -42,7 +44,9 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
 
 ## Invariants
 
-1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build.
+1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build,
+   except to apply a fix that a reviewer or verifier spelled out exactly; a check from the other
+   family than the orchestrator then covers it.
 2. Above the floor, settle the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
    the rules. Commit the candidate before verifying; untracked files are excluded and named by
@@ -73,7 +77,9 @@ Unresolved consequential uncertainty means above. File count, wording and resear
 Decide again when an analysis turns into building or a repair touches saved state.
 
 **Above:** settled scenarios, a challenger, a separate builder, verification on the real system;
-skipping one is a departure, recorded with its reason and named in the delivery. **Below:** a short contract, a builder or your own edit, and one
+skipping one is a departure, recorded with its reason and named in the delivery. The real system
+means the changed behavior used as it is used for real, through its real interface and processes;
+a test suite that stands in for them is a narrower check, not this. **Below:** a short contract, a builder or your own edit, and one
 counterexample you tried; if you edited it yourself, a verifier still checks it.
 
 ## Roles and models
@@ -81,8 +87,9 @@ counterexample you tried; if you edited it yourself, a verifier still checks it.
 - **Orchestrator** (you): the most capable model available. Frames, decides depth, writes briefs,
   judges, talks to the user.
 - **Builder:** Codex for settled, well-specified work; Claude for work that still needs judgment.
-- **Verifier, challenger, reviewer:** always from the other model family than the author of what
-  they check: the builder for code, you for scenarios, designs and documents. Each runs in its own
+- **Verifier, challenger, reviewer:** from the other model family than the author of what they
+  check (the builder for code, you for scenarios, designs and documents), unless the user's
+  models file in their preferences currently says otherwise. Each runs in its own
   session on its own committed checkout for verification; Codex challengers and reviewers read
   their snapshot through Git. Where only one family is available, use a separate session and say
   that independence comes only from that.
