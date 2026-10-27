@@ -74,7 +74,7 @@ by the session that owns it. Record the reply word for word with the date.
   it waits. Never delete results or evidence before they are kept where the task record links them.
   Launcher pool slots are not task output.
 - **Reported wrong later:** reopen the same task record with a new candidate (and a new pull
-  request where the project uses them).
+  request where the project uses them), and note in the delivery it escaped from what was missed.
 - **Changes requested:** continue under the same task record and the same pull request or a
   follow-up under the same number.
 
@@ -83,4 +83,6 @@ by the session that owns it. Record the reply word for word with the date.
 A problem with the project's knowledge or checks goes into `findings/` in the project's private
 folder (`templates/finding.md`). A problem with the method is recorded there as a finding, marked
 `core`, and may also be reported to the method's upstream repository. Record the evidence, then
-continue the product work.
+continue the product work. A method change made from findings names the failure it addresses and
+prefers a check or a tool over new prose; added text replaces or removes at least as much, unless
+the change says why it cannot.

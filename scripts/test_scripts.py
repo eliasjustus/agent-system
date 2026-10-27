@@ -9384,5 +9384,16 @@ pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()))
         self.assertNotIn("/.claude/agents/builder.md", (self.repo / ".git/info/exclude").read_text())
 
 
+
+class MethodSizeTest(unittest.TestCase):
+    # Raising this is a reviewed decision in the pull request, not a fix for a failing test.
+    BUDGET = 7850
+
+    def test_method_text_stays_within_its_word_budget(self):
+        words = sum(len(path.read_text().split()) for path in sorted((ROOT / "product").rglob("*.md")))
+        self.assertLessEqual(words, self.BUDGET,
+                             f"method text has {words} words, budget {self.BUDGET}: replace or remove "
+                             "text for what you add, or raise BUDGET with the reason in the pull request")
+
 if __name__ == "__main__":
     unittest.main()

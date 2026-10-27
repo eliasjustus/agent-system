@@ -3,60 +3,31 @@
 ## Choose the builder
 
 Give the work to **Codex** when the outcome, design and acceptance checks are settled and the
-assignment is self-contained. Otherwise give it to a **Claude** builder. Above the floor you never
-build yourself, except the narrow repair the entry's first invariant allows. Builders never delegate further, commit, push or publish, and never read the
-private folder.
-Builders run the project's `.agents/preflight`, if present, before handing back.
+assignment is self-contained. Otherwise give it to a **Claude** builder.
 
 ## Briefs
 
 Write every brief from `templates/packets.md`: it lists what each role receives and what it never
-receives. Put nothing else in.
+receives. Put nothing else in. Every role but investigator is shut out of the private folder, so a
+brief carries everything the role needs.
 
 ## Run reviews from the other family
 
 Verifiers, challengers and reviewers run in their own session, from the model family the entry's
-"Roles and models" names for them. Commit the candidate before sending a verifier: the launcher
-`{{METHOD}}/run.py` refuses tracked changes, leases a clean detached checkout at the committed
-HEAD captured at startup, and leaves untracked files out, naming them in the answer's header.
-It runs the candidate's committed `.agents/preflight`, if present, before starting the verifier;
-a failure refuses the launch. Never relay or summarise a review before reading it in full.
+"Roles and models" names for them, through the launcher:
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
-Verifiers require `--before <commit>` to lease a second writable checkout for the baseline, or
-`--before none` to start without one. If a before state is needed after all, the verifier makes
-an ad-hoc shared clone inside $TMPDIR and builds it into its own build folder.
-The third verifier launch into the same `--out` directory, and each later one, requires a fresh
-`round-decision.md` there (see `guides/recovery.md`). Give each repair sequence, such as one
-package of a larger task, its own results folder, so unrelated verifications do not count against it.
-Pool slots retain ignored build output; retry with `--clean-checkout`
-after an environment-looking failure, keeping both results. The pool has five slots per
-repository; a busy pool falls back to a temporary session worktree without waiting.
-
-Challengers and reviewers keep snapshots of uncommitted changes and untracked files up to 5 MB,
-without moving a branch. Codex reads code through `git show <snapshot>:<path>`,
-`git grep <pattern> <snapshot>` and `git diff`; only root AGENTS.md/CLAUDE.md are checked out.
-Claude keeps its checkout and optional leave-out list, with `--full-checkout` when needed.
-
-For Codex builders and verifiers, add `--network` when the assignment needs local servers, child
-processes from Node or network access; otherwise the user's network configuration applies. Use
-`--writable DIR` to open an extra directory, for example `--writable ~/.gradle` for a build cache.
-Network access does not open extra directories. There is no full-access option because these
-cover the known needs.
-Builds started through `gradle` or `gradlew` get a per-session daemon registry via `GRADLE_OPTS`, overriding any caller registry setting, so each session's first build starts a daemon and sessions never share one. A script that replaces `GRADLE_OPTS`, or a build started another way, shares daemons again. A cache path with shell-special characters skips this, with a warning.
-
-Codex challengers and reviewers start without plugins, skills or MCP servers (best effort: servers
-that cannot be disabled stay enabled and the header reports it); Claude sessions use a fixed tool
-list and no MCP servers. Builders and verifiers wait up to 30 minutes for memory and IO
-room before starting (`Admission:` header); a project's build gate can wait the same way with
-`python3 {{METHOD}}/run.py --wait-for-room`. The header records what each session was given.
-
-Every role but investigator is shut out of the private folder, shell included: Codex through a
-permission profile, Claude inside bubblewrap (`Shield:` header). A launch that cannot set this up is
-refused. Preflight runs inside the shield; the system bus is not covered. The shield also cuts off the user's session services through the runtime directory and X11
-sockets. Not covered: services reached by abstract socket or localhost network port, external MCP
-servers in Codex user configuration, pre-existing hard links and bind mounts.
+Commit the candidate first: the launcher refuses tracked changes, tests the committed HEAD in a
+clean leased checkout and names left-out untracked files in the answer's header. Verifiers need
+`--before <commit>` or `--before none`. Add `--network` or `--writable DIR` only when the work
+need them; retry with `--clean-checkout` after an environment-looking failure, keeping both
+results. The third verifier launch into one `--out` directory needs a fresh `round-decision.md`
+there (`guides/recovery.md`), so give each repair sequence its own results folder. The header
+records what each session was given; the result file decides what completed. Everything else the
+launcher does (snapshots, the private-folder shield and its limits, admission, pool slots, result
+states and exit codes) is in `run.py --help` and the launcher section of the Agent System README
+(github.com/eliasjustus/agent-system). Never relay or summarise a review before reading it in full.
 
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
 candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
@@ -64,12 +35,6 @@ candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight`
 fresh session of the family the entry's "Roles and models" names, with the role contract, the brief and, for a verifier,
 `guides/verification.md`; its answer and evidence kept unedited in `results/`; the same written
 decision from the third verification on; the worktree removed afterwards.
-
-The result file decides what completed. Earlier results are kept as `.attempt-N` siblings; a
-saved answer survives later failures and signals; `Result: running` means the launcher is running or
-was killed (`flock -n <stem>.lock true` fails while it lives). Result states, exit codes and refused
-output names are in the launcher section of the Agent System README
-(github.com/eliasjustus/agent-system).
 
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the
@@ -93,7 +58,8 @@ already asked is not news (see `guides/delivery.md`).
 ## After each delegation
 
 - Save the agent's answer in the task folder's `results/`, unedited.
-- Read the answer before acting on it. A later cleanup error does not erase a completed answer.
+- Read the answer before acting on it. Answer every must-fix finding in the task record: fixed, or
+  rejected with its reason. A later cleanup error does not erase a completed answer.
 - A prerequisite a check proved (an environment variable, a path limit, a lock, a launch option)
   goes into every later brief of the task.
 - A plan or synthesis you write from agents' answers is itself a candidate: before delivering it,

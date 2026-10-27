@@ -57,6 +57,7 @@ cases adopted or rejected. -->
 
 - Candidate: <commit verified>, pull request: <link>
 - Scenarios: <ID: pass | fail | unverified: reason>, ...
+- Caught before delivery: <defects the challenger, verifier or reviewer found, one line each, or none>
 - Limits:
 - Cost: estimate <range>, actual <time>
 - Verdict: signed off by the request  <!-- or, where you asked: pending, then the user's words and date -->
