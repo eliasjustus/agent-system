@@ -24,7 +24,7 @@ Scenarios or contract: <the agreed list, IDs and text>
 Design: <the decision, two to four sentences>
 Assignment: <exactly what to change, and where>
 Acceptance checks: <commands or observations, with expected results>
-Estimate: <time range>; come back at about twice its upper end
+Estimate: <time range>
 Come back if: <task-specific conditions>
 Proven failures: <approaches an earlier builder proved fail, or none>
 ```

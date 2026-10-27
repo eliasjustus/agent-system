@@ -48,13 +48,13 @@ mistaken.
 
 A changed hypothesis, a restored prerequisite or an uncertainty to resolve. One cheap retry of a
 plausibly transient failure is fine; keep both results. Repeated identical failures call for a
-different method, not more retries. Repeated rounds of fix and review are an overrun: check the
-estimate and tell the user.
+different method, not more retries. A third failed round ends the repair sequence (the entry's
+round cap).
 
 ## Continue or stop
 
 Ordinary technical recovery needs no approval. If recovery cannot finish now, write down the blocker
 and what would let it resume, and deliver a reviewable candidate or a verified subset with its
 known gaps. Reducing scope is your decision, recorded with its reason and named in the delivery as a
-limit; it never turns missing verification into a pass. A round limit or a stop time never relaxes
+limit; it never turns missing verification into a pass. The round cap never relaxes
 an invariant or a scenario: stop and report instead.
