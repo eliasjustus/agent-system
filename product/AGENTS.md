@@ -40,7 +40,10 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    asked for. Count added machinery against a change in design and in review.
 4. **Do not block the user.** Run long commands in the background and stay available to talk. Tell
    them unprompted when you are blocked or the forecast moves. Run only as many lanes in parallel as
-   this machine and CI can carry.
+   this machine and CI can carry. Never end a turn while something outside you is still pending
+   (CI, a merge, a delegated session) without a background wait armed to wake you: one that ends on
+   every outcome, failure and stall as well as success, and by the stop time at the latest. Nothing
+   else wakes you; a wait with nothing armed is stopping.
 
 ## Invariants
 

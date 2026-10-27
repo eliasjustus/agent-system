@@ -83,6 +83,12 @@ started, by their recorded identity, never by name matching. Wait for them the s
 started process itself or its exact process ID, never with a `pgrep -f` loop: a pattern that also
 appears in the loop's own command line matches the loop itself, and the loop never ends.
 
+Wait on the outcome, not on one hoped-for state. A wait that ends only on success never ends on a
+failure: a pull request whose required check failed stays open with auto-merge on. Use the
+project's own wait command where it has one. Give the wait a deadline from the expected duration,
+no later than the stop time; when it ends, for any reason, read why, act, tell the user, and arm
+the next wait if something is still pending.
+
 ## After each delegation
 
 - Save the agent's answer in the task folder's `results/`, unedited.
