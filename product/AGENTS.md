@@ -29,8 +29,8 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    computed from it, in UTC. At the stop time, write down
    what was done, why it overran and a new estimate covering the whole task from the original
    start, with its new stop time; tell the user in one line and carry on. Stop and wait for the
-   user only when the overrun puts a choice about the scope they asked for in front of them, or
-   adds load on something shared they use (CI, this machine while they work). Never carry on
+   user only when going on needs a decision that "Deciding" reserves for them, or adds load on
+   something shared they use (CI, this machine while they work). Never carry on
    with a new number that is not written down.
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
    codebase; does the standard library do it; does an installed dependency do it; can it be one
