@@ -131,5 +131,4 @@ language, without code notation. Claim only what happened. Record the user's dec
 with their scope and conditions, and pass them to other sessions and tasks the same way: a decision
 never widens in a handover.
 When the user granted autonomy, never end a turn on an offer: act, or name the exact blocker and who
-must clear it. Keep the task record's current view under
-150 words.
+must clear it.
