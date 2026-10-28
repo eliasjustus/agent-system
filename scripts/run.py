@@ -458,18 +458,18 @@ class ResultDestination:
         self.code = code
         self.rendered = contents
 
-    def cannot_save(self, error, answer):
+    def cannot_save(self, error, answer, code=1):
         self.finalizing = True
         if self.saved is not None:
             cleanup_failed("answer saving", error)
             return self.code
         self.keep_session = True
         reason = f"failed: cannot save answer: {error}; answer left in {answer.parent}"
-        contents = (self.header + f"Result: {header_value(reason)}\nEnd UTC: {utc()}\nExit code: 1\n").encode(
+        contents = (self.header + f"Result: {header_value(reason)}\nEnd UTC: {utc()}\nExit code: {code}\n").encode(
             "utf-8", errors="backslashreplace")
-        self.write_terminal(contents, 1)
+        self.write_terminal(contents, code)
         diagnostic(reason)
-        return 1
+        return code
 
     def artifact(self, path):
         if not path.is_relative_to(self.out.parent):
@@ -629,6 +629,88 @@ def discover_servers(executable, cwd, env, timeout, log, result):
         stop_session("", process)
 
 
+def pin_checkout(work):
+    """Remember identities before the verifier can replace checkout paths."""
+    admin = Path(git(work, "rev-parse", "--absolute-git-dir"))
+    paths = [work, work / ".git", admin, admin / "gitdir", admin / "commondir"]
+    tracked = git(work, *CHECKOUT_CONFIG, "ls-files", "-z", text=False).split(b"\0")
+    parents = {parent for raw in tracked if raw
+               for parent in (work / os.fsdecode(raw)).parents if parent.is_relative_to(work)}
+    paths.extend(sorted(parents - {work}, key=lambda path: len(path.parts)))
+    identities = [(path, path.lstat()) for path in paths]
+    registration = [(path, path.read_bytes()) for path in paths[1:5] if path != admin]
+    return admin, identities, registration
+
+
+def check_verifier_source(work, commit, pinned):
+    """Read each pinned checkout before resetting or releasing it; never repair it."""
+    changed = set()
+    untracked = []
+    try:
+        admin, identities, registration = pinned
+        for path, previous in identities:
+            try:
+                current = path.lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                return "changed", [str(path)], untracked
+            if (not os.path.samestat(previous, current)
+                    or stat.S_IFMT(previous.st_mode) != stat.S_IFMT(current.st_mode)
+                    or (stat.S_ISREG(current.st_mode) and current.st_nlink != 1)):
+                # Stop before Git or the content checker could follow a substituted parent.
+                return "changed", [str(path)], untracked
+        for path, contents in registration:
+            with open_result(path, os.O_RDONLY, "rb") as stream:
+                if stream.read() != contents:
+                    return "changed", [str(path)], untracked
+        for name in ("HEAD", "index"):
+            path = admin / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if name == "HEAD":  # Reftable stores HEAD in its tables.
+                    continue
+                return "changed", [str(path)], untracked
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return "changed", [str(path)], untracked
+        run = partial(git, work, *CHECKOUT_CONFIG)
+        if (run("rev-parse", "HEAD") != commit
+                or run("rev-parse", "--abbrev-ref", "HEAD") != "HEAD"):
+            changed.add(".git/HEAD")
+        changed.update(os.fsdecode(raw) for raw in run(
+            "diff", "--cached", "--no-renames", "--name-only", "-z", commit,
+            text=False).split(b"\0") if raw)
+        changed.update(os.fsdecode(entry[2:]) for entry in run(
+            "ls-files", "-v", "-z", text=False).split(b"\0")
+            if entry and (entry[:1] == b"S" or entry[:1].islower()))
+        stages = [entry.split(b"\t", 1) for entry in run(
+            "ls-files", "--stage", "-z", text=False).split(b"\0") if entry]
+        conflicts = [path for info, path in stages if info.split()[2] != b"0"]
+        if conflicts:
+            changed.update(os.fsdecode(raw) for raw in conflicts)
+            return "changed", sorted(changed), untracked
+        paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
+        # New index entries also need a parent check before any content is read.
+        check_checkout_parents(work, paths)
+        mismatches = checkout_mismatches(work)
+        changed.update(os.fsdecode(raw) for raw in mismatches)
+        gitlinks = {path for info, path in stages if info.startswith(b"160000 ")}
+        if gitlinks.intersection(mismatches):
+            return "changed", sorted(changed), untracked
+        status = run("status", "--porcelain=v2", "-z", "--ignored=no", "--untracked-files=all",
+                     "--ignore-submodules=none", text=False).split(b"\0")
+        for entry in status:
+            if entry.startswith(b"? "):
+                untracked.append(os.fsdecode(entry[2:]))
+            elif entry.startswith((b"1 ", b"2 ", b"u ")) and (
+                    entry.split(b" ", 3)[2] != b"N..." or b"160000" in entry.split(b" ")[3:7]):
+                changed.add(os.fsdecode(entry.split(b" ", {b"1": 8, b"2": 9, b"u": 10}[entry[:1]])[-1]))
+        # HEAD and submodule checks above cover check_checkout's allocation
+        # requirements; untracked verifier output is reported without failing.
+        return ("changed" if changed else "unchanged"), sorted(changed), untracked
+    except Exception as error:
+        return "unconfirmed", [str(error) or type(error).__name__], untracked
+
+
 def check_entries(repo, method, private):
     entry = repo / "AGENTS.md"
     path = entry
@@ -734,8 +816,7 @@ def checkout_mismatches(work, pass_fds=(), paths=None, source=False):
             mode, blob, stage = info.split()
             if stage != b"0":
                 raise ValueError("unmerged checkout index")
-            if mode != b"160000":  # Submodules are checked by status, not as blobs.
-                entries.append((path, mode, blob))
+            entries.append((path, mode, blob))
     symlinks = run("config", "--type=bool", "--default=true", "--get", "core.symlinks") == "true"
     umask = os.umask(0)
     os.umask(umask)
@@ -749,6 +830,12 @@ def checkout_mismatches(work, pass_fds=(), paths=None, source=False):
             actual = info.st_mode
         except (FileNotFoundError, NotADirectoryError):
             mismatches.append(path)
+            continue
+        if stat.S_ISREG(actual) and not os.access(file, os.R_OK):
+            raise PermissionError(f"unreadable checkout file: {file}")
+        if mode == b"160000":  # Never let status traverse a substituted gitlink.
+            if not stat.S_ISDIR(actual):
+                mismatches.append(path)
             continue
         if not source and info.st_nlink > 1:
             mismatches.append(path)
@@ -837,8 +924,11 @@ def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
         work.chmod(directory_mode)
     checked = {work}
     for raw in paths:
+        relative = Path(os.fsdecode(raw))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("checkout path escapes checkout")
         parent = work
-        for part in Path(os.fsdecode(raw)).parts[:-1]:
+        for part in relative.parts[:-1]:
             parent /= part
             if parent in checked:
                 continue
@@ -1547,6 +1637,9 @@ def launch(parser, args, result):
     writes = "unavailable"
     skipped = []
     checkout_note, before_note = "", ""
+    source_check = ""
+    source_failed = False
+    pinned_sources = []
     untracked_note = ""
     if args.role == "verifier":
         untracked_note = "Untracked files left out: " + (", ".join(ascii(path) for path in untracked[:20]) or "none")
@@ -1614,6 +1707,7 @@ def launch(parser, args, result):
                              + (f"Snapshot commit: {snapshot}\n" if review else "")
                              + (header_value(checkout_note) + "\n" if checkout_note else "")
                              + (header_value(before_note) + "\n" if before_note else "")
+                             + (f"Source check: {header_value(source_check)}\n" if source_check else "")
                              + (f"Preflight: {header_value(preflight)}\n" if args.role == "verifier" else "")
                              + (header_value(untracked_note) + "\n" if untracked_note else "")
                              + (header_value(admission) + "\n" if admission else "")
@@ -1641,6 +1735,8 @@ def launch(parser, args, result):
                 checkout_note = "Checkout: " + note
                 update_header()
                 prompt += f"\nSnapshot commit: {snapshot}\n{checkout_note}\n{untracked_note}\n"
+                prompt += ("The launcher checks afterwards that the candidate's tracked files, index and HEAD "
+                           "are unchanged and fails the result otherwise.\n")
                 if before_commit:
                     before, note, _ = lease_checkout(repo, cache, before_commit, temp / "before", leases,
                                                      args.clean_checkout, untracked, reserved=reserved)
@@ -1652,6 +1748,9 @@ def launch(parser, args, result):
                     update_header()
                     prompt += "\n" + before_note + "\n"
                 cwd = work
+                pinned_sources = [("candidate", work, candidate, pin_checkout(work))]
+                if before is not None:
+                    pinned_sources.append(("before", before, before_commit, pin_checkout(before)))
             elif review:
                 env = dict(os.environ, GIT_INDEX_FILE=str(temp / "index"))
                 try:
@@ -1751,7 +1850,7 @@ def launch(parser, args, result):
                            "nothing else in the session folder is kept.\n")
             for path in roots:
                 path.mkdir(parents=True, exist_ok=True)
-            guarded = bool(leases)
+            guarded = bool(leases) or args.role == "verifier"
             if args.role == "verifier":
                 entry = git(work, *CHECKOUT_CONFIG, "ls-tree", candidate, "--", ".agents/preflight")
                 if entry:
@@ -1853,14 +1952,22 @@ def launch(parser, args, result):
                                 "-c", "skills.include_instructions=false"]
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with open_result(out.with_suffix(".log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "wb") as log:
-                        environment = "restricted with MCP servers not disabled: discovery did not complete"
+                        environment = "restricted; MCP discovery did not complete"
                         update_header()
-                        servers, reason = discover_servers(executable, cwd, agent_env,
-                                                           min(30, args.timeout or 30), log, result)
+                        for attempt in range(2):
+                            failures = len(CLEANUP_FAILURES)
+                            servers, reason = discover_servers(executable, cwd, agent_env,
+                                                               min(30, args.timeout or 30), log, result)
+                            if len(CLEANUP_FAILURES) != failures:
+                                reason = "MCP discovery cleanup failed: " + "; ".join(CLEANUP_FAILURES[failures:])
+                                break
+                            if not reason:
+                                break
                     environment = "restricted"
                     if reason:
-                        environment += f" with MCP servers not disabled: {reason}"
-                        diagnostic(f"Warning: MCP servers were not disabled: {reason}")
+                        environment += f"; {reason}"
+                        update_header()
+                        raise ValueError(reason)
                     unsupported = []
                     for name in servers:
                         if re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -1869,8 +1976,9 @@ def launch(parser, args, result):
                             unsupported.append(ascii(name))
                     if unsupported:
                         reason = f"unsupported server names: {', '.join(unsupported)}"
-                        environment += f" with MCP servers not all disabled: {reason}"
-                        diagnostic(f"Warning: MCP servers were not all disabled: {reason}")
+                        environment += f"; {reason}"
+                        update_header()
+                        raise ValueError(reason)
                 command += ["-"]
             else:
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
@@ -1951,6 +2059,26 @@ def launch(parser, args, result):
                 result.keep_session = True
                 cleanup_failed("session retention", f"stopping agent failed; session folder kept at {temp}"
                                + (f"; evidence left in {source}" if args.role == "verifier" else ""))
+            if agent_started and args.role == "verifier":
+                findings = []
+                for label, path, commit, pinned in pinned_sources:
+                    state, details, untracked_paths = (("unconfirmed", ["stopping agent failed"], [])
+                                                      if stop_failed else check_verifier_source(path, commit, pinned))
+                    source_failed |= label == "candidate" and state != "unchanged"
+                    detail = ", ".join(ascii(item) for item in details)
+                    if len(detail) > 1024:
+                        detail = detail[:1021] + "..."
+                    workspace = " (workspace)" if label == "before" and state != "unchanged" else ""
+                    findings.append(f"{label} {state}{workspace} ({path})" + (": " + detail if details else ""))
+                    if untracked_paths:
+                        detail = ", ".join(ascii(item) for item in untracked_paths)
+                        findings[-1] += "; untracked: " + (detail[:1021] + "..." if len(detail) > 1024 else detail)
+                if before is None:
+                    findings.append("before not applicable")
+                source_check = "; ".join(findings)
+                if stop_failed:
+                    source_check += f"; session {temp}; evidence {source} (saved beside {out})"
+                update_header()
             try:
                 if agent_started:
                     answer_bytes = None
@@ -1968,9 +2096,12 @@ def launch(parser, args, result):
                         writes = (f"{(final_io - initial_io) / 1024**2:.1f} MiB"
                                   if initial_io is not None and final_io is not None else "unavailable")
                         update_header()
-                        header = result.header + f"End UTC: {end}\nExit code: {code}\n\n"
+                        header = result.header + ("Result: source check failed\n" if source_failed else "")
+                        header += f"End UTC: {end}\nExit code: {code}\n\n"
                         out.parent.mkdir(parents=True, exist_ok=True)
-                        result.save(header, answer_bytes, code)
+                        result.save(header, answer_bytes, 4 if source_failed else code)
+                        if source_failed:
+                            code = 4
                         evidence = out.with_name(out.stem + "-evidence")
                         try:
                             if args.role == "verifier" and not stop_failed:
@@ -1983,7 +2114,7 @@ def launch(parser, args, result):
                     except Exception as error:
                         if result.saved is not None:
                             raise
-                        code = result.cannot_save(error, answer)
+                        code = result.cannot_save(error, answer, 4 if source_failed else 1)
                 if code:
                     try:
                         with open_result(out.with_suffix(".log"), os.O_RDONLY, "rb") as log:

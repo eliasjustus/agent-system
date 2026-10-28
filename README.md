@@ -73,10 +73,11 @@ records. Review roles require `--author-family`; a same-family check requires a 
 through `--same-family-reason`.
 
 Codex challengers and reviewers start with plugins, apps, skill instructions and discovered MCP
-servers disabled. If server discovery fails or times out, the session still starts; stderr and the
-answer's header explain that MCP servers were not disabled. Role contracts and the project's
-`AGENTS.md` still load. Servers also stay enabled when their names cannot be written as bare keys
-(ASCII letters, digits, `_` and `-`); stderr and the header list those names. Other Codex roles
+servers disabled. Discovery retries once after failure or timeout. If both attempts fail, discovery
+process cleanup fails, or an enabled server's name cannot be written as a bare key
+(ASCII letters, digits, `_` and `-`), the launcher refuses the session before starting the agent:
+`Result: launch refused`, exit 2, with the reason and offending names in the header and stderr.
+Discovery stderr stays in `.log`. Role contracts and the project's `AGENTS.md` still load. Other Codex roles
 keep the user's configured environment. Claude sessions use a fixed tool list and no MCP servers.
 
 Builders and verifiers wait for memory and IO room before leasing checkouts or starting agents,
@@ -88,7 +89,7 @@ without any readings the session starts immediately. The header records `Admissi
 Project build gates can run `python3 <method>/run.py --wait-for-room` with no other arguments:
 it uses the same wait, prints one status line to stderr, and exits 0 even after the maximum wait
 or when readings are unavailable. `--timeout` applies only to the agent session; admission and
-server discovery (at most 30 seconds) happen before it.
+server discovery (at most two attempts of 30 seconds each) happen before it.
 
 The provisional thresholds below each have an `AGENT_ADMISSION_<NAME>` override. Waiting ends
 when all available readings are below the pressure thresholds or at least the free-space limits.
@@ -130,6 +131,10 @@ but saving its answer failed. The session folder is kept with the answer in plac
 after recovering the answer. If the result cannot be written, the same failure and folder are reported
 on stderr (best effort). Exit 3 means a saved answer with exit 0 and failed cleanup. The header's
 `Exit code:` keeps the agent's code, including when cleanup fails.
+Exit 4 means the verifier's candidate source changed or could not be confirmed; its saved answer has
+`Result: source check failed`. This overrides the agent's exit status while `Exit code:` keeps
+the agent's code. An answer-save failure still reports `Result: failed: cannot save answer` and
+keeps the source finding and exit 4. A handled signal retains its usual exit status.
 `Cleanup: pending` means the answer is saved and cleanup is still running; its final status is
 `Cleanup: ok` or `Cleanup: failed: <what>; …`. If stopping the agent fails, evidence stays in the
 session folder, the session folder is kept, and the cleanup status gives its location.
@@ -143,7 +148,7 @@ status is written, further signals are ignored and the exit status matches the r
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
 The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
-and `Requested environment:`. The requested environment is `restricted` (with any MCP fallback
+and `Requested environment:`. The requested environment is `restricted` (with any MCP refusal
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
 `restricted; discovery did not run`.
 
@@ -159,6 +164,20 @@ staged or unstaged tracked changes, including conflicts, refuse the session befo
 leased. Untracked files of any size stay in the source tree and are omitted from the verifier's
 checkout; the header names at most 20, then reports the remaining count. A forgotten file must fail
 verification. `Snapshot commit:` records the committed candidate, even if the builder commits again.
+
+After the agent and its supervised descendants stop and are reaped, and before checkout removal,
+reset or lease release, `Source check:` reports the candidate and baseline separately as `unchanged`,
+`changed` (with checkout and paths, never file contents), or `unconfirmed` (with the reason).
+With `--before none`, the baseline is `not applicable`. Checks compare against the pinned
+`Snapshot commit:` and `Before checkout:` commits, including index changes, HEAD, raw checkout
+bytes and modes, and checkout identities. Before-checkout changes or an unconfirmed before check
+are reported only: that checkout is the verifier's writable workspace. Untracked non-ignored
+files are listed but do not fail the result; ignore rules added during the session can hide
+them from the report. Ignored build output and the evidence folder are allowed.
+Findings survive slot reuse and result archiving. The check
+detects lasting changes, not an edit–test–restore: an unchanged result does not prove that every
+test ran on unchanged source. An incomplete candidate check fails too; a failed process stop keeps the
+session and evidence locations in the header.
 
 The first two verifier launches into one results folder (the `--out` directory) need no round
 decision. Before a third or later launch leases any checkout, `round-decision.md` in that folder must

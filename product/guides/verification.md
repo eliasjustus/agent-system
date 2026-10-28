@@ -41,6 +41,7 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
 - Your working directory is your leased copy of the committed candidate. With `--before <commit>`,
   use the writable **Before checkout** named in the prompt and header for the baseline. The launcher
   resets and cleans it like the candidate; do not delete either pool checkout.
+  Afterwards, the launcher fails the result if the candidate's tracked files, index or HEAD changed.
   Verifiers require `--before <commit>` or `--before none`.
   With `--before none`, there is no before checkout; if you need one after all, make an ad-hoc
   shared clone at the baseline commit inside $TMPDIR
