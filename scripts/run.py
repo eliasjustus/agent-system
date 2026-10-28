@@ -304,7 +304,8 @@ class ResultDestination:
         self.saved = None
         self.code = None
         self.rendered = None
-        self.written = None
+        self.published = True
+        self.marker = None
         self.pending_cleanup = False
         self.lock = None
         self.claimed = False
@@ -394,17 +395,28 @@ class ResultDestination:
     def write(self, contents):
         # A sibling temporary file keeps replacement on the same filesystem.
         name = None
+        marker = None
         try:
             with tempfile.NamedTemporaryFile(dir=self.out.parent,
                                              prefix=self.out.stem + ".saving-", delete=False) as stream:
                 name = stream.name
+                if not self.claimed:
+                    # Pin the marker's inode before publishing it. Reopen the held
+                    # file read-only; the agent must never inherit this descriptor.
+                    # A restrictive umask can leave the file unreadable until chmod.
+                    os.fchmod(stream.fileno(), 0o600)
+                    marker = os.open(f"/proc/self/fd/{stream.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
                 os.fchmod(stream.fileno(), self.mode)
                 stream.write(contents)
-                written = os.fstat(stream.fileno())
             os.replace(name, self.out)
-            self.written = written
             name = None
+            if self.marker is not None:
+                os.close(self.marker)
+            self.marker = marker
+            marker = None
         finally:
+            if marker is not None:
+                os.close(marker)
             if name is not None:
                 Path(name).unlink(missing_ok=True)
 
@@ -432,19 +444,18 @@ class ResultDestination:
                 # Replacement may fail while the already claimed file is writable.
                 with open_result(self.out, os.O_WRONLY, "wb") as stream:
                     info = os.fstat(stream.fileno())
-                    if (info.st_nlink != 1 or self.written is None
-                            or not os.path.samestat(info, self.written)):
+                    if (info.st_nlink != 1 or self.marker is None
+                            or not os.path.samestat(info, os.fstat(self.marker))):
                         raise OSError(f"result file changed: {self.out}")
                     os.ftruncate(stream.fileno(), 0)
                     stream.write(contents)
             except Exception as report_error:
+                self.published = False
                 # Remove only our stale running marker if neither write succeeds.
                 try:
-                    # Inode numbers are reused at once on tmpfs: a symlink planted in
-                    # place of our marker can carry its number, so match the type too.
                     current = self.out.lstat()
-                    if (self.written is not None and os.path.samestat(current, self.written)
-                            and stat.S_IFMT(current.st_mode) == stat.S_IFMT(self.written.st_mode)):
+                    if (self.marker is not None
+                            and os.path.samestat(current, os.fstat(self.marker))):
                         self.out.unlink(missing_ok=True)
                     else:
                         diagnostic(f"Result path {self.out} holds a file the launcher does not own")
@@ -454,6 +465,9 @@ class ResultDestination:
                     diagnostic(f"Cannot remove stale result {self.out}: {remove_error}")
                 diagnostic(f"Cannot record result in {self.out}: {report_error}")
                 diagnostic(contents, end="")
+        if self.marker is not None:
+            os.close(self.marker)
+            self.marker = None
         self.saved = (header, answer)
         self.code = code
         self.rendered = contents
@@ -492,7 +506,7 @@ class ResultDestination:
         self.pending_cleanup = True
 
     def finish(self):
-        if self.saved is not None:
+        if self.saved is not None and self.published:
             header, answer = self.saved
             failures = 0
             while True:
