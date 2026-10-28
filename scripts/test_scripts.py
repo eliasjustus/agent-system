@@ -347,24 +347,34 @@ class ScriptsTest(unittest.TestCase):
         return output, json.loads(self.record.read_text())
 
     def test_SOURCE_S1_tracked_mutations_keep_answer_and_name_paths(self):
-        mutations = {
-            "unstaged": '(cwd / "tracked").write_text("private changed contents")',
-            "staged": '(cwd / "tracked").write_text("private changed contents"); subprocess.check_call(["git", "add", "tracked"])',
-            "added": '(cwd / "added").write_text("private changed contents"); subprocess.check_call(["git", "add", "added"])',
-            "deleted": '(cwd / "tracked").unlink(); subprocess.check_call(["git", "add", "-u"])',
-            "unstaged deletion": '(cwd / "tracked").unlink()',
-            "conflicted": '''blob = subprocess.check_output(["git", "rev-parse", "HEAD:tracked"]).strip()
-subprocess.check_call(["git", "update-index", "--index-info"], stdin=subprocess.DEVNULL)
+        for name in ("unstaged", "staged", "deleted", "unstaged-deletion", "conflicted"):
+            (self.repo / name).write_text("original")
+        self.git("add", ".")
+        self.git("commit", "-qm", "independent mutation paths")
+        # Conflicts short-circuit the raw content check, so keep worktree-only
+        # mutations in their own session. Every mutation still names its path.
+        groups = [
+            {
+                "unstaged": '(cwd / "unstaged").write_text("private changed contents")',
+                "unstaged-deletion": '(cwd / "unstaged-deletion").unlink()',
+            },
+            {
+                "staged": '(cwd / "staged").write_text("private changed contents"); subprocess.check_call(["git", "add", "staged"])',
+                "added": '(cwd / "added").write_text("private changed contents"); subprocess.check_call(["git", "add", "added"])',
+                "deleted": '(cwd / "deleted").unlink(); subprocess.check_call(["git", "add", "-u", "deleted"])',
+                "conflicted": '''blob = subprocess.check_output(["git", "rev-parse", "HEAD:conflicted"]).strip()
 subprocess.run(["git", "update-index", "--index-info"], check=True,
-               input=b"0 " + b"0" * len(blob) + b"\\ttracked\\n100644 " + blob + b" 1\\ttracked\\n100644 " + blob + b" 2\\ttracked\\n")''',
-        }
-        for kind, body in mutations.items():
-            with self.subTest(kind=kind):
-                output, record = self.source_launch(body)
-                self.assertIn(f"candidate changed ({record['cwd']})", output)
-                self.assertIn(repr("added" if kind == "added" else "tracked"), output)
-                self.assertIn("before not applicable", output)
-                self.assertNotIn("private changed contents", output)
+               input=b"0 " + b"0" * len(blob) + b"\\tconflicted\\n100644 " + blob + b" 1\\tconflicted\\n100644 " + blob + b" 2\\tconflicted\\n")''',
+            },
+        ]
+        for mutations in groups:
+            output, record = self.source_launch("\n".join(mutations.values()))
+            self.assertIn(f"candidate changed ({record['cwd']})", output)
+            for path in mutations:
+                with self.subTest(path=path):
+                    self.assertIn(repr(path), output)
+            self.assertIn("before not applicable", output)
+            self.assertNotIn("private changed contents", output)
         self.assertIn("edit–test–restore", (ROOT / "README.md").read_text())
 
     def test_SOURCE_S2_each_checkout_is_checked_even_if_candidate_is_unreadable(self):
@@ -377,8 +387,23 @@ before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"],
 record["before"] = str(before)
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''' + damage, before="HEAD")
-                self.assertIn(f"before changed ({record['before']}): 'tracked'", output)
+                self.assertIn(f"before changed (workspace) ({record['before']}): 'tracked'", output)
                 self.assertIn(f"candidate {'unconfirmed' if 'chmod' in damage else 'changed'} ({record['cwd']})", output)
+
+    def test_SOURCE_S2_unconfirmed_before_is_report_only_and_does_not_hide_candidate(self):
+        for mutate_candidate in (False, True):
+            with self.subTest(mutate_candidate=mutate_candidate):
+                output, record = self.source_launch('''
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+(before / "tracked").chmod(0)
+record["before"] = str(before)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''' + ('(cwd / "tracked").write_text("edit")' if mutate_candidate else ''),
+                    before="HEAD", expected=4 if mutate_candidate else 0)
+                self.assertIn(f"before unconfirmed (workspace) ({record['before']}):", output)
+                self.assertIn("unreadable checkout file:", output)
+                self.assertIn("candidate changed" if mutate_candidate else "candidate unchanged", output)
+                self.assertNotIn("; session ", output)
 
     def test_SOURCE_S3_identity_index_flags_modes_links_and_untracked(self):
         (self.repo / "sub").mkdir()
@@ -390,18 +415,32 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
         outside.mkdir()
         (outside / "file").write_text("outside untouched")
         (outside / "identical").write_text("original")
+        path_mutations = {
+            "index-removed": 'subprocess.check_call(["git", "update-index", "--force-remove", "index-removed"])',
+            "assume-unchanged": 'subprocess.check_call(["git", "update-index", "--assume-unchanged", "assume-unchanged"])',
+            "skip-worktree": 'subprocess.check_call(["git", "update-index", "--skip-worktree", "skip-worktree"])',
+            "mode": '(cwd / "mode").chmod(0o755)',
+            "symlink": '(cwd / "symlink").unlink(); (cwd / "symlink").symlink_to("sub/file")',
+            "hardlink": f'(cwd / "hardlink").unlink(); os.link({str(outside / "identical")!r}, cwd / "hardlink")',
+            "module": '''head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+subprocess.check_call(["git", "update-index", "--add", "--cacheinfo", "160000," + head + ",module"])''',
+        }
+        for path in path_mutations.keys() - {"module"}:
+            (self.repo / path).write_text("original")
+        self.git("add", ".")
+        self.git("commit", "-qm", "independent structural mutation paths")
+        self.git("config", "core.filemode", "false")
+        output, _ = self.source_launch("\n".join(path_mutations.values()))
+        self.assertIn("candidate changed", output)
+        for path in path_mutations:
+            with self.subTest(path=path):
+                self.assertIn(repr(path), output)
         mutations = {
             "new commit": 'subprocess.check_call(["git", "commit", "--allow-empty", "-qm", "verifier commit"])',
             "other commit": f'subprocess.check_call(["git", "checkout", "-q", "--detach", {baseline!r}])',
             "attached HEAD": 'subprocess.check_call(["git", "checkout", "-q", "-B", "verifier-branch"])',
             "empty index": 'subprocess.check_call(["git", "read-tree", "--empty"])',
-            "changed index": 'subprocess.check_call(["git", "update-index", "--force-remove", "tracked"])',
-            "assume unchanged": 'subprocess.check_call(["git", "update-index", "--assume-unchanged", "tracked"])',
-            "skip worktree": 'subprocess.check_call(["git", "update-index", "--skip-worktree", "tracked"])',
-            "mode": '(cwd / "tracked").chmod(0o755)',
             "mode with filemode true": 'subprocess.check_call(["git", "config", "core.filemode", "true"]); (cwd / "tracked").chmod(0o755)',
-            "symlink": '(cwd / "tracked").unlink(); (cwd / "tracked").symlink_to("sub/file")',
-            "hardlink": f'(cwd / "tracked").unlink(); os.link({str(outside / "identical")!r}, cwd / "tracked")',
             "parent symlink": f'(cwd / "sub").rename(cwd / "old-sub"); (cwd / "sub").symlink_to({str(outside)!r})',
             "parent replaced": '(cwd / "sub").rename(cwd / "old-sub"); (cwd / "sub").mkdir(); (cwd / "sub/file").write_text("nested source")',
             "checkout deleted": 'import shutil; shutil.rmtree(cwd)',
@@ -413,9 +452,6 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
             "registration deleted": '''import shutil
 admin = pathlib.Path(subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], text=True).strip())
 shutil.rmtree(admin)''',
-            "untracked": '(cwd / "untracked-source").write_text("new source")',
-            "gitlink": '''head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-subprocess.check_call(["git", "update-index", "--add", "--cacheinfo", "160000," + head + ",module"])''',
         }
         self.git("config", "core.filemode", "false")
         for kind, body in mutations.items():
@@ -504,10 +540,14 @@ subprocess.check_output = check_output
                 self.assertIn("before not applicable", output)
                 self.assertIn("Snapshot commit:", output)
                 if kind == "stop failure":
+                    self.assertIn("; session ", output)
                     self.assertIn("session folder kept at", output)
                     self.assertIn("evidence left in", output)
                     session = Path(record["tmpdir"]).parent
                     self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+                else:
+                    self.assertNotIn("; session ", output)
+                    self.assert_session_cleaned(record)
         self.env.pop("STOP_FAIL")
 
     def test_SOURCE_S7_findings_archive_count_and_clean_reuse(self):
@@ -585,10 +625,14 @@ os.replace = replace
         self.git("add", ".")
         self.git("commit", "-qm", "conversions")
         self.git("config", "core.symlinks", "false")
-        for path in ("tracked", "encoded", "filtered", "link"):
+        paths = ("tracked", "encoded", "filtered", "link")
+        output, _ = self.source_launch(expected=0)
+        self.assertIn("candidate unchanged", output)
+        output, _ = self.source_launch("\n".join(
+            f'(cwd / {path!r}).write_bytes(b"changed bytes")' for path in paths))
+        self.assertIn("candidate changed", output)
+        for path in paths:
             with self.subTest(path=path):
-                self.assertIn("candidate unchanged", self.source_launch(expected=0)[0])
-                output, _ = self.source_launch(f'(cwd / {path!r}).write_bytes(b"changed bytes")')
                 self.assertIn(f"'{path}'", output)
 
     def test_SOURCE_S8_fresh_candidate_and_pooled_before_both_checked(self):
@@ -609,7 +653,7 @@ subprocess.check_output = check_output
         for mutate in (False, True):
             body = '''before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
 (before / "tracked").write_text("baseline edit")''' if mutate else ''
-            output, record = self.source_launch(body, before=baseline, expected=4 if mutate else 0)
+            output, record = self.source_launch(body, before=baseline, expected=0)
             self.assertFalse(Path(record["cwd"]).is_relative_to(self.pool_root()))
             self.assertEqual(output.count("pool busy or slots unusable; fresh session worktree"), 1)
             self.assertIn("candidate unchanged", output)
@@ -633,16 +677,19 @@ subprocess.check_output = check_output
 
     def test_SOURCE_S3_committed_gitlink_worktree_changes(self):
         head = self.git("rev-parse", "HEAD")
-        self.git("update-index", "--add", "--cacheinfo", f"160000,{head},module")
+        for path in ("module-file", "module-symlink", "module-index"):
+            self.git("update-index", "--add", "--cacheinfo", f"160000,{head},{path}")
+            (self.repo / path).mkdir()
         self.git("commit", "-qm", "gitlink")
-        (self.repo / "module").mkdir()
-        for body in ('(cwd / "module").rmdir(); (cwd / "module").write_text("file")',
-                     '(cwd / "module").rmdir(); (cwd / "module").symlink_to("tracked")',
-                     f'subprocess.check_call(["git", "update-index", "--cacheinfo", "160000,{self.git("rev-parse", "HEAD")},module"])'):
-            with self.subTest(body=body):
-                output, _ = self.source_launch(body)
-                self.assertIn("candidate changed", output)
-                self.assertIn("'module'", output)
+        output, _ = self.source_launch(f'''
+(cwd / "module-file").rmdir(); (cwd / "module-file").write_text("file")
+(cwd / "module-symlink").rmdir(); (cwd / "module-symlink").symlink_to("tracked")
+subprocess.check_call(["git", "update-index", "--cacheinfo", "160000,{self.git("rev-parse", "HEAD")},module-index"])
+''')
+        self.assertIn("candidate changed", output)
+        for path in ("module-file", "module-symlink", "module-index"):
+            with self.subTest(path=path):
+                self.assertIn(repr(path), output)
 
     def test_SOURCE_P1_ignored_build_output_and_evidence_are_allowed(self):
         (self.repo / ".gitignore").write_text("build/\nnode_modules/\n.gradle/\nignored\n")
@@ -656,6 +703,27 @@ for name in ("build", "node_modules", ".gradle"):
 ''', expected=0)
         self.assertIn("candidate unchanged", output)
         self.assertEqual((self.out.parent / "answer-evidence/proof").read_text(), "evidence")
+
+    def test_SOURCE_P1_before_edits_and_candidate_untracked_are_report_only(self):
+        output, record = self.source_launch('''
+before = pathlib.Path(re.search(r"^Before checkout: (.+?) \\(", record["stdin"], re.M).group(1))
+(before / "tracked").write_text("baseline test edits")
+(cwd / "new-test-output").write_text("untracked output")
+(cwd / "artifacts").mkdir()
+(cwd / "artifacts/.gitignore").write_text("hidden-output\\n")
+(cwd / "artifacts/hidden-output").write_text("hidden by the session's ignore rule")
+record["before"] = str(before)
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
+''', before="HEAD", expected=0)
+        self.assertIn("Exit code: 0\n", output)
+        self.assertNotIn("Result:", output.split("\n\n", 1)[0])
+        self.assertIn("The launcher checks afterwards that the candidate's tracked files, index and HEAD "
+                      "are unchanged and fails the result otherwise.", record["stdin"])
+        self.assertIn("Use this writable checkout for the before state.", record["stdin"])
+        self.assertIn(f"candidate unchanged ({record['cwd']}); untracked: 'artifacts/.gitignore', 'new-test-output'", output)
+        self.assertIn(f"before changed (workspace) ({record['before']}): 'tracked'", output)
+        self.assertNotIn("hidden-output", output)
+        self.assertNotIn("Result: source check failed", output)
 
     def test_SOURCE_P2_agent_outcomes_keep_codes_with_unchanged_source(self):
         for outcome, expected in (("success", 0), ("nonzero", 7), ("timeout", 124),
@@ -696,9 +764,10 @@ def check_output(command, *args, **kwargs):
 subprocess.check_output = check_output
 ''')
         output, _ = self.source_launch('(cwd / "line\\nname").write_text("untracked")', expected=143)
-        self.assertIn("Result: source check failed\n", output)
+        self.assertNotIn("Result: source check failed\n", output)
+        self.assertIn("candidate unchanged", output)
         self.assertIn("Signal: 15\n", output)
-        self.assertIn("'line\\nname'", output)
+        self.assertIn("untracked: 'line\\nname'", output)
 
     def install_preflight(self, body):
         path = self.repo / ".agents/preflight"
@@ -2120,7 +2189,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                record = self.verifier(family, "--before", baseline, expected_code=4)
+                record = self.verifier(family, "--before", baseline)
                 self.assertTrue(Path(record["before"]).is_relative_to(self.pool_root()))
                 self.assertIn("Before checkout:", self.out.read_text())
                 self.assertEqual((self.repo / "tracked").read_text(), "candidate")
@@ -2431,7 +2500,7 @@ assert before != cwd
 record["before"] = str(before)
 pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
 ''')
-        record = self.verifier("codex", "--before", "HEAD", expected_code=4)
+        record = self.verifier("codex", "--before", "HEAD")
         self.assertEqual(self.out.read_text().count("pool busy or slots unusable; fresh session worktree"), 2)
         self.assertFalse(Path(record["before"]).exists())
         self.assert_session_cleaned(record)
@@ -5911,6 +5980,8 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                         metadata = [next(line for line in header.splitlines() if line.startswith(prefix))
                                     for prefix in ("Snapshot commit:", "Checkout:", "Untracked files left out:")]
                         expected += "\n" + "\n".join(metadata) + "\n"
+                        expected += ("The launcher checks afterwards that the candidate's tracked files, index and HEAD "
+                                     "are unchanged and fails the result otherwise.\n")
                         expected += "\nBefore checkout: none (--before none)\n"
                         evidence = Path(record["tmpdir"]).parent / "evidence"
                         expected += (f"\nEvidence folder: {evidence}; "
@@ -6962,8 +7033,9 @@ assert evidence.parent == pathlib.Path(os.environ["TMPDIR"]).parent and not evid
 ''')
         self.env["SLEEP"] = "1"
         result = self.launch("verifier", "codex", "--author-family", "claude", "--timeout", "0.4")
-        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("Exit code: 124\n", self.out.read_text())
+        self.assertIn("candidate unchanged", self.out.read_text())
         self.assertIn("'discard.txt'", self.out.read_text())
         record = json.loads(self.record.read_text())
         evidence = Path(record["tmpdir"]).parent / "evidence"

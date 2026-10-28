@@ -645,22 +645,23 @@ def pin_checkout(work):
 def check_verifier_source(work, commit, pinned):
     """Read each pinned checkout before resetting or releasing it; never repair it."""
     changed = set()
+    untracked = []
     try:
         admin, identities, registration = pinned
         for path, previous in identities:
             try:
                 current = path.lstat()
             except (FileNotFoundError, NotADirectoryError):
-                return "changed", [str(path)]
+                return "changed", [str(path)], untracked
             if (not os.path.samestat(previous, current)
                     or stat.S_IFMT(previous.st_mode) != stat.S_IFMT(current.st_mode)
                     or (stat.S_ISREG(current.st_mode) and current.st_nlink != 1)):
                 # Stop before Git or the content checker could follow a substituted parent.
-                return "changed", [str(path)]
+                return "changed", [str(path)], untracked
         for path, contents in registration:
             with open_result(path, os.O_RDONLY, "rb") as stream:
                 if stream.read() != contents:
-                    return "changed", [str(path)]
+                    return "changed", [str(path)], untracked
         for name in ("HEAD", "index"):
             path = admin / name
             try:
@@ -668,9 +669,9 @@ def check_verifier_source(work, commit, pinned):
             except FileNotFoundError:
                 if name == "HEAD":  # Reftable stores HEAD in its tables.
                     continue
-                return "changed", [str(path)]
+                return "changed", [str(path)], untracked
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                return "changed", [str(path)]
+                return "changed", [str(path)], untracked
         run = partial(git, work, *CHECKOUT_CONFIG)
         if (run("rev-parse", "HEAD") != commit
                 or run("rev-parse", "--abbrev-ref", "HEAD") != "HEAD"):
@@ -686,7 +687,7 @@ def check_verifier_source(work, commit, pinned):
         conflicts = [path for info, path in stages if info.split()[2] != b"0"]
         if conflicts:
             changed.update(os.fsdecode(raw) for raw in conflicts)
-            return "changed", sorted(changed)
+            return "changed", sorted(changed), untracked
         paths = [raw for raw in run("ls-files", "-z", text=False).split(b"\0") if raw]
         # New index entries also need a parent check before any content is read.
         check_checkout_parents(work, paths)
@@ -694,21 +695,20 @@ def check_verifier_source(work, commit, pinned):
         changed.update(os.fsdecode(raw) for raw in mismatches)
         gitlinks = {path for info, path in stages if info.startswith(b"160000 ")}
         if gitlinks.intersection(mismatches):
-            return "changed", sorted(changed)
+            return "changed", sorted(changed), untracked
         status = run("status", "--porcelain=v2", "-z", "--ignored=no", "--untracked-files=all",
                      "--ignore-submodules=none", text=False).split(b"\0")
         for entry in status:
             if entry.startswith(b"? "):
-                changed.add(os.fsdecode(entry[2:]))
+                untracked.append(os.fsdecode(entry[2:]))
             elif entry.startswith((b"1 ", b"2 ", b"u ")) and (
                     entry.split(b" ", 3)[2] != b"N..." or b"160000" in entry.split(b" ")[3:7]):
                 changed.add(os.fsdecode(entry.split(b" ", {b"1": 8, b"2": 9, b"u": 10}[entry[:1]])[-1]))
-        # Keep the allocation path's clean/detached/submodule check authoritative too.
-        if not changed:
-            check_checkout(work, commit)
-        return ("changed", sorted(changed)) if changed else ("unchanged", [])
+        # HEAD and submodule checks above cover check_checkout's allocation
+        # requirements; untracked verifier output is reported without failing.
+        return ("changed" if changed else "unchanged"), sorted(changed), untracked
     except Exception as error:
-        return "unconfirmed", [str(error) or type(error).__name__]
+        return "unconfirmed", [str(error) or type(error).__name__], untracked
 
 
 def check_entries(repo, method, private):
@@ -1735,6 +1735,8 @@ def launch(parser, args, result):
                 checkout_note = "Checkout: " + note
                 update_header()
                 prompt += f"\nSnapshot commit: {snapshot}\n{checkout_note}\n{untracked_note}\n"
+                prompt += ("The launcher checks afterwards that the candidate's tracked files, index and HEAD "
+                           "are unchanged and fails the result otherwise.\n")
                 if before_commit:
                     before, note, _ = lease_checkout(repo, cache, before_commit, temp / "before", leases,
                                                      args.clean_checkout, untracked, reserved=reserved)
@@ -2060,17 +2062,21 @@ def launch(parser, args, result):
             if agent_started and args.role == "verifier":
                 findings = []
                 for label, path, commit, pinned in pinned_sources:
-                    state, details = (("unconfirmed", ["stopping agent failed"])
-                                      if stop_failed else check_verifier_source(path, commit, pinned))
-                    source_failed |= state != "unchanged"
+                    state, details, untracked_paths = (("unconfirmed", ["stopping agent failed"], [])
+                                                      if stop_failed else check_verifier_source(path, commit, pinned))
+                    source_failed |= label == "candidate" and state != "unchanged"
                     detail = ", ".join(ascii(item) for item in details)
                     if len(detail) > 1024:
                         detail = detail[:1021] + "..."
-                    findings.append(f"{label} {state} ({path})" + (": " + detail if details else ""))
+                    workspace = " (workspace)" if label == "before" and state != "unchanged" else ""
+                    findings.append(f"{label} {state}{workspace} ({path})" + (": " + detail if details else ""))
+                    if untracked_paths:
+                        detail = ", ".join(ascii(item) for item in untracked_paths)
+                        findings[-1] += "; untracked: " + (detail[:1021] + "..." if len(detail) > 1024 else detail)
                 if before is None:
                     findings.append("before not applicable")
                 source_check = "; ".join(findings)
-                if any("unconfirmed" in finding for finding in findings):
+                if stop_failed:
                     source_check += f"; session {temp}; evidence {source} (saved beside {out})"
                 update_header()
             try:

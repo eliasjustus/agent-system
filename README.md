@@ -131,7 +131,7 @@ but saving its answer failed. The session folder is kept with the answer in plac
 after recovering the answer. If the result cannot be written, the same failure and folder are reported
 on stderr (best effort). Exit 3 means a saved answer with exit 0 and failed cleanup. The header's
 `Exit code:` keeps the agent's code, including when cleanup fails.
-Exit 4 means the verifier's source changed or could not be confirmed; its saved answer has
+Exit 4 means the verifier's candidate source changed or could not be confirmed; its saved answer has
 `Result: source check failed`. This overrides the agent's exit status while `Exit code:` keeps
 the agent's code. An answer-save failure still reports `Result: failed: cannot save answer` and
 keeps the source finding and exit 4. A handled signal retains its usual exit status.
@@ -170,10 +170,13 @@ reset or lease release, `Source check:` reports the candidate and baseline separ
 `changed` (with checkout and paths, never file contents), or `unconfirmed` (with the reason).
 With `--before none`, the baseline is `not applicable`. Checks compare against the pinned
 `Snapshot commit:` and `Before checkout:` commits, including index changes, HEAD, raw checkout
-bytes and modes, checkout identities and untracked non-ignored files. Ignored build output and
-the evidence folder are allowed. Findings survive slot reuse and result archiving. The check
+bytes and modes, and checkout identities. Before-checkout changes or an unconfirmed before check
+are reported only: that checkout is the verifier's writable workspace. Untracked non-ignored
+files are listed but do not fail the result; ignore rules added during the session can hide
+them from the report. Ignored build output and the evidence folder are allowed.
+Findings survive slot reuse and result archiving. The check
 detects lasting changes, not an edit–test–restore: an unchanged result does not prove that every
-test ran on unchanged source. An incomplete check fails too; a failed process stop keeps the
+test ran on unchanged source. An incomplete candidate check fails too; a failed process stop keeps the
 session and evidence locations in the header.
 
 The first two verifier launches into one results folder (the `--out` directory) need no round
