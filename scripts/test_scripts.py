@@ -9014,7 +9014,7 @@ pathlib.Path({str(observed)!r}).write_text(json.dumps(
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertTrue(observed.exists(), result.stderr)
         record = json.loads(observed.read_text())
-        self.assertTrue(record["held"] or record["reused"], record)
+        self.assertTrue(record["held"], record)
         self.assertEqual(record["links"], links)
         self.assertEqual(record["inherited"], [])
         for flags in record["held"].values():
@@ -9072,6 +9072,39 @@ atexit.register(finished)
         record = json.loads(observed.read_text())
         self.assertTrue(record["held"], record)
         self.assertTrue(record["released"], record)
+
+    def test_RESULTS_S4_finish_preserves_planted_file_after_terminal_writes_fail(self):
+        observed = self.base / "terminal-writes"
+        self.inject_launcher(f'''
+import os, pathlib, signal
+original_replace, original_open = os.replace, os.open
+failed = False
+def replace(source, destination, *args, **kwargs):
+    global failed
+    if (not failed and destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        failed = True
+        destination.unlink()
+        destination.write_bytes(b"agent-owned bytes")
+        pathlib.Path({str(observed)!r}).write_text("replacement failed\\n")
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise OSError("forced terminal replacement failure")
+    return original_replace(source, destination, *args, **kwargs)
+def open(path, flags, *args, **kwargs):
+    if str(path) == {str(self.out)!r} and flags & os.O_ACCMODE == os.O_WRONLY:
+        with pathlib.Path({str(observed)!r}).open("a") as stream:
+            stream.write("rewrite attempted\\n")
+    return original_open(path, flags, *args, **kwargs)
+os.replace, os.open = replace, open
+''')
+        result = self.launch("builder", "codex", "--before", "HEAD")
+        self.assertEqual(observed.read_text(), "replacement failed\nrewrite attempted\n")
+        self.assertEqual(self.out.read_bytes(), b"agent-owned bytes")
+        self.assertEqual(self.out.stat().st_nlink, 1)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"Result path {self.out} holds a file the launcher does not own", result.stderr)
+        self.assertIn(f"Cannot record result in {self.out}: result file changed:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_RESULTS_R5_log_tail_does_not_read_agent_symlink(self):
         secret = self.base / "secret"

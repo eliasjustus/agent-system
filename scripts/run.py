@@ -304,6 +304,7 @@ class ResultDestination:
         self.saved = None
         self.code = None
         self.rendered = None
+        self.published = True
         self.marker = None
         self.pending_cleanup = False
         self.lock = None
@@ -402,6 +403,7 @@ class ResultDestination:
                 if not self.claimed:
                     # Pin the marker's inode before publishing it. Reopen the held
                     # file read-only; the agent must never inherit this descriptor.
+                    # A restrictive umask can leave the file unreadable until chmod.
                     os.fchmod(stream.fileno(), 0o600)
                     marker = os.open(f"/proc/self/fd/{stream.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
                 os.fchmod(stream.fileno(), self.mode)
@@ -448,6 +450,7 @@ class ResultDestination:
                     os.ftruncate(stream.fileno(), 0)
                     stream.write(contents)
             except Exception as report_error:
+                self.published = False
                 # Remove only our stale running marker if neither write succeeds.
                 try:
                     current = self.out.lstat()
@@ -503,7 +506,7 @@ class ResultDestination:
         self.pending_cleanup = True
 
     def finish(self):
-        if self.saved is not None:
+        if self.saved is not None and self.published:
             header, answer = self.saved
             failures = 0
             while True:
