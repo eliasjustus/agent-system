@@ -8951,6 +8951,128 @@ os.replace = replace
         self.assertIn("holds a file the launcher does not own", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def terminal_fallback_inode_reuse(self, links, fail_rewrite):
+        observed = self.base / "marker-observed.json"
+        observed.unlink(missing_ok=True)
+        other = self.base / "other-link"
+        self.inject_launcher(f'''
+import atexit, json, os, pathlib
+os.environ["TEST_LAUNCHER_PID"] = str(os.getpid())
+original_replace, original_open = os.replace, os.open
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: running\\n" not in pathlib.Path(source).read_bytes()):
+        raise OSError("forced terminal replacement failure")
+    return original_replace(source, destination, *args, **kwargs)
+def open(path, flags, *args, **kwargs):
+    if ({fail_rewrite!r} and str(path) == {str(self.out)!r}
+            and flags & os.O_ACCMODE == os.O_WRONLY):
+        raise OSError("forced terminal rewrite failure")
+    return original_open(path, flags, *args, **kwargs)
+os.replace, os.open = replace, open
+def finished():
+    path = pathlib.Path({str(observed)!r})
+    if path.exists():
+        record = json.loads(path.read_text())
+        record["released"] = all(not pathlib.Path("/proc/self/fd", fd).exists()
+                                 for fd in record["held"])
+        path.write_text(json.dumps(record))
+atexit.register(finished)
+''')
+        self.agent_extra(f'''
+out = pathlib.Path({str(self.out)!r})
+marker = out.stat()
+held, inherited = {{}}, []
+for directory, matches in ((pathlib.Path("/proc", os.environ["TEST_LAUNCHER_PID"], "fd"), held),
+                           (pathlib.Path("/proc/self/fd"), inherited)):
+    for fd in directory.iterdir():
+        try:
+            if os.path.samestat(marker, fd.stat()):
+                if isinstance(matches, dict):
+                    info = (directory.parent / "fdinfo" / fd.name).read_text()
+                    matches[fd.name] = int(next(line.split()[1] for line in info.splitlines()
+                                               if line.startswith("flags:")), 8)
+                else:
+                    matches.append(fd.name)
+        except FileNotFoundError:
+            pass
+out.unlink()
+for attempt in range(4096):
+    out.write_bytes(b"agent-owned bytes")
+    reused = os.path.samestat(marker, out.stat())
+    if held or reused:
+        break
+    out.unlink()
+else:
+    raise RuntimeError("inode-reuse fixture could not reuse an unpinned marker")
+if {links} == 2:
+    os.link(out, {str(other)!r})
+pathlib.Path({str(observed)!r}).write_text(json.dumps(
+    {{"held": held, "inherited": inherited, "reused": reused, "links": out.stat().st_nlink}}))
+''')
+        result = self.launch()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertTrue(observed.exists(), result.stderr)
+        record = json.loads(observed.read_text())
+        self.assertTrue(record["held"] or record["reused"], record)
+        self.assertEqual(record["links"], links)
+        self.assertEqual(record["inherited"], [])
+        for flags in record["held"].values():
+            self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+            self.assertTrue(flags & os.O_CLOEXEC)
+        self.assertTrue(record["released"], record)
+        self.assertTrue(self.out.exists(), result.stderr)
+        self.assertEqual(self.out.read_bytes(), b"agent-owned bytes")
+        if links == 2:
+            self.assertEqual(other.read_bytes(), b"agent-owned bytes")
+            self.assertTrue(os.path.samestat(self.out.stat(), other.stat()))
+        self.assertIn(f"Result path {self.out} holds a file the launcher does not own", result.stderr)
+        self.assertIn(f"Cannot record result in {self.out}:", result.stderr)
+
+    def test_RESULTS_S1_terminal_fallback_preserves_reused_single_link_inode(self):
+        for fail_rewrite in (False, True):
+            with self.subTest(fail_rewrite=fail_rewrite):
+                self.terminal_fallback_inode_reuse(1, fail_rewrite)
+
+    def test_RESULTS_S2_terminal_fallback_preserves_reused_two_link_inode(self):
+        self.terminal_fallback_inode_reuse(2, False)
+
+    def test_RESULTS_S3_terminal_fallback_removes_and_releases_owned_marker(self):
+        observed = self.base / "marker-observed.json"
+        self.inject_launcher(f'''
+import atexit, json, os, pathlib
+original_replace, original_open = os.replace, os.open
+held = []
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Result: launch refused\\n" in pathlib.Path(source).read_bytes()):
+        marker = destination.stat()
+        for fd in pathlib.Path("/proc/self/fd").iterdir():
+            try:
+                if os.path.samestat(marker, fd.stat()):
+                    held.append(fd.name)
+            except FileNotFoundError:
+                pass
+        raise OSError("forced terminal replacement failure")
+    return original_replace(source, destination, *args, **kwargs)
+def open(path, flags, *args, **kwargs):
+    if str(path) == {str(self.out)!r} and flags & os.O_ACCMODE == os.O_WRONLY:
+        raise OSError("forced terminal rewrite failure")
+    return original_open(path, flags, *args, **kwargs)
+os.replace, os.open = replace, open
+def finished():
+    pathlib.Path({str(observed)!r}).write_text(json.dumps({{
+        "held": held, "released": all(not pathlib.Path("/proc/self/fd", fd).exists() for fd in held)}}))
+atexit.register(finished)
+''')
+        result = self.launch("builder", "codex", "--before", "HEAD")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.out.exists(), result.stderr)
+        self.assertIn(f"Cannot record result in {self.out}: forced terminal rewrite failure", result.stderr)
+        record = json.loads(observed.read_text())
+        self.assertTrue(record["held"], record)
+        self.assertTrue(record["released"], record)
+
     def test_RESULTS_R5_log_tail_does_not_read_agent_symlink(self):
         secret = self.base / "secret"
         secret.write_text("private log contents")
@@ -9342,6 +9464,17 @@ os.replace = replace
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(modes.read_text().splitlines(), ["0o640"] * 5)
         self.assertEqual(stat.S_IMODE(self.out.stat().st_mode), 0o640)
+
+    def test_RESULTS_P2_marker_pin_preserves_write_only_result_mode(self):
+        self.out.parent.mkdir()
+        self.inject_launcher("import os\nos.umask(0o400)\n")
+        result = self.launch("builder", "codex", "--before", "HEAD")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(self.out.exists(), result.stderr)
+        self.assertEqual(stat.S_IMODE(self.out.stat().st_mode), 0o266)
+        self.out.chmod(0o600)
+        self.assertIn("Result: launch refused\n", self.out.read_text())
+        self.assertIn("allowed only for verifiers", self.out.read_text())
 
     def test_RESULTS_R3_signal_inside_discovery_popen_stops_discovery_group(self):
         self.env["MCP_SLEEP"] = "1"
