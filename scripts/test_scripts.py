@@ -1,7 +1,8 @@
 import ast
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import textwrap
 import time
 import tomllib
 import unittest
+from unittest import mock
 
 
 # Fixtures add home/.cache/am/<session>/tmp beneath a temporary directory.
@@ -10192,6 +10194,84 @@ r.lock.close()
         self.assertEqual(process.returncode, code, error)
         return output, error
 
+    def poll_wait(self, out, locks, after_sleep=None):
+        elapsed, sleeps = 0, []
+        clock = mock.Mock()
+        clock.monotonic.side_effect = lambda: elapsed
+
+        def sleep(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+            sleeps.append(elapsed)
+            if after_sleep is not None:
+                after_sleep(len(sleeps))
+
+        clock.sleep.side_effect = sleep
+        held = mock.Mock(side_effect=locks)
+        output = io.StringIO()
+        with mock.patch.dict(self.helpers["wait_sessions"].__globals__, time=clock, result_lock_held=held), \
+                mock.patch.object(sys, "argv", ["run.py", "--wait", str(out)]), redirect_stdout(output):
+            self.assertEqual(self.helpers["wait_sessions"](), 0)
+        return output.getvalue(), sleeps, held.call_count
+
+    def finish_destination(self, destination):
+        destination.save(destination.header + f"End UTC: {self.helpers['utc']()}\nExit code: 0\n\n",
+                         b"Result: done\n", 0)
+        destination.finish()
+
+    def test_WAIT_single_lock_miss_keeps_running_until_real_result(self):
+        args, destination = self.destination()
+
+        def after_sleep(poll):
+            if poll == 2:
+                self.finish_destination(destination)
+
+        output, sleeps, calls = self.poll_wait(args.out, [False, True], after_sleep)
+        self.assertEqual(sleeps, [2, 4])
+        self.assertEqual(calls, 2)
+        self.assertIn(f"{args.out}: done, exit 0,", output)
+        self.assertNotIn("killed", output)
+
+    def test_WAIT_missing_lock_requires_six_seconds_of_confirmation(self):
+        args, _ = self.destination()
+        output, sleeps, calls = self.poll_wait(args.out, [False] * 4)
+        self.assertEqual(sleeps, [2, 4, 6])
+        self.assertEqual(calls, 4)
+        self.assertIn(f"{args.out}: killed, exit unknown,", output)
+
+    def test_WAIT_completion_during_missing_lock_confirmation_wins(self):
+        args, destination = self.destination()
+
+        def after_sleep(poll):
+            if poll == 2:
+                self.finish_destination(destination)
+
+        output, sleeps, calls = self.poll_wait(args.out, [False, False], after_sleep)
+        self.assertEqual(sleeps, [2, 4])
+        self.assertEqual(calls, 2)
+        self.assertIn(f"{args.out}: done, exit 0,", output)
+        self.assertNotIn("killed", output)
+
+    def test_WAIT_lock_reappearance_resets_confirmation(self):
+        args, _ = self.destination()
+        output, sleeps, calls = self.poll_wait(args.out, [False, False, True] + [False] * 4)
+        self.assertEqual(sleeps, [2, 4, 6, 8, 10, 12])
+        self.assertEqual(calls, 7)
+        self.assertIn(f"{args.out}: killed, exit unknown,", output)
+
+    def test_WAIT_changed_running_result_resets_confirmation(self):
+        args, destination = self.destination()
+
+        def after_sleep(poll):
+            if poll == 2:
+                destination.header = destination.header.replace(destination.start, "2026-01-01T00:00:00+00:00")
+                args.out.write_text(destination.header + "Result: running\n")
+
+        output, sleeps, calls = self.poll_wait(args.out, [False] * 6, after_sleep)
+        self.assertEqual(sleeps, [2, 4, 6, 8, 10])
+        self.assertEqual(calls, 6)
+        self.assertIn(f"{args.out}: killed, exit unknown,", output)
+
     def test_WAIT_C1_waits_for_all_and_reports_each_once(self):
         first, child1 = self.holder("first.md")
         second, child2 = self.holder("second.md")
@@ -10229,7 +10309,9 @@ r.lock.close()
         child.kill()
         child.communicate(timeout=5)
         self.assertEqual(child.returncode, -signal.SIGKILL)
-        output, error = waiter.communicate(timeout=5)
+        started = time.monotonic()
+        output, error = waiter.communicate(timeout=15)
+        self.assertGreaterEqual(time.monotonic() - started, 5.5)
         self.assertEqual(waiter.returncode, 0, error)
         self.assertIn(f"{out}: killed, exit unknown,", output)
         self.assertEqual(out.read_bytes(), before)
