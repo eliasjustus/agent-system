@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import runpy
 import shlex
 import shutil
 import signal
@@ -7886,6 +7888,49 @@ while not pathlib.Path({str(release)!r}).exists():
                          | {out.stem + "-evidence" for out, process in zip(outputs, processes)
                             if process.returncode == 0})
 
+    def test_WAIT_terminal_paths_are_readable_through_cli(self):
+        for mode in ("normal", "refused", "interrupted", "save", "source"):
+            with self.subTest(mode=mode):
+                self.env.pop("PYTHONPATH", None)
+                self.agent_extra("")
+                extra = ()
+                expected, status = 0, "completed"
+                if mode == "refused":
+                    extra = ("--timeout", "0")
+                    expected, status = 2, "launch refused"
+                elif mode == "interrupted":
+                    self.inject_launcher(f'''
+import os, pathlib, signal
+original = pathlib.Path.read_text
+def read(path, *args, **kwargs):
+    if path == pathlib.Path({str(self.brief)!r}):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original(path, *args, **kwargs)
+pathlib.Path.read_text = read
+''')
+                    expected, status = 143, "interrupted"
+                elif mode == "save":
+                    self.agent_extra('answer = pathlib.Path(args[args.index("-o") + 1]); '
+                                     'answer.unlink(); answer.mkdir()')
+                    expected, status = 1, "failed: cannot save answer:"
+                elif mode == "source":
+                    self.source_launch('(cwd / "tracked").write_text("changed")')
+                    expected, status = 4, "source check failed"
+                if mode != "source":
+                    launch = self.launch("builder", "codex", *extra)
+                    self.assertEqual(launch.returncode, expected, launch.stderr)
+                if mode == "save":
+                    record = json.loads(self.record.read_text())
+                    self.addCleanup(shutil.rmtree, Path(record["tmpdir"]).parent, ignore_errors=True)
+                header = self.out.read_text().split("\n\n", 1)[0]
+                code = re.search(r"^Exit code: (\d+)$", header, re.MULTILINE)
+                self.assertIsNotNone(code, header)
+                self.env.pop("PYTHONPATH", None)
+                waited = self.run_script("run.py", "--wait", self.out)
+                self.assertEqual(waited.returncode, 0, waited.stderr)
+                self.assertIn(f"{self.out}: {status}", waited.stdout)
+                self.assertIn(f", exit {code[1]},", waited.stdout)
+
     def test_RESULTS_S1_refusals_record_reason_before_start(self):
         cases = (
             ("builder", "--before", "HEAD", "allowed only for verifiers"),
@@ -10071,6 +10116,223 @@ pathlib.Path(os.environ["RECORD"] + ".pids").write_text(str(os.getpid()))
         self.assertFalse((self.method / "obsolete").exists())
         self.assertNotIn("/.claude/agents/builder.md", (self.repo / ".git/info/exclude").read_text())
 
+
+
+class ResultWaitTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.helpers = runpy.run_path(str(ROOT / "scripts/run.py"))
+
+    def reap(self, process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+    def destination(self, name="answer.md"):
+        args = type("Args", (), dict(out=self.base / name, role="builder", family="codex",
+                                    author_family=None, same_family_reason=None))()
+        result = self.helpers["ResultDestination"](args)
+        result.claim(args)
+        self.addCleanup(result.lock.close)
+        self.addCleanup(lambda: os.close(result.marker) if result.marker is not None else None)
+        return args, result
+
+    def terminal(self, name="ended.md", answer=b"Result: done\n", result=None):
+        _, destination = self.destination(name)
+        destination.header = destination.header.replace(destination.start, "2026-01-01T00:00:00+00:00")
+        header = destination.header + (f"Result: {result}\n" if result else "")
+        header += "End UTC: 2026-01-01T00:00:12+00:00\nExit code: 7\n\n"
+        destination.save(header, answer, 7)
+        destination.finish()
+        destination.lock.close()
+        return destination.out
+
+    def holder(self, name="running.md"):
+        out = self.base / name
+        source = '''
+import argparse, runpy, sys
+from pathlib import Path
+h = runpy.run_path(sys.argv[1])
+args = argparse.Namespace(out=Path(sys.argv[2]), role="builder", family="codex",
+                          author_family=None, same_family_reason=None)
+r = h["ResultDestination"](args)
+r.claim(args)
+print("ready", flush=True)
+mode = sys.stdin.readline().strip()
+if mode != "release":
+    r.save(r.header + "End UTC: " + h["utc"]() + "\\nExit code: 0\\n\\n",
+           ("Result: " + mode + "\\n").encode(), 0)
+    r.finish()
+r.lock.close()
+'''
+        process = subprocess.Popen([sys.executable, "-c", source, str(ROOT / "scripts/run.py"), str(out)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.reap, process)
+        self.assertEqual(process.stdout.readline(), "ready\n")
+        info = out.with_suffix(".lock").stat()
+        identity = (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
+        locks = [line.split() for line in Path("/proc/locks").read_text().splitlines()]
+        self.assertTrue(any((int(parts[5].split(":")[0], 16), int(parts[5].split(":")[1], 16),
+                             int(parts[5].split(":")[2])) == identity
+                            for parts in locks if len(parts) >= 6 and parts[1] == "FLOCK"),
+                        "real child flock is absent from /proc/locks")
+        return out, process
+
+    def start_wait(self, *args, env=None):
+        process = subprocess.Popen([sys.executable, str(ROOT / "scripts/run.py"), "--wait", *map(str, args)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(self.reap, process)
+        return process
+
+    def wait(self, *args, code=0, timeout=6, env=None):
+        process = self.start_wait(*args, env=env)
+        output, error = process.communicate(timeout=timeout)
+        self.assertEqual(process.returncode, code, error)
+        return output, error
+
+    def test_WAIT_C1_waits_for_all_and_reports_each_once(self):
+        first, child1 = self.holder("first.md")
+        second, child2 = self.holder("second.md")
+        ready = self.terminal()
+        waiter = self.start_wait(ready, first, second)
+        self.assertEqual(waiter.stdout.readline(), f"{ready}: done, exit 7, 12.0 s\n")
+        self.assertIsNone(waiter.poll())
+        child1.communicate("done\n", timeout=5)
+        self.assertRegex(waiter.stdout.readline(), rf"^{re.escape(str(first))}: done, exit 0, \d+\.\d s\n$")
+        self.assertIsNone(waiter.poll())
+        child2.communicate("needs decision\n", timeout=5)
+        output, error = waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, 0, error)
+        self.assertRegex(output, rf"^{re.escape(str(second))}: needs decision, exit 0, \d+\.\d s\n$")
+
+    def test_WAIT_C2_terminal_headers_override_answer_and_use_header_code(self):
+        for number, result in enumerate((None, "launch refused", "interrupted", "failed: cannot save answer",
+                                         "source check failed")):
+            with self.subTest(result=result):
+                out = self.terminal(f"ended-{number}.md", b"Result: needs decision\nResult: ignored\n", result)
+                output, _ = self.wait(out, timeout=2)
+                self.assertEqual(output, f"{out}: {result or 'needs decision'}, exit 7, 12.0 s\n")
+
+    def test_WAIT_C2_completed_fallback_ignores_answer_header_fields(self):
+        out = self.terminal(answer=b"No result here\nExit code: 99\nEnd UTC: forged\n")
+        output, _ = self.wait(out, timeout=2)
+        self.assertEqual(output, f"{out}: completed, exit 7, 12.0 s\n")
+
+    def test_WAIT_C3_sigkill_leaves_marker_but_wait_ends(self):
+        out, child = self.holder()
+        ready = self.terminal()
+        waiter = self.start_wait(ready, out)
+        self.assertIn(": done, exit 7,", waiter.stdout.readline())
+        before = out.read_bytes()
+        child.kill()
+        child.communicate(timeout=5)
+        self.assertEqual(child.returncode, -signal.SIGKILL)
+        output, error = waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, 0, error)
+        self.assertIn(f"{out}: killed, exit unknown,", output)
+        self.assertEqual(out.read_bytes(), before)
+        self.assertTrue(out.with_suffix(".lock").exists())
+
+    def test_WAIT_C4_any_reports_first_end_and_running_peers(self):
+        first, child = self.holder("first.md")
+        second, _ = self.holder("second.md")
+        waiter = self.start_wait(first, second, "--any")
+        child.communicate("done\n", timeout=5)
+        output, error = waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, 0, error)
+        self.assertEqual(len(output.splitlines()), 2)
+        self.assertIn(f"{first}: done, exit 0,", output.splitlines()[0])
+        self.assertIn(f"{second}: running, exit unknown,", output.splitlines()[1])
+
+    def test_WAIT_C5_deadline_reports_only_remaining(self):
+        ended = self.terminal()
+        running, _ = self.holder()
+        other, _ = self.holder("other.md")
+        started = time.monotonic()
+        output, _ = self.wait(ended, running, other, "--deadline-sec", "0.15", code=3, timeout=2)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(len(output.splitlines()), 3)
+        self.assertIn(f"{ended}: done, exit 7,", output.splitlines()[0])
+        self.assertIn(f"{running}: running, exit unknown,", output.splitlines()[1])
+        self.assertIn(f"{other}: running, exit unknown,", output.splitlines()[2])
+
+    def test_WAIT_C6_invalid_inputs_refused_before_any_output(self):
+        ended = self.terminal()
+        invalid = self.base / "foreign"
+        invalid.write_text("ordinary answer\nResult: done\nExit code: 0\n")
+        link = self.base / "link"
+        link.symlink_to(ended)
+        fifo = self.base / "fifo"
+        os.mkfifo(fifo)
+        malformed = self.base / "malformed"
+        malformed.write_text("Role: builder\nStart UTC: 2026-01-01T00:00:00+00:00\nResult: running\n\nforeign body\n")
+        for path in (self.base / "missing", self.base, link, invalid, fifo, malformed):
+            with self.subTest(path=path):
+                output, error = self.wait(ended, path, code=2, timeout=2)
+                self.assertEqual(output, "")
+                self.assertIn(f"Cannot wait for {path}:", error)
+
+    def test_WAIT_options_reject_nonfinite_deadlines_and_launcher_options(self):
+        ended = self.terminal()
+        for value in ("-1", "nan", "inf"):
+            with self.subTest(value=value):
+                _, error = self.wait(ended, "--deadline-sec", value, code=2)
+                self.assertIn("--deadline-sec must be finite and nonnegative", error)
+        _, error = self.wait(ended, "--role", "builder", code=2)
+        self.assertIn("unrecognized arguments: --role builder", error)
+
+    def test_WAIT_C4_any_already_terminal_reports_immediately(self):
+        ended = self.terminal()
+        running, _ = self.holder()
+        output, _ = self.wait(ended, running, "--any", timeout=2)
+        self.assertEqual(len(output.splitlines()), 2)
+        self.assertIn(f"{ended}: done, exit 7,", output.splitlines()[0])
+        self.assertIn(f"{running}: running, exit unknown,", output.splitlines()[1])
+
+    def test_WAIT_C6_reads_without_writes_or_locks(self):
+        ended = self.terminal()
+        running, _ = self.holder()
+        injection = self.base / "injection"
+        injection.mkdir()
+        (injection / "sitecustomize.py").write_text('''
+import fcntl, os, sys
+def forbidden(*args, **kwargs):
+    raise AssertionError("wait attempted a mutation or lock")
+fcntl.flock = fcntl.lockf = forbidden
+def audit(event, args):
+    if event == "open" and args[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+        forbidden()
+    if event in ("os.remove", "os.rename", "os.mkdir", "os.rmdir", "os.chmod", "os.truncate", "fcntl.fcntl"):
+        forbidden()
+sys.addaudithook(audit)
+''')
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+                  for path in self.base.iterdir() if path.is_file()}
+        output, _ = self.wait(ended, running, "--deadline-sec", "0.1", code=3,
+                              env=dict(os.environ, PYTHONPATH=str(injection), PYTHONDONTWRITEBYTECODE="1"))
+        self.assertIn(f"{running}: running,", output)
+        after = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+                 for path in self.base.iterdir() if path.is_file()}
+        self.assertEqual(before, after)
+
+    def test_WAIT_P1_claim_succeeds_while_wait_polls_same_out(self):
+        out, child = self.holder()
+        ended = self.terminal()
+        waiter = self.start_wait(ended, out)
+        self.assertIn(": done, exit 7,", waiter.stdout.readline())
+        self.assertIsNone(waiter.poll())
+        child.communicate("release\n", timeout=5)
+        _, replacement = self.destination(out.name)
+        self.assertTrue(replacement.claimed)
+        self.assertIsNone(waiter.poll())
+        replacement.save(replacement.header + f"End UTC: {self.helpers['utc']()}\nExit code: 0\n\n",
+                         b"Result: done\n", 0)
+        replacement.finish()
+        output, error = waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, 0, error)
+        self.assertIn(f"{out}: done, exit 0,", output)
 
 
 class MethodSizeTest(unittest.TestCase):

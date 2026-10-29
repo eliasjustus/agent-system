@@ -72,6 +72,17 @@ and `codex`. Builders work in the project. Investigators work there read-only an
 records. Choose each role's model in your `models.md`. The optional `--author-family` and
 `--same-family-reason` values are recorded in the result header.
 
+Wait for launcher sessions from any session or later turn with
+`python3 <method>/run.py --wait OUT [OUT ...] [--any] [--deadline-sec N]`.
+It polls every two seconds, reports each ended session as
+`<out>: <result>, exit <code>, <duration> s`, and exits 0 when all have ended,
+regardless of their exit codes. `--any` exits 0 after the first completion and also
+reports sessions still running. A finite nonnegative `--deadline-sec` limits the wait;
+expiry reports sessions still running and exits 3. Running sessions and abandoned
+`killed` results show `exit unknown`. Missing, nonregular, symlink or non-launcher
+results are refused at start with exit 2. Waiting only reads files and Linux's
+`/proc/locks`; it never locks, changes results, retries or relaunches a session.
+
 Codex challengers and reviewers start with plugins, apps, skill instructions and discovered MCP
 servers disabled. Discovery retries once after failure or timeout. If both attempts fail, discovery
 process cleanup fails, or an enabled server's name cannot be written as a bare key
