@@ -45,8 +45,8 @@ private records when the brief needs them.
 
 Run builders and reviews in the background and stay available to the user. Before repeating
 something that timed out, check whether it already took effect. Stop only the processes you
-started, by their recorded identity, never by name matching. For launcher sessions, use
-`python3 {{METHOD}}/run.py --wait <out>`.
+started, by their recorded identity, never by name matching. Wait for launcher sessions with
+`python3 {{METHOD}}/run.py --wait <out>`, which ends however they end.
 
 Wait on the outcome, not on one hoped-for state. A wait that ends only on success never ends on a
 failure: a pull request whose required check failed stays open with auto-merge on. Use the
