@@ -171,9 +171,11 @@ just before the session folder is created until the agent has been stopped and w
 launcher and the children it waited for (and theirs, in turn). It includes data deleted before it
 reached the disk, and is `unavailable` when `/proc/self/io` cannot be read or parsed. Writes inside a
 tmpfs folder add nothing; writes elsewhere, such as Git objects in the repository, still count. It
-misses daemons, descendants that no parent waited for, and saving the answer and cleanup. Gradle and
-Kotlin daemons are such daemons: where the machine moves them into their own scopes so later
-sessions can reuse them, their writes (test workers included) belong to no session's count.
+misses daemons, descendants that no parent waited for, and saving the answer and cleanup. Which
+systemd scope a process ends up in does not decide this; whether the launcher waits for it does. A
+daemon that was already running, or that another session started (a shared Gradle or Kotlin daemon,
+for example), counts for no session. Verifiers adopt and reap their own orphaned descendants, so
+what those write before being reaped counts.
 
 Verifiers test the commit that HEAD names when the launcher starts. Commit before verifying:
 staged or unstaged tracked changes, including conflicts, refuse the session before a checkout is
