@@ -6034,16 +6034,22 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                                      role in ("builder", "investigator"))
                     self.assertTrue(self.out.read_bytes().endswith(b"\n\nanswer\n  unchanged\n"))
 
-    def test_review_requires_author_and_records_same_family_reason(self):
+    def test_review_author_family_and_reason_are_optional(self):
         for role in ("verifier", "challenger", "reviewer"):
             for extra in ((), ("--author-family", "codex")):
-                result = self.launch(role, "codex", *extra)
-                self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse(self.record.exists())
+                with self.subTest(role=role, extra=extra):
+                    result = self.launch(role, "codex", *extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(self.record.read_text())
+                    self.assertNotEqual(record["cwd"], str(self.repo))
+                    author = "codex" if extra else ""
+                    self.assertIn(f"Author family: {author}\n", self.out.read_text())
+                    self.assertIn("Same-family reason: \n", self.out.read_text())
         result = self.launch("reviewer", "codex", "--author-family", "codex",
-                             "--same-family-reason", "only available family")
+                             "--same-family-reason", "user choice")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Same-family reason: only available family", self.out.read_text())
+        self.assertIn("Author family: codex\n", self.out.read_text())
+        self.assertIn("Same-family reason: user choice\n", self.out.read_text())
 
     def test_snapshot_preserves_repository(self):
         (self.repo / "tracked").write_text("staged")
@@ -7884,7 +7890,6 @@ while not pathlib.Path({str(release)!r}).exists():
         cases = (
             ("builder", "--before", "HEAD", "allowed only for verifiers"),
             ("reviewer", "--network", "only builder and verifier"),
-            ("verifier", "--author-family", "codex", "same-family review"),
             ("builder", "--writable", self.private, "unsafe --writable"),
             ("builder", "--timeout", "0", "must be positive"),
             ("verifier", "--author-family", "claude", "--before", "missing", "returned non-zero"),
@@ -7949,7 +7954,7 @@ pathlib.Path.mkdir = mkdir
                 else:
                     extra = ("--timeout", "0.3") if outcome == "timeout" else ()
                     if outcome == "refusal":
-                        extra = ("--author-family", "codex")
+                        extra = ("--timeout", "0")
                     result = self.launch("verifier", "codex", "--author-family", "claude", *extra)
                     self.assertEqual(result.returncode,
                                      {"success": 0, "failure": 7, "empty": 1, "timeout": 124, "refusal": 2}[outcome],
@@ -7962,8 +7967,8 @@ pathlib.Path.mkdir = mkdir
                     (evidence / "link").symlink_to("absent")
                 self.record.unlink(missing_ok=True)
                 scopes = set(self.scope_state.iterdir())
-                refused = self.launch("reviewer")
-                self.assert_launch_refused(refused, "require --author-family", scopes)
+                refused = self.launch("reviewer", "codex", "--timeout", "0")
+                self.assert_launch_refused(refused, "--timeout must be positive", scopes)
                 # The first launch in each later iteration also archives the preceding refusal.
                 attempt = 2 + (number - 2) * 2
                 archived = self.out.parent / f"answer.attempt-{attempt}.md"

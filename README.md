@@ -2,7 +2,7 @@
 
 Agent System gives the owner's projects one consistent way for AI coding agents to work, and one
 way to set it up. Agents clarify the user's intent, agree what “done” means, weigh the cost of
-their work, and have a separate session check it, from another model family when one is available.
+their work, and have a separate session check it.
 The aim is complete, verified changes for as little of the user's attention as possible.
 
 The method is plain instructions that Claude Code and Codex load in a project. The launcher for
@@ -64,13 +64,13 @@ file. Setup warns only about the project's own `CLAUDE.md`; check the loaded con
 Write a bounded brief outside the repository, then run from the target project, for example:
 
 ```sh
-python3 ~/.local/share/agent-method/run.py --role reviewer --family codex --author-family claude --brief /path/to/brief.md --out /path/to/results/reviewer.md
+python3 ~/.local/share/agent-method/run.py --role reviewer --family codex --brief /path/to/brief.md --out /path/to/results/reviewer.md
 ```
 
 Roles are `builder`, `investigator`, `verifier`, `challenger` and `reviewer`; families are `claude`
 and `codex`. Builders work in the project. Investigators work there read-only and may read private
-records. Review roles require `--author-family`; a same-family check requires a recorded reason
-through `--same-family-reason`.
+records. Choose each role's model in your `models.md`. The optional `--author-family` and
+`--same-family-reason` values are recorded in the result header.
 
 Codex challengers and reviewers start with plugins, apps, skill instructions and discovered MCP
 servers disabled. Discovery retries once after failure or timeout. If both attempts fail, discovery
@@ -345,7 +345,7 @@ git worktree add --detach /path/to/checkout COMMIT
 Before a manual verifier session, run `.agents/preflight` if present in that checkout; require an
 executable regular file, exit 0 and tracked files still matching the candidate. Keep its build output
 for verification. Builders also run the project's preflight before handing back.
-Start a fresh session in that checkout, of the other model family unless the user's `models.md` currently says otherwise. Give it the appropriate installed
+Start a fresh session in that checkout, using the model named in the user's `models.md`. Give it the appropriate installed
 role contract and brief, plus `guides/verification.md` for a verifier. Configure the session's
 permissions for the role, save its full answer unedited outside the repository, and retain verifier
 evidence. Remove the checkout with `git worktree remove /path/to/checkout` after checking.
