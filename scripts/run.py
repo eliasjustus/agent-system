@@ -1498,10 +1498,6 @@ def launch(parser, args, result):
     review = args.role not in ("builder", "investigator")
     # Investigators may read the private records; checkers and builders may not.
     shielded = args.role != "investigator"
-    if review and not args.author_family:
-        parser.error("review roles require --author-family")
-    if review and args.author_family == args.family and not (args.same_family_reason or "").strip():
-        parser.error("same-family review requires --same-family-reason")
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.role == "verifier" and args.before is None:

@@ -52,8 +52,8 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
 
 1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build,
    except to apply a repair to an already built candidate that a reviewer or verifier spelled out
-   exactly and that needs no further design; a check from the other family than the orchestrator
-   then covers it. Missing features and repairs that need design go back to a builder.
+   exactly and that needs no further design; an independent check then covers it. Missing
+   features and repairs that need design go back to a builder.
 2. Above the floor, settle the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
    the rules. Commit the candidate before verifying; untracked files are excluded and named by
@@ -94,13 +94,10 @@ counterexample you tried; if you edited it yourself, a verifier still checks it.
 - **Orchestrator** (you): the most capable model available. Frames, decides depth, writes briefs,
   judges, talks to the user.
 - **Builder:** Codex for settled, well-specified work; Claude for work that still needs judgment.
-- **Verifier, challenger, reviewer:** from the other model family than the author of what they
-  check (the builder for code, you for scenarios, designs and documents), unless the user's
-  `models.md` in their preferences folder currently says otherwise; without it, the other family. Each runs in its own
-  session on its own committed checkout for verification; Codex challengers and reviewers read
-  their snapshot through Git. Where only one family is available, use a separate session and say
-  that independence comes only from that.
-- **Investigator:** research, analysis or a design draft that changes nothing; either family.
+- **Verifier, challenger, reviewer:** the model named in the user's `models.md` in their
+  preferences folder. Each runs in its own session with no author context, on its own committed
+  checkout for verification; Codex challengers and reviewers read their snapshot through Git.
+- **Investigator:** research, analysis or a design draft that changes nothing.
 
 Read `guides/handover.md` before delegating.
 

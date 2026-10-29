@@ -48,7 +48,7 @@ cases adopted or rejected. -->
 
 ## Assignments
 
-<!-- One line each: role, model family, brief file, result file. -->
+<!-- One line each: role, model, brief file, result file. -->
 
 ## Deliveries
 

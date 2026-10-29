@@ -17,7 +17,7 @@ request body), they decide where each part goes:
    report table and the decisive output for each scenario pasted in (short excerpts, secrets
    removed), so a reviewer can judge it without the private folder. Full outputs stay in the task
    folder, linked from the task record; nothing in the pull request names the private folder. Say
-   which model family verified.
+   which model verified.
 3. **Limits:** anything unverified, deferred or newly risky, and any departure from these rules.
 4. **Cost:** the estimate and the actual effort.
 

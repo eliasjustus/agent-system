@@ -11,12 +11,12 @@ Write every brief from `templates/packets.md`: it lists what each role receives 
 receives. Put nothing else in. Every role but investigator is shut out of the private folder, so a
 brief carries everything the role needs.
 
-## Run reviews from the other family
+## Run reviews
 
-Verifiers, challengers and reviewers run in their own session, from the model family the entry's
-"Roles and models" names for them, through the launcher:
+Verifiers, challengers and reviewers run in their own session, using the model named in the user's
+`models.md`, through the launcher:
 
-`python3 {{METHOD}}/run.py --role verifier --family codex --author-family claude --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
+`python3 {{METHOD}}/run.py --role verifier --family codex --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
 Before verification, commit the candidate: the launcher refuses tracked changes, tests the
 committed HEAD in a clean leased checkout and names left-out untracked files in the answer's
@@ -33,12 +33,12 @@ limits to result states, is in `run.py --help` and the launcher section of the A
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
 candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
 (an executable regular file that exits 0 and leaves tracked files matching the candidate), a
-fresh session of the family the entry's "Roles and models" names, with the role contract, the brief and, for a verifier,
+fresh session using the model named in the user's `models.md`, with the role contract, the brief and, for a verifier,
 `guides/verification.md`; its answer and evidence kept unedited in `results/`; the same written
 decision from the third verification on; the worktree removed afterwards.
 
 Investigations, research and analyses that change nothing run the same way with `--role
-investigator` and no `--author-family`: in the repository itself, read-only, and allowed to read the
+investigator`: in the repository itself, read-only, and allowed to read the
 private records when the brief needs them.
 
 ## Long work
