@@ -13,8 +13,8 @@
 
 ## Pausing or stopping
 
-Before stopping, bring the current view up to date so a stranger could continue: what is done, what
-is running, what is next and what would let it resume. Create temporary checkouts as shared clones
+Before stopping, bring the current view up to date so a stranger could continue: what is done, pointers to
+what is running, what is next and what would let it resume. Create temporary checkouts as shared clones
 that write nothing into the source repository, inside your session's temporary folder
 ($TMPDIR in sessions the launcher starts). Remove them before stopping, after keeping anything
 unique, and stop the processes you started. Leave launcher pool slots registered and in place.
