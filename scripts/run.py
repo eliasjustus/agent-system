@@ -230,6 +230,102 @@ def open_result(path, flags, mode):
         raise
 
 
+def wait_result(path):
+    """Read a launcher header and, for completed agents, their first result."""
+    with open_result(path, os.O_RDONLY, "rb") as stream:
+        fields, remaining, last = {}, 65536, b""
+        while remaining:
+            line = stream.readline(remaining)
+            remaining -= len(line)
+            if line in (b"", b"\n", b"\r\n"):
+                break
+            last = line.rstrip(b"\r\n")
+            key, separator, value = line.decode("utf-8").rstrip("\r\n").partition(": ")
+            if separator:
+                fields[key] = value
+        if not remaining or not fields.get("Role") or "Start UTC" not in fields:
+            raise ValueError("not a launcher result")
+        start = datetime.fromisoformat(fields["Start UTC"])
+        end = datetime.fromisoformat(fields["End UTC"]) if "Exit code" in fields else None
+        if start.tzinfo is None or (end is not None and end.tzinfo is None):
+            raise ValueError("launcher timestamps must include a timezone")
+        code = int(fields["Exit code"]) if "Exit code" in fields else "unknown"
+        result = fields.get("Result")
+        if end is not None:
+            if result is None:
+                for line in stream:
+                    if line.startswith(b"Result: "):
+                        result = line.decode("utf-8").strip().removeprefix("Result: ")
+                        break
+            result = result or "completed"
+        elif result != "running" or line != b"" or last != b"Result: running":
+            raise ValueError("not a running launcher result")
+    return result, code, start, end
+
+
+def result_lock_held(path):
+    """Inspect Linux's lock table without acquiring a lock, even briefly."""
+    try:
+        info = path.with_name(path.stem + ".lock").stat()
+    except FileNotFoundError:
+        return False
+    identity = os.major(info.st_dev), os.minor(info.st_dev), info.st_ino
+    with open("/proc/locks") as locks:
+        for line in locks:
+            fields = line.split()
+            if len(fields) >= 6 and fields[1] == "FLOCK":
+                major, minor, inode = fields[5].split(":")
+                if (int(major, 16), int(minor, 16), int(inode)) == identity:
+                    return True
+    return False
+
+
+def wait_sessions():
+    parser = argparse.ArgumentParser(description="Wait for launcher session results without locking or writing.")
+    parser.add_argument("--wait", nargs="+", required=True, type=Path, metavar="OUT")
+    parser.add_argument("--any", action="store_true", help="return when any named session ends")
+    parser.add_argument("--deadline-sec", type=float, metavar="N")
+    args = parser.parse_args()
+    if args.deadline_sec is not None and (not math.isfinite(args.deadline_sec) or args.deadline_sec < 0):
+        parser.error("--deadline-sec must be finite and nonnegative")
+    deadline = time.monotonic() + args.deadline_sec if args.deadline_sec is not None else None
+    pending = dict.fromkeys(args.wait)
+
+    def read(path):
+        try:
+            state = wait_result(path.expanduser())
+            if state[3] is None and not result_lock_held(path.expanduser()):
+                # The launcher may have published its result just before unlocking.
+                state = wait_result(path.expanduser())
+                if state[3] is None:
+                    state = ("killed", *state[1:])
+            return state
+        except (OSError, ValueError, KeyError, UnicodeError) as error:
+            parser.error(f"Cannot wait for {path}: {error}")
+
+    def report(path, state):
+        result, code, start, end = state
+        duration = max(0, ((end or datetime.now(timezone.utc)) - start).total_seconds())
+        print(f"{path}: {result}, exit {code}, {duration:.1f} s", flush=True)
+
+    # Validate every input before reporting or waiting on any of them.
+    states = {path: read(path) for path in pending}
+    while True:
+        ended = [path for path in pending if states[path][0] != "running" or states[path][3] is not None]
+        for path in ended:
+            report(path, states[path])
+            del pending[path]
+        if not pending:
+            return 0
+        expired = deadline is not None and time.monotonic() >= deadline
+        if (args.any and ended) or expired:
+            for path in pending:
+                report(path, states[path])
+            return 0 if args.any and ended else 3
+        time.sleep(min(2, max(0, deadline - time.monotonic())) if deadline is not None else 2)
+        states = {path: read(path) for path in pending}
+
+
 def verifier_round(out):
     count, newest = 0, 0
     decision = out.parent / "round-decision.md"
@@ -1358,11 +1454,14 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
 
 def main():
     global CLEANUP_FAILURES
+    if any(arg == "--wait" or arg.startswith("--wait=") for arg in sys.argv[1:]):
+        return wait_sessions()
     if sys.argv[1:] == ["--wait-for-room"]:
         diagnostic(wait_for_room())
         return 0
     parser = argparse.ArgumentParser(description=__doc__,
-                                     epilog="Use --wait-for-room alone to wait for memory and IO room for a build gate.")
+                                     epilog="Use --wait OUT [OUT ...] [--any] [--deadline-sec N] to wait for launcher sessions. "
+                                     "Use --wait-for-room alone to wait for memory and IO room for a build gate.")
     parser.add_argument("--role", required=True, choices=("builder", "investigator", "verifier", "challenger", "reviewer"))
     parser.add_argument("--family", required=True, choices=("claude", "codex"))
     parser.add_argument("--brief", required=True, type=Path)
