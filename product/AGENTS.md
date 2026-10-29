@@ -95,7 +95,7 @@ counterexample you tried; if you edited it yourself, a verifier still checks it.
   judges, talks to the user.
 - **Builder:** Codex for settled, well-specified work; Claude for work that still needs judgment.
 - **Verifier, challenger, reviewer:** the model named in the user's `models.md` in their
-  preferences folder. Each runs in its own session with no author context, on its own committed
+  preferences folder; without one, any available model. Each runs in its own session with no author context, on its own committed
   checkout for verification; Codex challengers and reviewers read their snapshot through Git.
 - **Investigator:** research, analysis or a design draft that changes nothing.
 
