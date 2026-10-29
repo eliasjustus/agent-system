@@ -79,7 +79,9 @@ It polls every two seconds, reports each ended session as
 regardless of their exit codes. `--any` exits 0 after the first completion and also
 reports sessions still running. A finite nonnegative `--deadline-sec` limits the wait;
 expiry reports sessions still running and exits 3. Running sessions and abandoned
-`killed` results show `exit unknown`. Missing, nonregular, symlink or non-launcher
+`killed` results show `exit unknown`. A session is reported `killed` only after
+consecutive lock misses spanning at least six seconds with its result still running.
+Missing, nonregular, symlink or non-launcher
 results are refused at start with exit 2. Waiting only reads files and Linux's
 `/proc/locks`; it never locks, changes results, retries or relaunches a session.
 

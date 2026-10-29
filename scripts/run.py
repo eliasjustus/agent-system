@@ -271,7 +271,7 @@ def result_lock_held(path):
         return False
     identity = os.major(info.st_dev), os.minor(info.st_dev), info.st_ino
     with open("/proc/locks") as locks:
-        for line in locks:
+        for line in locks.read().splitlines():
             fields = line.split()
             if len(fields) >= 6 and fields[1] == "FLOCK":
                 major, minor, inode = fields[5].split(":")
@@ -290,6 +290,7 @@ def wait_sessions():
         parser.error("--deadline-sec must be finite and nonnegative")
     deadline = time.monotonic() + args.deadline_sec if args.deadline_sec is not None else None
     pending = dict.fromkeys(args.wait)
+    misses = {}
 
     def read(path):
         try:
@@ -298,7 +299,18 @@ def wait_sessions():
                 # The launcher may have published its result just before unlocking.
                 state = wait_result(path.expanduser())
                 if state[3] is None:
-                    state = ("killed", *state[1:])
+                    now = time.monotonic()
+                    previous, count, since = misses.get(path, (None, 0, now))
+                    count, since = (count + 1, since) if previous == state else (1, now)
+                    misses[path] = (state, count, since)
+                    # /proc/locks can miss a held lock while its entries change.
+                    # Confirm across polls, including at least six seconds of absence.
+                    if count >= 3 and now - since >= 6:
+                        state = ("killed", *state[1:])
+                else:
+                    misses.pop(path, None)
+            else:
+                misses.pop(path, None)
             return state
         except (OSError, ValueError, KeyError, UnicodeError) as error:
             parser.error(f"Cannot wait for {path}: {error}")
