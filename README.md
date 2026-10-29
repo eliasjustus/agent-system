@@ -156,8 +156,9 @@ A handled signal is recorded as `Signal: <number>` and exits with 128 plus that 
 after the answer was saved. The header's `Exit code:` retains the original outcome.
 The result file decides what completed: a late signal never replaces a saved answer. Once the final
 status is written, further signals are ignored and the exit status matches the recorded outcome.
-`Result: running` means the launcher is running or was killed. Check liveness with
-`flock -n <stem>.lock true` (fails while the launcher lives). An output ending in `.log` or `.lock`,
+`Result: running` means the launcher is running or was killed. Check with `run.py --wait <out>`,
+which reads the lock table without taking the lock (a probe with `flock` would make a launch to the
+same output refuse while it holds the lock). An output ending in `.log` or `.lock`,
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
 The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
@@ -170,7 +171,10 @@ just before the session folder is created until the agent has been stopped and w
 launcher and the children it waited for (and theirs, in turn). It includes data deleted before it
 reached the disk, and is `unavailable` when `/proc/self/io` cannot be read or parsed. Writes inside a
 tmpfs folder add nothing; writes elsewhere, such as Git objects in the repository, still count. It
-misses daemons, descendants that no parent waited for, and saving the answer and cleanup.
+misses descendants that no parent waited for, and saving the answer and cleanup. Which systemd
+scope a process ends up in does not decide this: a daemon's writes count only if it is reaped
+through the launcher's waited process tree (verifiers adopt and reap their orphaned descendants).
+Shared-daemon writes can therefore be charged to the session that started the daemon.
 
 Verifiers test the commit that HEAD names when the launcher starts. Commit before verifying:
 staged or unstaged tracked changes, including conflicts, refuse the session before a checkout is
