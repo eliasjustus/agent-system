@@ -13,8 +13,8 @@
 
 ## Pausing or stopping
 
-Before stopping, bring the current view up to date so a stranger could continue: what is done, what
-is running, what is next and what would let it resume. Create temporary checkouts as shared clones
+Before stopping, bring the current view up to date so a stranger could continue: what is done, pointers to
+what is running, what is next and what would let it resume. Create temporary checkouts as shared clones
 that write nothing into the source repository, inside your session's temporary folder
 ($TMPDIR in sessions the launcher starts). Remove them before stopping, after keeping anything
 unique, and stop the processes you started. Leave launcher pool slots registered and in place.
@@ -25,9 +25,3 @@ Treat interrupted checks as not run.
 Your context grows with every turn and costs more each time. Start a fresh session for substantial
 independent work or a change of responsibility; it takes over from the record. The user's explicit
 choice to continue in the current session wins. Never continue orchestrating on a weaker model.
-
-## Current view
-
-At most 150 words, rewritten in place whenever the owner, a blocker or the state changes; the log
-never goes into it. Lines: Request, State, Depth, Owner, Estimate, Plan, Now,
-Next, Open for user.
