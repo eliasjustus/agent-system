@@ -12,7 +12,11 @@ and your role contract instead of this file.
 
 Read the project's goals, knowledge and checks in `{{PRIVATE}}/projects/{{PROJECT}}/`, the user's
 preferences in `{{PRIVATE}}/user/`. Keep one task record per outcome in `tasks/` in the project's
-private folder: continue an existing one rather than starting a second. Task records, briefs and review
+private folder: continue an existing one rather than starting a second; list open ones with
+`grep -H '^- State:' tasks/*/task.md`. A record's current view holds what the next action needs and
+nothing else holds: the user's words, decisions, next step, blocker, and pointers to the worktree,
+commit, pull request or wait; never copies of what git, GitHub or a process can tell. At close, move
+reusable lessons to the project's notes. Task records, briefs and review
 outputs never go into the repository; a project may also keep public task documents there, as its
 knowledge says. The guides, role contracts and templates named below are in `{{METHOD}}/`. If
 these folders do not exist, you are not working for this project's maintainer: say so and follow the

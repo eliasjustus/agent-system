@@ -64,4 +64,4 @@ cases adopted or rejected. -->
 
 ## Log
 
-<!-- Dated notes. Keep the current view up to date. -->
+<!-- Dated events a successor needs, not narration. Keep the current view up to date. -->
