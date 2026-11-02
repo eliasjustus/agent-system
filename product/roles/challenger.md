@@ -32,9 +32,9 @@ reasoning. Report:
 1. cases from pass 1 the list misses;
 2. scenarios that look wrongly classified, such as "must not break" on behavior already broken;
 3. scenarios that widen scope beyond what the request implies;
-4. deliver scenarios stronger than today's code with nothing in that code or in the scenarios
-   themselves to make them possible, or stricter than the signal they depend on (timing, staleness,
-   atomicity).
+4. deliver scenarios that promise more than a signal or operation they rely on provides in today's
+   code (timing, staleness, atomicity) where no scenario adds what is missing; work still to be built
+   is not such a case.
 
 Be specific and brief. Say "nothing missing" if that is your finding; padding is worse than silence.
 
