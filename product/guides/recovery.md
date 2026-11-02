@@ -26,8 +26,8 @@ check wrong. Where feasible, the corrected check still rejects the original defe
 
 Repair briefs carry all open findings at once, grouped into one repair plan per cause, not per
 symptom, and only the latest failure output. Earlier outputs stay in the task's results folder. Where
-the baseline's behavior meets the settled scenarios for the failing part, the plan returns that part
-to it; new machinery needs a scenario the baseline cannot meet, named in the plan. When a
+the baseline's behavior is shown to meet the settled scenarios for the failing part, the plan
+returns that part to it; new machinery needs a scenario the baseline cannot meet, named in the plan. When a
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios before the repair, and have the builder exercise them before handing back,
 rather than letting verification find them one at a time.
