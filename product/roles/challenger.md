@@ -31,7 +31,10 @@ reasoning. Report:
 
 1. cases from pass 1 the list misses;
 2. scenarios that look wrongly classified, such as "must not break" on behavior already broken;
-3. scenarios that widen scope beyond what the request implies.
+3. scenarios that widen scope beyond what the request implies;
+4. deliver scenarios stronger than today's code with nothing in that code or in the scenarios
+   themselves to make them possible, or stricter than the signal they depend on (timing, staleness,
+   atomicity).
 
 Be specific and brief. Say "nothing missing" if that is your finding; padding is worse than silence.
 

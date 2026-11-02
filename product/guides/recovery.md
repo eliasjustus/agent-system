@@ -25,20 +25,20 @@ check wrong. Where feasible, the corrected check still rejects the original defe
 ## Recheck
 
 Repair briefs carry all open findings at once, grouped into one repair plan per cause, not per
-symptom, and only the latest failure output. Earlier outputs stay in the task's results folder. When a
+symptom, and only the latest failure output. Earlier outputs stay in the task's results folder. Where
+the baseline's behavior meets the settled scenarios for the failing part, the plan returns that part
+to it; new machinery needs a scenario the baseline cannot meet, named in the plan. When a
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios before the repair, and have the builder exercise them before handing back,
 rather than letting verification find them one at a time.
 
 After two verifier launches into one results folder (the `--out` directory), the launcher refuses
-another before leasing a checkout unless `round-decision.md` there is a regular file, not a symlink,
-non-empty after stripping whitespace, and modified after the newest counted result. Write one of:
+another unless `round-decision.md` there is newer than the newest counted result. Write one of:
 the table of cases for the failure class, with the expected result per case and what must keep
 working; a re-scope or redesign, with its reason, named in the delivery; or a retry with its reason
-(environment, contention, flaky check). The launcher checks the file, not the decision's contents.
-Every verifier result in that folder counts, including archived, interrupted and failed runs;
-refused launches and other roles do not (details in the launcher section of the Agent System README, github.com/eliasjustus/agent-system). Each later verification needs a
-decision newer than the newest counted result. Give each repair sequence its own results folder.
+(environment, contention, flaky check). The launcher checks the file, not the decision's contents
+(what counts: the launcher section of the Agent System README, github.com/eliasjustus/agent-system).
+Each later verification needs a newer decision. Give each repair sequence its own results folder.
 
 After a repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was
