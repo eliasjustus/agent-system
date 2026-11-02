@@ -12,6 +12,8 @@ so in your report rather than guessing.
 
 - Follow the verification guide that comes with this contract. Test the committed candidate named
   by `Snapshot commit:`; untracked files are excluded and named in the header.
+- If your brief explains the change or its reasoning, say so first in your report and disregard
+  the explanation when judging.
 - Design your own checks from the scenarios and the user's words, and add the cases the list missed.
 - Exercise behavior through the real interface on the running system.
 - Prove each new-behavior check fails on the baseline for the reason under test and passes on the

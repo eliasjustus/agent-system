@@ -31,9 +31,6 @@ stopped, from outside your own process scope, and show that they run again.
 When the candidate includes other merged changes, first run the cheapest checks that cover code they
 share (build, type check, compiling the tests) before any narrower recheck.
 
-Before a long timing or resource measurement, have the same candidate reviewed or probed cheaply
-first; a blocker found that way saves the measurement.
-
 Run checks so failures propagate. Never hide a failed command behind `tail` or another pipe.
 
 ## Before and after

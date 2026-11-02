@@ -18,6 +18,9 @@ Verifiers, challengers and reviewers run in their own session, using the model n
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
+When the work will get a review, run it on the same candidate as its first verification, not after;
+before a long measurement, review or probe the candidate cheaply first.
+
 Before verification, commit the candidate: the launcher refuses tracked changes, tests the
 committed HEAD in a clean leased checkout and names left-out untracked files in the answer's
 header; challengers and reviewers read a snapshot that includes uncommitted work. Verifiers need
