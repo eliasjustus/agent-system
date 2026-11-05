@@ -19,7 +19,8 @@ request body), they decide where each part goes:
    folder, linked from the task record; nothing in the pull request names the private folder. Say
    which model verified.
 3. **Limits:** anything unverified, deferred or newly risky, and any departure from these rules.
-4. **Cost:** the estimate and the actual effort.
+4. **Cost:** the estimate, the actual effort, and the size (changed lines, pull requests, agent
+   sessions).
 
 A failed scenario stays failed here. You may ship with it or narrow the outcome when you can judge
 that better than the user, except that a known security or data-loss defect never ships. List every
@@ -28,7 +29,9 @@ recheck) is named as such and is not the scenario passing. A user decision appli
 keeps its conditions.
 
 A change meant to save cost or time is proven by its benefit measured on the work it is meant to
-improve; otherwise deliver it as "forecast, unmeasured" with who measures it and when.
+improve; otherwise deliver it as "forecast, unmeasured" with who measures it and when. Remove it if
+that measurement shows no benefit or is not made by then. Start no new analysis of a cost while its
+last change awaits measurement.
 
 If the code changed after verification, verify again; so too for a document, plan or synthesis
 changed after review: recheck the changed passages. A linked file is not proof by itself: say what

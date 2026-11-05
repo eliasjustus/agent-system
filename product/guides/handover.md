@@ -49,13 +49,13 @@ private records when the brief needs them.
 Run builders and reviews in the background and stay available to the user. Before repeating
 something that timed out, check whether it already took effect. Stop only the processes you
 started, by their recorded identity, never by name matching. Wait for launcher sessions with
-`python3 {{METHOD}}/run.py --wait <out>`, which ends however they end.
+`python3 {{METHOD}}/run.py --wait <out>`, which ends however they end, never with a timed check-in:
+the result then sits until the timer.
 
-Wait on the outcome, not on one hoped-for state. A wait that ends only on success never ends on a
-failure: a pull request whose required check failed stays open with auto-merge on. Use the
-project's own wait command where it has one. Give the wait a deadline from the expected duration;
-when it ends, for any reason, read why, act, and arm the next wait if
-something is still pending. Tell the user what changed for them; an unchanged state or a question
+Wait on the outcome, not on one hoped-for state: a pull request whose required check failed stays
+open with auto-merge on. Use the project's own wait command where it has one. Give the wait a
+deadline from the expected duration; when it ends, for any reason, read why, act, and arm the next
+wait if something is still pending. Tell the user what changed for them; an unchanged state or a question
 already asked is not news (see `guides/delivery.md`).
 
 ## After each delegation
