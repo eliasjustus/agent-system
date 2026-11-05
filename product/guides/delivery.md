@@ -19,8 +19,8 @@ request body), they decide where each part goes:
    folder, linked from the task record; nothing in the pull request names the private folder. Say
    which model verified.
 3. **Limits:** anything unverified, deferred or newly risky, and any departure from these rules.
-4. **Cost:** the estimate, the actual effort, and the size (changed lines, pull requests, agent
-   sessions).
+4. **Cost:** the estimate, the actual effort, the delivery time (UTC) and the size (changed lines,
+   pull requests, agent sessions).
 
 A failed scenario stays failed here. You may ship with it or narrow the outcome when you can judge
 that better than the user, except that a known security or data-loss defect never ships. List every
@@ -28,10 +28,12 @@ scenario that did not pass (failed, inconclusive or unverified) with its owner a
 recheck) is named as such and is not the scenario passing. A user decision applied to another task
 keeps its conditions.
 
-A change meant to save cost or time is proven by its benefit measured on the work it is meant to
-improve; otherwise deliver it as "forecast, unmeasured" with who measures it and when. Remove it if
-that measurement shows no benefit or is not made by then. Start no new analysis of a cost while its
-last change awaits measurement.
+A change meant to save cost or time names the number it should move, by how much, who measures it
+and when; until that measurement on the work it is meant to improve, deliver it as "forecast,
+unmeasured". If it shows no benefit, or still cannot be measured once overdue, its owner removes
+the part that only saves cost, keeps any fix it carries, and checks the removal like any change.
+Start no new general efficiency analysis while an earlier one's change awaits measurement, unless
+the user asks; diagnosing a specific failure is not one.
 
 If the code changed after verification, verify again; so too for a document, plan or synthesis
 changed after review: recheck the changed passages. A linked file is not proof by itself: say what
