@@ -76,3 +76,13 @@ The user asked, in their words: "<exact words>"
 Review: <pull request, commit range, design or document; exact scope>
 Look especially at: <counterexamples or risks to check>
 ```
+
+## Reviewer of a text
+
+```
+You are a reviewer. Follow the reviewer contract.
+Text: <a copy outside the private folder>
+Sources: <the user's words, files or results it must match>
+List each statement the sources do not support, overstate or contradict, with a correction.
+Check claims that something is absent first.
+```

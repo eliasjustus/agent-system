@@ -53,7 +53,7 @@ One message, at most about 250 words, in plain language:
 Ask nothing: the request, or the user's merge where the project leaves merging to them, is the
 sign-off. A decision the entry reserves for the user is asked before acting, not here.
 
-Claim only what happened. Never promise future behavior. Settle interpretation before building, or
+Never promise future behavior. Settle interpretation before building, or
 state it as a limit the user can correct. Leave out internal bookkeeping.
 
 **Outward acts need the user's yes:** merging into a default branch where the project's knowledge

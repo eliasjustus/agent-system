@@ -37,7 +37,7 @@ another unless `round-decision.md` there is newer than the newest counted result
 the table of cases for the failure class, with the expected result per case and what must keep
 working; a re-scope or redesign, with its reason, named in the delivery; or a retry with its reason
 (environment, contention, flaky check). The launcher checks the file, not the decision's contents
-(what counts: the launcher section of the Agent System README, github.com/eliasjustus/agent-system).
+(what counts: the Agent System README).
 Each later verification needs a newer decision. Give each repair sequence its own results folder.
 
 After a repair, independently rerun the reproducer, the affected must-not-break checks and the required
