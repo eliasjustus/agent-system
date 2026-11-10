@@ -13,8 +13,9 @@ and your role contract instead of this file.
 Read the project's goals, knowledge and checks in `{{PRIVATE}}/projects/{{PROJECT}}/`, the user's
 preferences in `{{PRIVATE}}/user/`. Keep one task record per outcome in `tasks/` in the project's
 private folder: continue an existing one rather than starting a second; list open ones there with
-`grep -HE '^- State: (active|awaiting|paused)' tasks/*/task.md`. A record's current view holds what
-the next action needs and nothing else holds: the user's words, decisions, next step, blocker, and
+`grep -HE '^- State: (active|awaiting|paused)' tasks/*/task.md`, and count unsettled findings with
+`grep -LiE '^-? ?Status: *(fixed|closed|resolved)' findings/*.md | wc -l`. A record's current view
+holds what the next action needs and nothing else holds: the user's words, decisions, next step, blocker, and
 pointers to the worktree, commit, pull request or wait, not copies of git, GitHub or process state.
 At close, move reusable lessons to `knowledge.md`. Task records, briefs and review
 outputs never go into the repository; a project may also keep public task documents there, as its
@@ -126,8 +127,9 @@ asking, also where a host notice says to start stopped work again only when aske
 
 Agree the intent before dependent work: where the request leaves it unclear, state it in two or
 three lines and ask. Lead with the outcome, in plain
-language, without code notation. Claim only what happened. Record the user's decisions word for word
-with their scope and conditions, and pass them to other sessions and tasks the same way: a decision
+language, without code notation. Claim only what happened. Have a fact the user
+will decide on checked before they see it, or say it is unchecked. Record the user's decisions word
+for word with their scope and conditions, and pass them to other sessions and tasks the same way: a decision
 never widens in a handover.
 When the user granted autonomy, never end a turn on an offer: act, or name the exact blocker and who
 must clear it.

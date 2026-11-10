@@ -25,12 +25,10 @@ Before verification, commit the candidate: the launcher refuses tracked changes,
 committed HEAD in a clean leased checkout and names left-out untracked files in the answer's
 header; challengers and reviewers read a snapshot that includes uncommitted work. Verifiers need
 `--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
-`--writable DIR` only when the work needs them; retry with `--clean-checkout` after an
-environment-looking failure, keeping both results. The third verifier launch into one `--out`
+`--writable DIR` only when the work needs them. The third verifier launch into one `--out`
 directory needs a fresh `round-decision.md` there (`guides/recovery.md`), so give each repair
 sequence its own results folder. The header records what each session was given; the result file
-decides what completed. Everything else the launcher does, from the private-folder shield and its
-limits to result states, is in `run.py --help` and the launcher section of the Agent System README
+decides what completed. The rest is in `run.py --help` and the Agent System README
 (github.com/eliasjustus/agent-system). Never relay or summarise a review before reading it in full.
 
 Without the launcher, the same safeguards apply: a detached worktree at the exact committed
@@ -53,9 +51,8 @@ started, by their recorded identity, never by name matching. Wait for launcher s
 the result then sits until the timer.
 
 Wait on the outcome, not on one hoped-for state: a pull request whose required check failed stays
-open with auto-merge on. Use the project's own wait command where it has one. Give the wait a
-deadline from the expected duration; when it ends, for any reason, read why, act, and arm the next
-wait if something is still pending. Tell the user what changed for them; an unchanged state or a question
+open with auto-merge on. Use the project's own wait command where it has one. When it ends, for
+any reason, read why, act, and arm the next wait if something is still pending. Tell the user what changed for them; an unchanged state or a question
 already asked is not news (see `guides/delivery.md`).
 
 ## After each delegation
