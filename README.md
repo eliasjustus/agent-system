@@ -90,8 +90,9 @@ servers disabled. Discovery retries once after failure or timeout. If both attem
 process cleanup fails, or an enabled server's name cannot be written as a bare key
 (ASCII letters, digits, `_` and `-`), the launcher refuses the session before starting the agent:
 `Result: launch refused`, exit 2, with the reason and offending names in the header and stderr.
-Discovery stderr stays in `.log`. Role contracts and the project's `AGENTS.md` still load. Other Codex roles
-keep the user's configured environment. Claude sessions use a fixed tool list and no MCP servers.
+Discovery stderr stays in `.log`. Role contracts and the project's `AGENTS.md` still load. Codex builders,
+verifiers and investigators keep the user's configured environment. Claude sessions use
+a fixed tool list and no MCP servers.
 
 Builders and verifiers wait for memory and IO room before leasing checkouts or starting agents,
 polling every 10 seconds. Investigators, challengers and reviewers start without this wait.
@@ -119,6 +120,79 @@ Invalid overrides use the defaults; overrides must be finite nonnegative numbers
 
 The agents slice is found through `/proc/self/cgroup`'s user service, falling back to
 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
+
+For investigations needing web research, use `--role investigator --family claude --web`.
+Claude adds `WebSearch` and `WebFetch` to its read-only `Read,Grep,Glob` tools and reads the live
+project, including uncommitted files. The session's own tools cannot write files, run shell commands
+or read the private folder, which is hidden behind read-only empty mounts. The launcher saves the
+final report in `--out`. Codex is not supported for web research because its configuration can
+undo the session's isolation.
+
+The user's, project's and local settings, plugins and hooks are off. Claude web investigators use
+`--safe-mode`, empty `--setting-sources`, `--settings '{"disableAllHooks": true, ...}'`, `--no-chrome`
+and `--strict-mcp-config`: installed plugins, skills, user/project/plugin hooks, MCP servers and
+settings-based command helpers do not load. This includes `apiKeyHelper`, `awsAuthRefresh`,
+`awsCredentialExport`, `otelHeadersHelper`, status-line and file-suggestion commands.
+Authentication must work without these helpers. These options were checked against Claude Code
+2.1.321; CLIs without safe mode fail argument parsing, with no fallback to user settings.
+The result header records `Web access: requested` and the applied tool, settings and hook restrictions.
+
+The launcher refuses `--web` with exit 2 for the Codex family, for roles other than investigator,
+or together with `--writable` or `--network`. It also refuses private paths in the brief,
+a missing or failing private-folder shield, and any of these local managed-policy sources,
+whatever they contain, before starting the agent:
+
+| Platform | Checked Claude policy locations |
+| --- | --- |
+| Linux/WSL | `/etc/claude-code/managed-settings.json`, `managed-settings.d/`, `managed-mcp.json` |
+| macOS | The same names under `/Library/Application Support/ClaudeCode/` |
+| Windows | The same names under `C:\Program Files\ClaudeCode\` |
+| macOS managed preferences | `/Library/Managed Preferences/com.anthropic.claudecode.plist` and `/Library/Managed Preferences/<username>/com.anthropic.claudecode.plist` |
+
+Locations follow the [Claude managed settings documentation](https://code.claude.com/docs/en/managed-settings).
+An existing drop-in directory is refused even when empty. Failure to establish or inspect a location
+also refuses the launch. The result says `Result: launch refused` and gives the reason in its
+header and stderr. These policy checks do not run without `--web`.
+
+Not covered: policy delivered by the account's organisation from the server, and configuration the
+launcher does not know of. Whoever controls those can change what a session does. This includes
+server-policy caches, Windows registry policy, inherited Windows policy on WSL and other OS
+preference stores beyond the listed files. Files can change after inspection. The filesystem
+shield's other limits are described below; this is bounded local isolation.
+Web claims in reports must cite their source address. Pages are untrusted input; the session can
+send out what it can read, so do not use it in a project whose files must not leave the machine.
+
+For fixture tests, each policy location can be replaced with an `AGENT_WEB_` environment variable:
+`CLAUDE_MANAGED_SETTINGS`, `CLAUDE_MANAGED_DROPINS`, `CLAUDE_MANAGED_MCP`, and, on macOS,
+`CLAUDE_MANAGED_PREFERENCES`, `CLAUDE_USER_MANAGED_PREFERENCES`.
+These replace only the launcher's inspection paths; they do not configure Claude.
+Use only fixture paths for these overrides when checking fixtures.
+
+To reproduce a refusal without changing your own configuration, prepare a throwaway repository,
+brief, private root and managed-settings fixture. This refuses before an agent starts:
+
+```sh
+probe=$(mktemp -d)
+git init -q "$probe/repo"
+mkdir -p "$probe/private"
+printf 'Investigate the project.\n' > "$probe/brief.md"
+printf '{}\n' > "$probe/policy.json"
+AGENT_WEB_CLAUDE_MANAGED_SETTINGS="$probe/policy.json" \
+  python3 scripts/run.py --role investigator --family claude --web \
+  --repo "$probe/repo" --method "$PWD/product" --private "$probe/private" \
+  --brief "$probe/brief.md" --out "$probe/result.md"
+```
+
+Use `AGENT_WEB_CLAUDE_MANAGED_MCP="$probe/policy.json"` instead for the managed MCP refusal.
+For drop-ins, create an empty `$probe/policy.d` directory and use
+`AGENT_WEB_CLAUDE_MANAGED_DROPINS="$probe/policy.d"`. On macOS, any existing fixture file, even
+empty, supplied through a managed-preference override exercises that refusal.
+Remove the throwaway folder after use.
+
+Without `--web`, investigators retain their existing permissions: the live project and private
+records are readable, with no private-folder shield. Claude gets only `Read,Grep,Glob`, without
+web tools or shell; Codex uses its read-only sandbox and user configuration, including configured
+web search and integrations. This default is not an offline guarantee.
 
 For Codex builders and verifiers, add `--network` when checks need local servers, child processes
 from Node or network access. Without it, the user's network configuration applies. Add
@@ -161,6 +235,9 @@ which reads the lock table without taking the lock (a probe with `flock` would m
 same output refuse while it holds the lock). An output ending in `.log` or `.lock`,
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
+Web sessions add `Web access: requested` and record their read-only tool
+restriction and safe mode, excluded settings, disabled hooks and strict MCP configuration in
+`Requested sandbox:` and `Requested environment:`.
 The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP refusal
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
@@ -341,7 +418,7 @@ paths. Also use `--full-checkout` whenever a Claude check needs all files; it sk
 A checkout with left-out paths skips the Git post-checkout hook. If Git checks out the listed
 paths anyway, the launcher reports a full checkout.
 
-Every role except investigator shields the private folder, including shell access: Codex uses a
+Every role except an investigator without `--web` shields the private folder, including shell access: Codex uses a
 permission profile denying its paths; Claude uses bubblewrap to hide it behind read-only empty
 mounts and keeps its Read/Edit deny settings. The header says `Shield: private folder denied (codex
 permission profile)`, `Shield: private folder hidden (bwrap)` or `Shield: none (investigator)`.
@@ -349,8 +426,10 @@ Missing bubblewrap, a failed namespace probe, or `sandbox_mode` in the Codex use
 (`$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml`) refuses a shielded launch with exit 2
 and `Result: launch refused`. Preflight runs inside the bubblewrap shield; the system bus is not covered. The shield also cuts off the user's
 session services through the runtime directory and X11 sockets. Services reached by abstract socket
-or localhost network port, external MCP servers in Codex user configuration, pre-existing hard links
-and bind mounts are not covered.
+or localhost network port, pre-existing hard links and bind mounts are not covered by the filesystem
+shield. Claude web investigators additionally disable configured integrations as described above.
+Other roles retain their existing integration settings, including external MCP servers for Codex
+builders, verifiers and investigators.
 Give checking sessions only the brief, role contract and evidence they need.
 
 For a committed candidate, the manual route is a detached worktree at its exact commit:

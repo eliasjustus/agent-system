@@ -183,6 +183,13 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
         self.env.pop("CODEX_HOME", None)
+        # Web policy checks must never inspect this host's policy files.
+        self.web_policy_paths = {}
+        for name in ("CLAUDE_MANAGED_SETTINGS", "CLAUDE_MANAGED_DROPINS", "CLAUDE_MANAGED_MCP",
+                     "CLAUDE_MANAGED_PREFERENCES", "CLAUDE_USER_MANAGED_PREFERENCES"):
+            path = self.base / "policy" / name
+            self.web_policy_paths[name] = path
+            self.env["AGENT_WEB_" + name] = str(path)
         # Ordinary launcher tests must not depend on this host's current load.
         for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
                             "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
@@ -5960,6 +5967,408 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), paths[:5])
+
+    def assert_web_config_refused(self, path):
+        scopes = set(self.scope_state.iterdir())
+        result = self.launch("investigator", "claude", "--web")
+        self.assert_launch_refused(result, str(path), scopes)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(Path(str(self.record) + ".discovery").exists())
+        self.assertFalse(Path(str(self.record) + ".bwrap").exists())
+
+    def assert_web_policy_locations(self):
+        check = runpy.run_path(str(ROOT / "scripts/run.py"))["check_claude_web_configuration"]
+        env = {key: value for key, value in self.env.items() if not key.startswith("AGENT_WEB_")}
+        for platform, system in (("linux", "/etc/claude-code"),
+                                 ("darwin", "/Library/Application Support/ClaudeCode"),
+                                 ("win32", r"C:\Program Files\ClaudeCode")):
+            expected = [Path(system) / name for name in
+                        ("managed-settings.json", "managed-settings.d", "managed-mcp.json")]
+            if platform == "darwin":
+                import pwd
+                expected += [Path("/Library/Managed Preferences") / suffix / "com.anthropic.claudecode.plist"
+                             for suffix in ("", pwd.getpwuid(os.getuid()).pw_name)]
+            seen = []
+
+            def absent(path):
+                seen.append(path)
+                raise FileNotFoundError(path)
+
+            with self.subTest(platform=platform), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "platform", platform), \
+                    mock.patch.object(Path, "lstat", autospec=True, side_effect=absent):
+                check()
+            self.assertEqual(seen, expected)
+
+        # Filesystem inspection errors fail closed, even before a file can be read.
+        name = "CLAUDE_MANAGED_SETTINGS"
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(Path, "lstat", side_effect=PermissionError("fixture policy denied")):
+            with self.assertRaisesRegex(ValueError, re.escape(str(self.web_policy_paths[name]))):
+                check()
+
+    def test_WEB_config_row1_claude_managed_policy_refused(self):
+        self.assert_web_policy_locations()
+        for name in ("CLAUDE_MANAGED_SETTINGS", "CLAUDE_MANAGED_DROPINS", "CLAUDE_MANAGED_MCP"):
+            path = self.web_policy_paths[name]
+            path.parent.mkdir(exist_ok=True)
+            for contents in ("", "{}", "invalid JSON"):
+                with self.subTest(name=name, contents=contents):
+                    if name.endswith("DROPINS"):
+                        path.mkdir()
+                        (path / "10-policy.json").write_text(contents)
+                    else:
+                        path.write_text(contents)
+                    self.assert_web_config_refused(path)
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+        # Even a dangling policy link cannot establish absence of policy.
+        path.symlink_to(self.base / "missing-policy")
+        self.assert_web_config_refused(path)
+
+    def test_WEB_config_row7_checks_do_not_run_without_web_for_any_role(self):
+        for path in self.web_policy_paths.values():
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("exists")
+        self.inject_launcher('''
+import os
+original_stat, original_lstat = os.stat, os.lstat
+def checked_stat(original, path, *args, **kwargs):
+    if not isinstance(path, int) and "/policy/" in os.fspath(path):
+        raise AssertionError("web-only policy check ran without --web")
+    return original(path, *args, **kwargs)
+os.stat = lambda *args, **kwargs: checked_stat(original_stat, *args, **kwargs)
+os.lstat = lambda *args, **kwargs: checked_stat(original_lstat, *args, **kwargs)
+''')
+        for family in ("codex", "claude"):
+            for role in ("investigator", "builder", "verifier", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_WEB_P1_no_web_commands_match_frozen_baseline(self):
+        # Full argv from 672bcd5, including ordering and JSON serialization.
+        # Only the session-specific answer path is supplied by the fixture.
+        self.brief.write_text(f"Read {self.private}/projects/demo/records.md\n")
+        for family in ("codex", "claude"):
+            executable = self.base / f"fake-{family}"
+            executable.write_text(FAKE)
+            executable.chmod(0o755)
+            self.env[f"AGENT_{family.upper()}_CMD"] = str(executable)
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch("investigator", family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(self.record.read_text())
+                if family == "codex":
+                    expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
+                                "-s", "read-only", "-C", str(self.repo), "-o",
+                                str(Path(record["tmpdir"]).parent / "answer"), "-"]
+                else:
+                    expected = ["-p", "--model", "claude-opus-5-5", "--output-format", "text",
+                                "--settings", '{"permissions": {"deny": []}}', "--allowedTools",
+                                "Read,Grep,Glob", "--tools", "Read,Grep,Glob", "--strict-mcp-config"]
+                executable = self.env[f"AGENT_{family.upper()}_CMD"]
+                self.assertEqual(record["executable"], executable)
+                self.assertEqual(os.fsencode(shlex.join([record["executable"], *record["argv"]])),
+                                 os.fsencode(shlex.join([executable, *expected])))
+                self.assertEqual(record["cwd"], str(self.repo))
+                self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+                self.assertNotIn("Web access:", self.out.read_text())
+                self.assertFalse(Path(str(self.record) + ".bwrap").exists())
+
+    def test_WEB_argument_matrix(self):
+        for family in ("codex", "claude"):
+            for role in ("builder", "investigator", "verifier", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    self.record.unlink(missing_ok=True)
+                    scopes = set(self.scope_state.iterdir())
+                    result = self.launch(role, family, "--web")
+                    if role == "investigator" and family == "codex":
+                        self.assert_launch_refused(result, "Web research is available for the Claude family only", scopes)
+                    elif role == "investigator":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    else:
+                        self.assert_launch_refused(result, "--web is allowed only for investigators", scopes)
+            for extra, reason in ((("--writable", self.base), "--writable is allowed for only builder and verifier"),
+                                  (("--network",), "--network is allowed for only builder and verifier"),
+                                  (("--before", "none"), "allowed only for verifiers"),
+                                  (("--clean-checkout",), "allowed only for verifiers")):
+                with self.subTest(family=family, extra=extra):
+                    self.record.unlink(missing_ok=True)
+                    scopes = set(self.scope_state.iterdir())
+                    result = self.launch("investigator", family, "--web", *extra)
+                    self.assert_launch_refused(result,
+                        "Web research is available for the Claude family only" if family == "codex" else reason, scopes)
+
+    def test_WEB_codex_refused_before_any_start_or_configuration_check(self):
+        self.env["AGENT_CODEX_CMD"] = str(self.base / "missing-codex")
+        self.env["MCP_JSON"] = "invalid discovery must not run"
+        for path in self.web_policy_paths.values():
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("exists")
+        scopes = set(self.scope_state.iterdir())
+        result = self.launch("investigator", "codex", "--web")
+        self.assert_launch_refused(result, "Web research is available for the Claude family only", scopes)
+        for suffix in ("", ".discovery", ".bwrap"):
+            self.assertFalse(Path(str(self.record) + suffix).exists())
+
+    def test_WEB_claude_hooks_disabled_for_every_event_and_settings_scope(self):
+        # Fakes can check the session controls, not Claude's execution of them.
+        events = ("SessionStart", "Setup", "InstructionsLoaded", "UserPromptSubmit",
+                  "UserPromptExpansion", "MessageDisplay", "PreToolUse", "PermissionRequest",
+                  "PostToolUse", "PostToolUseFailure", "PostToolBatch", "PermissionDenied",
+                  "Notification", "SubagentStart", "SubagentStop", "Stop", "StopFailure",
+                  "TeammateIdle", "TaskCreated", "TaskCompleted", "ConfigChange",
+                  "CwdChanged", "FileChanged", "PreCompact", "PostCompact", "Elicitation",
+                  "ElicitationResult", "WorktreeCreate", "WorktreeRemove", "SessionEnd")
+        for path in (self.home / ".claude/settings.json", self.repo / ".claude/settings.json",
+                     self.repo / ".claude/settings.local.json"):
+            with self.subTest(settings=path):
+                path.parent.mkdir(exist_ok=True)
+                data = {"disableAllHooks": False, "hooks": {
+                    event: [{"hooks": [{"type": "command", "command": "untrusted-hook"}]}]
+                    for event in events}}
+                path.write_text(json.dumps(data))
+                result = self.launch("investigator", "claude", "--web")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertIs(json.loads(args[args.index("--settings") + 1])["disableAllHooks"], True)
+                self.assertEqual(args[args.index("--setting-sources") + 1], "")
+                self.assertIn("--safe-mode", args)
+                self.assertEqual(json.loads(path.read_text()), data)
+
+    def test_WEB_claude_mcp_plugins_and_command_settings_excluded(self):
+        for path in (self.home / ".claude/settings.json", self.repo / ".claude/settings.json",
+                     self.repo / ".claude/settings.local.json"):
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps({
+                "enabledPlugins": {"unsafe@market": True},
+                "apiKeyHelper": "untrusted-key-helper", "awsAuthRefresh": "untrusted-refresh",
+                "awsCredentialExport": "untrusted-export", "otelHeadersHelper": "untrusted-headers",
+                "statusLine": {"type": "command", "command": "untrusted-status"},
+                "fileSuggestion": {"type": "command", "command": "untrusted-suggestion"},
+                "env": {"BASH_ENV": "untrusted-startup"}}))
+        (self.repo / ".mcp.json").write_text('{"mcpServers":{"unsafe":{"command":"untrusted-mcp"}}}')
+        result = self.launch("investigator", "claude", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.record.read_text())["argv"]
+        self.assertEqual(args[args.index("--setting-sources") + 1], "")
+        for flag in ("--safe-mode", "--strict-mcp-config", "--no-chrome"):
+            self.assertIn(flag, args)
+        self.assertNotIn("--mcp-config", args)
+        self.assertNotIn("--plugin-dir", args)
+        self.assertEqual(args[args.index("--tools") + 1], "Read,Grep,Glob,WebSearch,WebFetch")
+
+    def test_WEB_commands_shield_header_and_live_project(self):
+        (self.repo / "tracked").write_text("live uncommitted")
+        (self.repo / "new").write_text("live untracked")
+        head, index = self.git("rev-parse", "HEAD"), (self.repo / ".git/index").read_bytes()
+        Path(str(self.record) + ".discovery").unlink(missing_ok=True)
+        result = self.launch("investigator", "claude", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["cwd"], str(self.repo))
+        self.assertEqual((record["changed"], record["untracked"]),
+                         ("live uncommitted", "live untracked"))
+        self.assertEqual(record["stdin"], (self.method / "roles/investigator.md").read_text()
+                         + "\n---\n" + self.brief.read_text())
+        settings = {"permissions": {"deny": [f"{tool}(/{self.private}/**)" for tool in ("Read", "Edit")]}}
+        settings["disableAllHooks"] = True
+        tools = "Read,Grep,Glob,WebSearch,WebFetch"
+        expected = ["-p", "--model", "claude-opus-5-5", "--output-format", "text", "--settings",
+                    json.dumps(settings), "--allowedTools", tools, "--tools", tools, "--strict-mcp-config",
+                    "--setting-sources", "", "--safe-mode", "--no-chrome"]
+        self.assertIn("Shield: private folder hidden (bwrap)\n", self.out.read_text())
+        self.assertIn("Requested sandbox: read-only tools (no shell)\n", self.out.read_text())
+        self.assertIn("Requested environment: safe mode; no user/project/local settings; user/project/plugin hooks disabled; strict MCP configuration\n",
+                      self.out.read_text())
+        wraps = [json.loads(line) for line in Path(str(self.record) + ".bwrap").read_text().splitlines()]
+        self.assertEqual(len(wraps), 2)
+        for wrap in wraps:
+            mounts = [wrap["argv"][i + 1] for i, arg in enumerate(wrap["argv"]) if arg == "--tmpfs"]
+            self.assertEqual(mounts, self.expected_bwrap_paths())
+            self.assertIn("--remount-ro", wrap["argv"])
+        self.assertIsNotNone(wraps[-1]["scope"])
+        self.assertEqual(record["argv"], expected)
+        self.assertIn("Web access: requested\n", self.out.read_text())
+        self.assertNotIn("Snapshot commit:", self.out.read_text())
+        self.assertFalse(Path(str(self.record) + ".discovery").exists())
+        self.assertFalse(Path(record["tmpdir"]).parent.exists())
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        self.assertEqual((self.repo / "tracked").read_text(), "live uncommitted")
+        self.assertEqual((self.repo / "new").read_text(), "live untracked")
+
+    def test_WEB_private_briefs_and_unavailable_shields_refuse_before_agent(self):
+        for private in (str(self.private), "~/private"):
+            with self.subTest(private=private):
+                self.brief.write_text(f"Read {private}/projects/demo/records.md\n")
+                result = self.launch("investigator", "claude", "--web")
+                self.assert_launch_refused(result, "brief contains the private folder path")
+                self.assertIn("Web access: requested\n", self.out.read_text())
+        self.brief.write_text("bounded assignment\n")
+        (self.bin / "bwrap").unlink()
+        result = self.launch("investigator", "claude", "--web")
+        self.assert_launch_refused(result, "Cannot find bwrap for private folder shield")
+        (self.bin / "bwrap").write_text(BWRAP)
+        (self.bin / "bwrap").chmod(0o755)
+        self.env["BWRAP_PROBE_FAIL"] = "1"
+        result = self.launch("investigator", "claude", "--web")
+        self.assert_launch_refused(result, "Private folder shield probe failed: namespace probe refused")
+
+    def test_WEB_results_wait_and_rerun_archives(self):
+        previous = None
+        for outcome, code in (("done", 0), ("blocked", 0), ("failed", 7)):
+            with self.subTest(outcome=outcome):
+                answer = f"Result: {outcome}\n  complete, unedited answer\nhttps://example.org/source\n\n"
+                self.env.update(SESSION_ANSWER=answer, SESSION_EXIT=str(code), SESSION_STDERR=outcome)
+                result = self.launch("investigator", "claude", "--web")
+                self.assertEqual(result.returncode, code, result.stderr)
+                output = self.out.read_bytes()
+                self.assertEqual(output.split(b"\n\n", 1)[1], answer.encode())
+                self.assertIn(f"Exit code: {code}\n".encode(), output)
+                self.assertFalse(Path(json.loads(self.record.read_text())["tmpdir"]).parent.exists())
+                self.assertEqual(self.out.with_suffix(".log").read_text(), outcome + "\n")
+                if previous:
+                    self.assertIn(previous[0], [p.read_bytes() for p in self.out.parent.glob("answer.attempt-*.md")])
+                    self.assertIn(previous[1], [p.read_bytes() for p in self.out.parent.glob("answer.attempt-*.log")])
+                previous = output, self.out.with_suffix(".log").read_bytes()
+                waited = self.run_script("run.py", "--wait", self.out)
+                self.assertEqual(waited.returncode, 0, waited.stderr)
+                self.assertIn(f"{self.out}: {outcome}, exit {code},", waited.stdout)
+                self.assertEqual(self.out.read_bytes(), output)
+
+    def test_WEB_installed_launcher_preserves_project_and_private_records(self):
+        self.private.mkdir()
+        secret = self.private / "keep.txt"
+        secret.write_text("private content\n")
+        result = self.setup_project()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = (self.repo / "AGENTS.md").read_bytes()
+        private_files = {path.relative_to(self.private): path.read_bytes()
+                         for path in self.private.rglob("*") if path.is_file()}
+        result = subprocess.run(
+            [sys.executable, str(self.method / "run.py"), "--role", "investigator",
+             "--family", "claude", "--web", "--brief", str(self.brief), "--out", str(self.out)],
+            env=self.env, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["cwd"], str(self.repo))
+        self.assertIn(str(self.private), " ".join(record["argv"]))
+        self.assertIn("Web access: requested\n", self.out.read_text())
+        before = self.files()
+        result = self.setup_project()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.files(), before)
+        self.assertEqual((self.repo / "AGENTS.md").read_bytes(), entry)
+        self.assertEqual({path.relative_to(self.private): path.read_bytes()
+                          for path in self.private.rglob("*") if path.is_file()}, private_files)
+
+    def test_WEB_running_wait_and_concurrent_output_ownership(self):
+        self.env.update(SLEEP="1", SESSION_ANSWER="Result: blocked\nCannot retrieve the requested source.\n")
+        process = self.start_launcher("--web", "--family", "claude", role="investigator")
+        record = self.wait_record()
+        running = self.out.read_bytes()
+        refused = self.launch("investigator", "claude", "--web")
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("another launcher owns", refused.stderr)
+        self.assertEqual(self.out.read_bytes(), running)
+        waiter = subprocess.Popen([sys.executable, str(ROOT / "scripts/run.py"), "--wait", str(self.out)],
+                                  env=self.env, cwd=self.repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.reap_launcher, waiter)
+        self.assertIsNone(waiter.poll())
+        process.terminate()
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 143, stderr)
+        stdout, stderr = waiter.communicate(timeout=10)
+        self.assertEqual(waiter.returncode, 0, stderr)
+        self.assertIn("blocked, exit 143,", stdout)
+        self.assertTrue(self.out.read_text().endswith(self.env["SESSION_ANSWER"]))
+        self.assertFalse(Path(record["tmpdir"]).parent.exists())
+        self.assertEqual(list(self.out.parent.glob("answer.attempt-*")), [])
+
+    def test_WEB_empty_timeout_and_signal_reporting(self):
+        for mode in ("empty", "timeout", "signal"):
+            with self.subTest(mode=mode):
+                self.record.unlink(missing_ok=True)
+                self.env.update(SESSION_ANSWER="" if mode == "empty" else "Result: blocked\nlimits stated\n")
+                if mode != "empty":
+                    self.env["SLEEP"] = "1"
+                if mode == "signal":
+                    process = self.start_launcher("--web", "--family", "claude", role="investigator")
+                    record = self.wait_record()
+                    answer = Path(record["tmpdir"]).parent / "answer"
+                    deadline = time.monotonic() + 5
+                    while (not answer.exists() or not answer.stat().st_size) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(answer.read_text(), self.env["SESSION_ANSWER"])
+                    process.terminate()
+                    _, stderr = process.communicate(timeout=10)
+                    code = process.returncode
+                else:
+                    result = self.launch("investigator", "claude", "--web", *(["--timeout", "0.3"] if mode == "timeout" else []))
+                    code, stderr = result.returncode, result.stderr
+                    record = json.loads(self.record.read_text())
+                self.assertEqual(code, {"empty": 1, "timeout": 124, "signal": 143}[mode], stderr)
+                output = self.out.read_text()
+                if mode == "empty":
+                    self.assertIn("no non-empty answer", stderr)
+                    self.assertIn("Exit code: 1\n", output)
+                else:
+                    self.assertTrue(output.endswith(self.env["SESSION_ANSWER"]))
+                if mode == "signal":
+                    self.assertIn("Signal: 15\n", output)
+                self.assertIn("Web access: requested\n", output)
+                self.assertFalse(Path(record["tmpdir"]).parent.exists())
+                self.env.pop("SLEEP", None)
+                self.record.unlink()
+
+    def test_WEB_save_failure_preserves_answer_and_wait_status(self):
+        self.inject_launcher(f'''
+import os, pathlib
+original = os.replace
+def replace(source, destination, *args, **kwargs):
+    if (destination == pathlib.Path({str(self.out)!r})
+            and b"Cleanup: pending\\n" in pathlib.Path(source).read_bytes()):
+        raise OSError("forced web answer save failure")
+    return original(source, destination, *args, **kwargs)
+os.replace = replace
+''')
+        result = self.launch("investigator", "claude", "--web")
+        session = self.assert_unsaved_answer(result, "forced web answer save failure")
+        self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        self.assertEqual((session / "answer").read_bytes(), b"answer\n  unchanged\n")
+        waited = self.run_script("run.py", "--wait", self.out)
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        self.assertIn("failed: cannot save answer:", waited.stdout)
+        self.assertIn(", exit 1,", waited.stdout)
+
+    def test_WEB_cleanup_failure_keeps_completed_answer(self):
+        self.inject_launcher('''
+import tempfile
+original = tempfile.TemporaryDirectory.cleanup
+def cleanup(self):
+    if self.name.rsplit("/", 2)[-2] == "am":
+        raise OSError("forced web cleanup failure")
+    return original(self)
+tempfile.TemporaryDirectory.cleanup = cleanup
+''')
+        for code in (0, 7):
+            with self.subTest(code=code):
+                self.env["SESSION_EXIT"] = str(code)
+                result = self.launch("investigator", "claude", "--web")
+                self.assertEqual(result.returncode, code or 3, result.stderr)
+                self.assertIn("forced web cleanup failure", result.stderr)
+                output = self.out.read_bytes()
+                self.assertTrue(output.endswith(b"\n\nanswer\n  unchanged\n"))
+                self.assertIn(f"Exit code: {code}\n".encode(), output)
+                self.assertIn(b"Cleanup: failed:", output)
+                session = Path(json.loads(self.record.read_text())["tmpdir"]).parent
+                self.addCleanup(shutil.rmtree, session, ignore_errors=True)
 
     def test_prompt_and_native_arguments_for_every_role_and_family(self):
         for family in ("claude", "codex"):

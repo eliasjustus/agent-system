@@ -1490,6 +1490,8 @@ def main():
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--writable", action="append", default=[], type=Path, metavar="DIR")
     parser.add_argument("--network", action="store_true")
+    parser.add_argument("--web", action="store_true",
+                        help="enable web research for a read-only, private-folder-shielded investigator (Claude only)")
     local = Path(__file__).resolve().parent
     parser.add_argument("--method", default=local if (local / "roles").is_dir()
                         else Path("~/.local/share/agent-method"), type=Path)
@@ -1594,8 +1596,45 @@ def main():
     return 3 if code == 0 and CLEANUP_FAILURES else code
 
 
+def check_claude_web_configuration():
+    """Reject local policy that can defeat the web session's restrictions.
+
+    Each policy location has a test override; never inspect remote policy or its
+    caches here. Keep this check entirely outside launches without --web.
+    """
+    system = Path("/Library/Application Support/ClaudeCode" if sys.platform == "darwin"
+                  else r"C:\Program Files\ClaudeCode" if sys.platform == "win32"
+                  else "/etc/claude-code")
+    locations = {
+        "CLAUDE_MANAGED_SETTINGS": system / "managed-settings.json",
+        "CLAUDE_MANAGED_DROPINS": system / "managed-settings.d",
+        "CLAUDE_MANAGED_MCP": system / "managed-mcp.json",
+    }
+    if sys.platform == "darwin":
+        preferences = Path("/Library/Managed Preferences")
+        import pwd
+        locations["CLAUDE_MANAGED_PREFERENCES"] = preferences / "com.anthropic.claudecode.plist"
+        locations["CLAUDE_USER_MANAGED_PREFERENCES"] = (
+            preferences / pwd.getpwuid(os.getuid()).pw_name / "com.anthropic.claudecode.plist")
+    for name, default in locations.items():
+        path = Path(os.environ.get("AGENT_WEB_" + name, str(default))).expanduser()
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError(f"Cannot inspect local claude policy {path}: {error}") from error
+        raise ValueError(f"Local claude managed/system configuration exists: {path}")
+
+
 def launch(parser, args, result):
     global CLEANUP_FAILURES
+    if args.web and args.role != "investigator":
+        parser.error("--web is allowed only for investigators")
+    if args.web and args.family != "claude":
+        parser.error("Web research is available for the Claude family only")
+    if args.web:
+        result.header += "Web access: requested\n"
     if (args.before is not None or args.clean_checkout) and args.role != "verifier":
         parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
@@ -1607,8 +1646,8 @@ def launch(parser, args, result):
     if args.writable and args.family != "codex":
         parser.error("--writable is supported only for the codex family")
     review = args.role not in ("builder", "investigator")
-    # Investigators may read the private records; checkers and builders may not.
-    shielded = args.role != "investigator"
+    # Only investigators without web access may read the private records.
+    shielded = args.role != "investigator" or args.web
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.role == "verifier" and args.before is None:
@@ -1708,6 +1747,8 @@ def launch(parser, args, result):
               "private folder denied (codex permission profile)" if args.family == "codex" else
               "private folder hidden (bwrap)")
     result.header += f"Shield: {shield}\n"
+    if args.web:
+        check_claude_web_configuration()
     bwrap_prefix = []
     session_paths = []
     if shielded:
@@ -1819,9 +1860,13 @@ def launch(parser, args, result):
                              + round_header
                              + f"Executable: {header_value(executable)}\n"
                              + f"Shield: {shield}\n"
+                             + ("Web access: requested\n" if args.web else "")
                              + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
                                 f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
+                             + ("Requested sandbox: read-only tools (no shell)\n"
+                                "Requested environment: safe mode; no user/project/local settings; user/project/plugin hooks disabled; strict MCP configuration\n"
+                                if args.web and args.family == "claude" else "")
                              + f"Author family: {args.author_family or ''}\n"
                              f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
                              f"Scope: {header_value(unit or 'none')}\n"
@@ -2105,9 +2150,17 @@ def launch(parser, args, result):
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
                                                      for tool in ("Read", "Edit")] if shielded else []}}
                 tools = "Read,Grep,Glob,Bash,Write,Edit" if writable else "Read,Grep,Glob"
+                if args.web:
+                    tools += ",WebSearch,WebFetch"
+                    # Empty sources exclude command helpers and plugin settings;
+                    # safe mode also excludes installed customizations. Disable
+                    # hooks from user, project and plugin customizations.
+                    settings["disableAllHooks"] = True
                 command = [executable, "-p", "--model", model, "--output-format", "text",
                            "--settings", json.dumps(settings), "--allowedTools",
                            tools, "--tools", tools, "--strict-mcp-config"]
+                if args.web:
+                    command += ["--setting-sources", "", "--safe-mode", "--no-chrome"]
                 if args.role == "verifier":
                     command += ["--add-dir", str(source)]
                     if before:
