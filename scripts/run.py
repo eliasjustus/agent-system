@@ -1757,7 +1757,7 @@ def launch(parser, args, result):
         if probe.returncode:
             return result.refused("Private folder shield probe failed: "
                                   + (probe.stderr.strip() or f"exit {probe.returncode}"))
-    restricted = args.family == "codex" and args.role in ("challenger", "reviewer")
+    restricted = args.family == "codex" and (args.role in ("challenger", "reviewer") or args.web)
     environment = ("restricted; discovery did not run"
                    if restricted else "user configuration")
     start, snapshot, code = result.start, "", 1
@@ -1830,7 +1830,7 @@ def launch(parser, args, result):
                                 f"Network: {'off (web tools only)' if args.web else 'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
                              + ("Requested sandbox: read-only tools (no shell)\n"
-                                "Requested environment: strict MCP configuration\n"
+                                "Requested environment: safe mode; no user/project/local settings; hooks disabled; strict MCP configuration\n"
                                 if args.web and args.family == "claude" else "")
                              + f"Author family: {args.author_family or ''}\n"
                              f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
@@ -2061,8 +2061,7 @@ def launch(parser, args, result):
                                f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
             if args.family == "codex":
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
-                command = [executable, *(["--search"] if args.web else []),
-                           "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
+                command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
                 if shielded:
                     filesystem = ", ".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
                                            for path in [private, *session_paths])
@@ -2080,7 +2079,11 @@ def launch(parser, args, result):
                 if args.network:
                     command += ["-c", "permissions.am-shield.network.enabled=true"]
                 if args.web:
-                    command += ["-c", "permissions.am-shield.network.enabled=false"]
+                    # exec does not inherit the interactive CLI's --search flag.
+                    # Strict validation refuses versions without these settings.
+                    command += ["--strict-config", "-c", 'web_search="live"',
+                                "-c", "permissions.am-shield.network.enabled=false",
+                                "--disable", "hooks", "-c", "notify=[]"]
                 if restricted:
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
@@ -2120,9 +2123,15 @@ def launch(parser, args, result):
                 tools = "Read,Grep,Glob,Bash,Write,Edit" if writable else "Read,Grep,Glob"
                 if args.web:
                     tools += ",WebSearch,WebFetch"
+                    # Empty sources exclude command helpers and plugin settings;
+                    # safe mode also excludes installed customizations. This is
+                    # the documented per-session switch for every hook event.
+                    settings["disableAllHooks"] = True
                 command = [executable, "-p", "--model", model, "--output-format", "text",
                            "--settings", json.dumps(settings), "--allowedTools",
                            tools, "--tools", tools, "--strict-mcp-config"]
+                if args.web:
+                    command += ["--setting-sources", "", "--safe-mode", "--no-chrome"]
                 if args.role == "verifier":
                     command += ["--add-dir", str(source)]
                     if before:

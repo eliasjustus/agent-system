@@ -5966,6 +5966,11 @@ if "model_reasoning_effort=unsupported-test-value" in args:
         # Only the session-specific answer path is supplied by the fixture.
         self.brief.write_text(f"Read {self.private}/projects/demo/records.md\n")
         for family in ("codex", "claude"):
+            executable = self.base / f"fake-{family}"
+            executable.write_text(FAKE)
+            executable.chmod(0o755)
+            self.env[f"AGENT_{family.upper()}_CMD"] = str(executable)
+        for family in ("codex", "claude"):
             with self.subTest(family=family):
                 result = self.launch("investigator", family)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -5978,8 +5983,10 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                     expected = ["-p", "--model", "claude-opus-5-5", "--output-format", "text",
                                 "--settings", '{"permissions": {"deny": []}}', "--allowedTools",
                                 "Read,Grep,Glob", "--tools", "Read,Grep,Glob", "--strict-mcp-config"]
-                self.assertEqual(os.fsencode(shlex.join([self.env["AGENT_CODEX_CMD"], *record["argv"]])),
-                                 os.fsencode(shlex.join([self.env["AGENT_CODEX_CMD"], *expected])))
+                executable = self.env[f"AGENT_{family.upper()}_CMD"]
+                self.assertEqual(record["executable"], executable)
+                self.assertEqual(os.fsencode(shlex.join([record["executable"], *record["argv"]])),
+                                 os.fsencode(shlex.join([executable, *expected])))
                 self.assertEqual(record["cwd"], str(self.repo))
                 self.assertIn("Shield: none (investigator)\n", self.out.read_text())
                 self.assertNotIn("Web access:", self.out.read_text())
@@ -6006,12 +6013,144 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                     result = self.launch("investigator", family, "--web", *extra)
                     self.assert_launch_refused(result, reason, scopes)
 
+    def test_WEB_codex_configured_mcp_servers_use_reviewer_restrictions(self):
+        self.env["MCP_JSON"] = json.dumps([
+            {"name": "user-server", "enabled": True},
+            {"name": "project_server", "enabled": True},
+            {"name": "already-off", "enabled": False}])
+        restrictions = []
+        for role, extra in (("reviewer", ("--author-family", "claude")),
+                            ("investigator", ("--web",))):
+            result = self.launch(role, "codex", *extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(self.record.read_text())
+            args = record["argv"]
+            restrictions.append([args[i:i + 2] for i, arg in enumerate(args[:-1])
+                                 if (arg == "--disable" and args[i + 1] in ("apps", "plugins"))
+                                 or (arg == "-c" and args[i + 1].startswith(("skills.", "mcp_servers.")))])
+            discovery = json.loads(Path(str(self.record) + ".discovery").read_text())
+            self.assertEqual(discovery["executable"], record["executable"])
+            self.assertEqual(discovery["cwd"], record["cwd"])
+            self.assertEqual(discovery["tmpdir"], record["tmpdir"])
+        self.assertEqual(restrictions[0], restrictions[1])
+        self.assertIn(["-c", "mcp_servers.user-server.enabled=false"], restrictions[1])
+        self.assertIn(["-c", "mcp_servers.project_server.enabled=false"], restrictions[1])
+        self.assertNotIn(["-c", "mcp_servers.already-off.enabled=false"], restrictions[1])
+
+    def test_WEB_codex_unknown_mcp_configuration_refuses_before_agent(self):
+        cases = [("[]", "9", "discovery exited 9"),
+                 ("not JSON", "0", "discovery returned invalid JSON"),
+                 ('[{"name":"missing-enabled"}]', "0", "discovery returned an invalid server list"),
+                 ('[{"name":"unsafe.name","enabled":true}]', "0", "unsupported server names")]
+        for data, code, reason in cases:
+            with self.subTest(data=data, code=code):
+                Path(str(self.record) + ".discovery-attempts").unlink(missing_ok=True)
+                self.env.update(MCP_JSON=data, MCP_EXIT=code)
+                scopes = set(self.scope_state.iterdir())
+                result = self.launch("investigator", "codex", "--web")
+                self.assert_launch_refused(result, reason, scopes)
+                attempts = Path(str(self.record) + ".discovery-attempts").read_text().splitlines()
+                self.assertEqual(len(attempts), 1 if reason == "unsupported server names" else 2)
+                self.assertIn("Requested environment: restricted; " + reason, self.out.read_text())
+
+    def test_WEB_codex_apps_and_plugins_disabled(self):
+        result = self.launch("investigator", "codex", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.record.read_text())["argv"]
+        disabled = [args[i + 1] for i, arg in enumerate(args) if arg == "--disable"]
+        self.assertIn("apps", disabled)
+        self.assertIn("plugins", disabled)
+
+    def test_WEB_codex_skill_instructions_excluded(self):
+        result = self.launch("investigator", "codex", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.record.read_text())["argv"]
+        self.assertIn("skills.include_instructions=false",
+                      [args[i + 1] for i, arg in enumerate(args) if arg == "-c"])
+
+    def test_WEB_codex_live_search_overrides_config_with_shell_network_off(self):
+        config = self.home / ".codex/config.toml"
+        config.parent.mkdir()
+        config.write_text('web_search="disabled"\nnotify=["untrusted-notifier"]\n[features]\nhooks=true\n')
+        result = self.launch("investigator", "codex", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.record.read_text())["argv"]
+        overrides = [args[i + 1] for i, arg in enumerate(args) if arg == "-c"]
+        self.assertEqual(args[0], "exec")
+        self.assertNotIn("--search", args)
+        self.assertIn('web_search="live"', overrides)
+        self.assertIn("permissions.am-shield.network.enabled=false", overrides)
+        self.assertIn("notify=[]", overrides)
+        self.assertIn("hooks", [args[i + 1] for i, arg in enumerate(args) if arg == "--disable"])
+        self.assertIn("--strict-config", args)
+
+    def test_WEB_codex_unsupported_live_setting_fails_without_fallback(self):
+        fake = Path(self.env["AGENT_CODEX_CMD"])
+        fake.write_text(FAKE.replace('record = {"argv": args,', '''
+if "--strict-config" in args and 'web_search="live"' in args:
+    print("unknown config field web_search", file=sys.stderr)
+    sys.exit(2)
+record = {"argv": args,'''))
+        result = self.launch("investigator", "codex", "--web")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unknown config field web_search", result.stderr)
+        self.assertFalse(self.record.exists())
+        self.assertIn("Exit code: 2\n", self.out.read_text())
+
+    def test_WEB_claude_hooks_disabled_for_every_event_and_settings_scope(self):
+        # Fakes can check the session controls, not Claude's execution of them.
+        events = ("SessionStart", "Setup", "InstructionsLoaded", "UserPromptSubmit",
+                  "UserPromptExpansion", "MessageDisplay", "PreToolUse", "PermissionRequest",
+                  "PostToolUse", "PostToolUseFailure", "PostToolBatch", "PermissionDenied",
+                  "Notification", "SubagentStart", "SubagentStop", "Stop", "StopFailure",
+                  "TeammateIdle", "TaskCreated", "TaskCompleted", "ConfigChange",
+                  "CwdChanged", "FileChanged", "PreCompact", "PostCompact", "Elicitation",
+                  "ElicitationResult", "WorktreeCreate", "WorktreeRemove", "SessionEnd")
+        for path in (self.home / ".claude/settings.json", self.repo / ".claude/settings.json",
+                     self.repo / ".claude/settings.local.json"):
+            with self.subTest(settings=path):
+                path.parent.mkdir(exist_ok=True)
+                data = {"disableAllHooks": False, "hooks": {
+                    event: [{"hooks": [{"type": "command", "command": "untrusted-hook"}]}]
+                    for event in events}}
+                path.write_text(json.dumps(data))
+                result = self.launch("investigator", "claude", "--web")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.record.read_text())["argv"]
+                self.assertIs(json.loads(args[args.index("--settings") + 1])["disableAllHooks"], True)
+                self.assertEqual(args[args.index("--setting-sources") + 1], "")
+                self.assertIn("--safe-mode", args)
+                self.assertEqual(json.loads(path.read_text()), data)
+
+    def test_WEB_claude_mcp_plugins_and_command_settings_excluded(self):
+        for path in (self.home / ".claude/settings.json", self.repo / ".claude/settings.json",
+                     self.repo / ".claude/settings.local.json"):
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps({
+                "enabledPlugins": {"unsafe@market": True},
+                "apiKeyHelper": "untrusted-key-helper", "awsAuthRefresh": "untrusted-refresh",
+                "awsCredentialExport": "untrusted-export", "otelHeadersHelper": "untrusted-headers",
+                "statusLine": {"type": "command", "command": "untrusted-status"},
+                "fileSuggestion": {"type": "command", "command": "untrusted-suggestion"},
+                "env": {"BASH_ENV": "untrusted-startup"}}))
+        (self.repo / ".mcp.json").write_text('{"mcpServers":{"unsafe":{"command":"untrusted-mcp"}}}')
+        result = self.launch("investigator", "claude", "--web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.record.read_text())["argv"]
+        self.assertEqual(args[args.index("--setting-sources") + 1], "")
+        for flag in ("--safe-mode", "--strict-mcp-config", "--no-chrome"):
+            self.assertIn(flag, args)
+        self.assertNotIn("--mcp-config", args)
+        self.assertNotIn("--plugin-dir", args)
+        self.assertEqual(args[args.index("--tools") + 1], "Read,Grep,Glob,WebSearch,WebFetch")
+
     def test_WEB_commands_shield_header_and_live_project(self):
         (self.repo / "tracked").write_text("live uncommitted")
         (self.repo / "new").write_text("live untracked")
         head, index = self.git("rev-parse", "HEAD"), (self.repo / ".git/index").read_bytes()
         for family in ("codex", "claude"):
             with self.subTest(family=family):
+                Path(str(self.record) + ".discovery").unlink(missing_ok=True)
                 result = self.launch("investigator", family, "--web")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.record.read_text())
@@ -6021,26 +6160,33 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                 self.assertEqual(record["stdin"], (self.method / "roles/investigator.md").read_text()
                                  + "\n---\n" + self.brief.read_text())
                 if family == "codex":
-                    expected = ["--search", "exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
+                    expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
                                 "-c", 'default_permissions="am-shield"',
                                 "-c", 'permissions.am-shield.extends=":read-only"',
                                 "-c", "permissions.am-shield.filesystem={"
                                 + ", ".join(json.dumps(path) + '="deny"' for path in
                                             self.expected_shield_filesystem()) + "}",
                                 "-C", str(self.repo), "-o", str(Path(record["tmpdir"]).parent / "answer"),
-                                "-c", "permissions.am-shield.network.enabled=false", "-"]
+                                "--strict-config", "-c", 'web_search="live"',
+                                "-c", "permissions.am-shield.network.enabled=false",
+                                "--disable", "hooks", "-c", "notify=[]",
+                                "--disable", "plugins", "--disable", "apps",
+                                "-c", "skills.include_instructions=false", "-"]
                     self.assertIn("Shield: private folder denied (codex permission profile)\n", self.out.read_text())
                     self.assertIn("Requested sandbox: read-only\n", self.out.read_text())
                     self.assertIn("Network: off (web tools only)\n", self.out.read_text())
-                    self.assertIn("Requested environment: user configuration\n", self.out.read_text())
+                    self.assertIn("Requested environment: restricted\n", self.out.read_text())
                 else:
                     settings = {"permissions": {"deny": [f"{tool}(/{self.private}/**)" for tool in ("Read", "Edit")]}}
+                    settings["disableAllHooks"] = True
                     tools = "Read,Grep,Glob,WebSearch,WebFetch"
                     expected = ["-p", "--model", "claude-opus-5-5", "--output-format", "text", "--settings",
-                                json.dumps(settings), "--allowedTools", tools, "--tools", tools, "--strict-mcp-config"]
+                                json.dumps(settings), "--allowedTools", tools, "--tools", tools, "--strict-mcp-config",
+                                "--setting-sources", "", "--safe-mode", "--no-chrome"]
                     self.assertIn("Shield: private folder hidden (bwrap)\n", self.out.read_text())
                     self.assertIn("Requested sandbox: read-only tools (no shell)\n", self.out.read_text())
-                    self.assertIn("Requested environment: strict MCP configuration\n", self.out.read_text())
+                    self.assertIn("Requested environment: safe mode; no user/project/local settings; hooks disabled; strict MCP configuration\n",
+                                  self.out.read_text())
                     wraps = [json.loads(line) for line in Path(str(self.record) + ".bwrap").read_text().splitlines()]
                     self.assertEqual(len(wraps), 2)
                     for wrap in wraps:
@@ -6051,7 +6197,7 @@ if "model_reasoning_effort=unsupported-test-value" in args:
                 self.assertEqual(record["argv"], expected)
                 self.assertIn("Web access: requested\n", self.out.read_text())
                 self.assertNotIn("Snapshot commit:", self.out.read_text())
-                self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                self.assertEqual(Path(str(self.record) + ".discovery").exists(), family == "codex")
                 self.assertFalse(Path(record["tmpdir"]).parent.exists())
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual((self.repo / ".git/index").read_bytes(), index)

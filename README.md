@@ -121,13 +121,26 @@ The agents slice is found through `/proc/self/cgroup`'s user service, falling ba
 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
 
 For investigations needing web research, add `--web` to `--role investigator`, for either
-`--family codex` or `--family claude`. Codex uses `codex --search exec` for live web search
+`--family codex` or `--family claude`. Codex uses `codex exec -c 'web_search="live"'` for live web search
 with sandbox networking disabled; Claude adds `WebSearch` and `WebFetch` to its read-only tools.
 Both read the live project, including uncommitted files, and shield the private folder from file
 tools and shell access. Briefs naming private paths are refused. Investigators cannot use
 `--writable` or `--network`; other roles cannot use `--web`. Web claims in reports must cite their
 source address. Pages are untrusted input; the session can send out what it can read, so do not
 use it in a project whose files must not leave the machine.
+
+Codex web investigators use the same restricted environment as challengers and reviewers:
+apps, plugins and skill instructions are disabled, and every enabled configured MCP server is
+discovered and disabled; failed discovery refuses the launch. Web sessions also disable Codex
+hooks and notification commands. Claude web investigators use `--safe-mode`, empty
+`--setting-sources`, `--settings '{"disableAllHooks": true, ...}'`, `--no-chrome` and
+`--strict-mcp-config`: user, project and local settings, installed plugins, skills, hooks,
+MCP servers and settings-based command helpers do not load. This includes `apiKeyHelper`,
+`awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper`, status-line and file-suggestion
+commands. Authentication must work without these helpers.
+These options were checked against Codex 0.167.0 and Claude Code 2.1.321. Codex uses
+`--strict-config` so an unsupported setting fails validation; older CLIs without that flag,
+or Claude CLIs without safe mode, fail argument parsing. There is no fallback to user settings.
 
 Without `--web`, investigators retain their existing permissions: the live project and private
 records are readable, with no private-folder shield. Claude gets only `Read,Grep,Glob`, without
@@ -176,7 +189,8 @@ same output refuse while it holds the lock). An output ending in `.log` or `.loc
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
 Web sessions add `Web access: requested`; Claude web sessions also record their read-only tool
-restriction and strict MCP configuration in `Requested sandbox:` and `Requested environment:`.
+restriction and safe mode, excluded settings, disabled hooks and strict MCP configuration in
+`Requested sandbox:` and `Requested environment:`.
 The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP refusal
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
@@ -365,8 +379,11 @@ Missing bubblewrap, a failed namespace probe, or `sandbox_mode` in the Codex use
 (`$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml`) refuses a shielded launch with exit 2
 and `Result: launch refused`. Preflight runs inside the bubblewrap shield; the system bus is not covered. The shield also cuts off the user's
 session services through the runtime directory and X11 sockets. Services reached by abstract socket
-or localhost network port, external MCP servers in Codex user configuration, pre-existing hard links
-and bind mounts are not covered.
+or localhost network port, pre-existing hard links and bind mounts are not covered by the filesystem
+shield. Web investigators additionally disable configured integrations as described above; Codex
+sandbox networking is explicitly off (`Network: off (web tools only)`), while its built-in web
+research remains available. Other roles retain their existing integration settings, including
+external MCP servers for Codex builders, verifiers and investigators without `--web`.
 Give checking sessions only the brief, role contract and evidence they need.
 
 For a committed candidate, the manual route is a detached worktree at its exact commit:
