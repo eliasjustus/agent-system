@@ -2,14 +2,14 @@
 
 ## Choose the builder
 
-Give the work to **Codex** when the outcome, design and acceptance checks are settled and the
-assignment is self-contained. Otherwise give it to a **Claude** builder.
+Use **Codex** for self-contained assignments with settled outcome, design and acceptance checks.
+Otherwise use a **Claude** builder.
 
 ## Briefs
 
-Write every brief from `templates/packets.md`: it lists what each role receives and what it never
-receives. Put nothing else in. Every role but investigator is shut out of the private folder, so a
-brief carries everything the role needs.
+Write every brief from `templates/packets.md` and put nothing else in. Every role but an
+investigator without `--web` is shut out of the private folder, so a brief carries everything the
+role needs.
 
 ## Run reviews
 
@@ -21,9 +21,8 @@ Verifiers, challengers and reviewers run in their own session, using the model n
 When the work will get a review, run it on the same candidate as its first verification, not after;
 before a long measurement, review or probe the candidate cheaply first.
 
-Before verification, commit the candidate: the launcher refuses tracked changes, tests the
-committed HEAD in a clean leased checkout and names left-out untracked files in the answer's
-header; challengers and reviewers read a snapshot that includes uncommitted work. Verifiers need
+Before verification, commit the candidate (`guides/verification.md`); challengers and reviewers
+read a snapshot that includes uncommitted work. Verifiers need
 `--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
 `--writable DIR` only when the work needs them. The third verifier launch into one `--out`
 directory needs a fresh `round-decision.md` there (`guides/recovery.md`), so give each repair
@@ -40,7 +39,9 @@ decision from the third verification on; the worktree removed afterwards.
 
 Investigations, research and analyses that change nothing run the same way with `--role
 investigator`: in the repository itself, read-only, and allowed to read the
-private records when the brief needs them.
+private records when the brief needs them. Add `--web` for web research: that session cannot read
+the private folder, but can send out what it reads, so not for projects whose files must stay
+local.
 
 ## Long work
 

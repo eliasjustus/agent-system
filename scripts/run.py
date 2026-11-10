@@ -1490,6 +1490,8 @@ def main():
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--writable", action="append", default=[], type=Path, metavar="DIR")
     parser.add_argument("--network", action="store_true")
+    parser.add_argument("--web", action="store_true",
+                        help="enable web research for a read-only, private-folder-shielded investigator (Claude or Codex)")
     local = Path(__file__).resolve().parent
     parser.add_argument("--method", default=local if (local / "roles").is_dir()
                         else Path("~/.local/share/agent-method"), type=Path)
@@ -1596,6 +1598,10 @@ def main():
 
 def launch(parser, args, result):
     global CLEANUP_FAILURES
+    if args.web and args.role != "investigator":
+        parser.error("--web is allowed only for investigators (claude or codex)")
+    if args.web:
+        result.header += "Web access: requested\n"
     if (args.before is not None or args.clean_checkout) and args.role != "verifier":
         parser.error("--before and --clean-checkout are allowed only for verifiers")
     if args.network and args.role not in ("builder", "verifier"):
@@ -1607,8 +1613,8 @@ def launch(parser, args, result):
     if args.writable and args.family != "codex":
         parser.error("--writable is supported only for the codex family")
     review = args.role not in ("builder", "investigator")
-    # Investigators may read the private records; checkers and builders may not.
-    shielded = args.role != "investigator"
+    # Only investigators without web access may read the private records.
+    shielded = args.role != "investigator" or args.web
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.role == "verifier" and args.before is None:
@@ -1819,9 +1825,13 @@ def launch(parser, args, result):
                              + round_header
                              + f"Executable: {header_value(executable)}\n"
                              + f"Shield: {shield}\n"
+                             + ("Web access: requested\n" if args.web else "")
                              + (f"Requested sandbox: {'workspace-write' if args.role in ('builder', 'verifier') else 'read-only'}\n"
-                                f"Network: {'on' if args.network else 'not requested (user config applies)'}\n"
+                                f"Network: {'off (web tools only)' if args.web else 'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
+                             + ("Requested sandbox: read-only tools (no shell)\n"
+                                "Requested environment: strict MCP configuration\n"
+                                if args.web and args.family == "claude" else "")
                              + f"Author family: {args.author_family or ''}\n"
                              f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
                              f"Scope: {header_value(unit or 'none')}\n"
@@ -2051,7 +2061,8 @@ def launch(parser, args, result):
                                f"(git clone --quiet --shared --no-checkout . \"$TMPDIR/{extra}\").\n")
             if args.family == "codex":
                 effort = os.environ.get("AGENT_CODEX_EFFORT") or "high"
-                command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
+                command = [executable, *(["--search"] if args.web else []),
+                           "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
                 if shielded:
                     filesystem = ", ".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
                                            for path in [private, *session_paths])
@@ -2068,6 +2079,8 @@ def launch(parser, args, result):
                     command += ["--add-dir", str(path)]
                 if args.network:
                     command += ["-c", "permissions.am-shield.network.enabled=true"]
+                if args.web:
+                    command += ["-c", "permissions.am-shield.network.enabled=false"]
                 if restricted:
                     command += ["--disable", "plugins", "--disable", "apps",
                                 "-c", "skills.include_instructions=false"]
@@ -2105,6 +2118,8 @@ def launch(parser, args, result):
                 settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
                                                      for tool in ("Read", "Edit")] if shielded else []}}
                 tools = "Read,Grep,Glob,Bash,Write,Edit" if writable else "Read,Grep,Glob"
+                if args.web:
+                    tools += ",WebSearch,WebFetch"
                 command = [executable, "-p", "--model", model, "--output-format", "text",
                            "--settings", json.dumps(settings), "--allowedTools",
                            tools, "--tools", tools, "--strict-mcp-config"]

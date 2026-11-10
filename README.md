@@ -120,6 +120,20 @@ Invalid overrides use the defaults; overrides must be finite nonnegative numbers
 The agents slice is found through `/proc/self/cgroup`'s user service, falling back to
 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
 
+For investigations needing web research, add `--web` to `--role investigator`, for either
+`--family codex` or `--family claude`. Codex uses `codex --search exec` for live web search
+with sandbox networking disabled; Claude adds `WebSearch` and `WebFetch` to its read-only tools.
+Both read the live project, including uncommitted files, and shield the private folder from file
+tools and shell access. Briefs naming private paths are refused. Investigators cannot use
+`--writable` or `--network`; other roles cannot use `--web`. Web claims in reports must cite their
+source address. Pages are untrusted input; the session can send out what it can read, so do not
+use it in a project whose files must not leave the machine.
+
+Without `--web`, investigators retain their existing permissions: the live project and private
+records are readable, with no private-folder shield. Claude gets only `Read,Grep,Glob`, without
+web tools or shell; Codex uses its read-only sandbox and user configuration, including configured
+web search and integrations. This default is not an offline guarantee.
+
 For Codex builders and verifiers, add `--network` when checks need local servers, child processes
 from Node or network access. Without it, the user's network configuration applies. Add
 `--writable DIR` for a directory outside the usual writable roots, for example
@@ -161,6 +175,8 @@ which reads the lock table without taking the lock (a probe with `flock` would m
 same output refuse while it holds the lock). An output ending in `.log` or `.lock`,
 an existing directory, a stem ending in `-evidence`, or a name containing `.saving-` or `.attempt-`
 is refused before claiming or archiving anything.
+Web sessions add `Web access: requested`; Claude web sessions also record their read-only tool
+restriction and strict MCP configuration in `Requested sandbox:` and `Requested environment:`.
 The header records the executable's absolute path, `Shield:`, and, for Codex, `Requested sandbox:`, `Network:`
 and `Requested environment:`. The requested environment is `restricted` (with any MCP refusal
 reason) or `user configuration`. If snapshot or worktree creation fails before discovery, it is
@@ -341,7 +357,7 @@ paths. Also use `--full-checkout` whenever a Claude check needs all files; it sk
 A checkout with left-out paths skips the Git post-checkout hook. If Git checks out the listed
 paths anyway, the launcher reports a full checkout.
 
-Every role except investigator shields the private folder, including shell access: Codex uses a
+Every role except an investigator without `--web` shields the private folder, including shell access: Codex uses a
 permission profile denying its paths; Claude uses bubblewrap to hide it behind read-only empty
 mounts and keeps its Read/Edit deny settings. The header says `Shield: private folder denied (codex
 permission profile)`, `Shield: private folder hidden (bwrap)` or `Shield: none (investigator)`.
