@@ -1596,6 +1596,131 @@ def main():
     return 3 if code == 0 and CLEANUP_FAILURES else code
 
 
+def check_web_configuration(family, repo, private):
+    """Reject local layers that can defeat the web session's restrictions.
+
+    Each policy location has a test override; never inspect remote policy or its
+    caches here. Keep this check entirely outside launches without --web.
+    """
+    if family == "claude":
+        system = Path("/Library/Application Support/ClaudeCode" if sys.platform == "darwin"
+                      else r"C:\Program Files\ClaudeCode" if sys.platform == "win32"
+                      else "/etc/claude-code")
+        locations = {
+            "CLAUDE_MANAGED_SETTINGS": system / "managed-settings.json",
+            "CLAUDE_MANAGED_DROPINS": system / "managed-settings.d",
+            "CLAUDE_MANAGED_MCP": system / "managed-mcp.json",
+        }
+    else:
+        system = (Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI/Codex"
+                  if sys.platform == "win32" else Path("/etc/codex"))
+        locations = {
+            "CODEX_SYSTEM_CONFIG": system / "config.toml",
+            "CODEX_REQUIREMENTS": system / "requirements.toml",
+        }
+        if sys.platform != "win32":
+            locations["CODEX_MANAGED_CONFIG"] = system / "managed_config.toml"
+    if sys.platform == "darwin":
+        domain = "com.anthropic.claudecode" if family == "claude" else "com.openai.codex"
+        preferences = Path("/Library/Managed Preferences")
+        import pwd
+        locations[family.upper() + "_MANAGED_PREFERENCES"] = preferences / (domain + ".plist")
+        locations[family.upper() + "_USER_MANAGED_PREFERENCES"] = (
+            preferences / pwd.getpwuid(os.getuid()).pw_name / (domain + ".plist"))
+    for name, default in locations.items():
+        path = Path(os.environ.get("AGENT_WEB_" + name, str(default))).expanduser()
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError(f"Cannot inspect local {family} policy {path}: {error}") from error
+        raise ValueError(f"Local {family} managed/system configuration exists: {path}")
+    if family != "codex":
+        return
+
+    def read_config(path):
+        try:
+            # lstat distinguishes an absent file from a dangling symlink.
+            path.lstat()
+        except FileNotFoundError:
+            return {}
+        except OSError as error:
+            raise ValueError(f"Cannot inspect Codex configuration {path}: {error}") from error
+        try:
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("not a regular file")
+                config = tomllib.load(stream)
+        except (OSError, ValueError, RecursionError) as error:
+            raise ValueError(f"Cannot read or parse Codex configuration {path}: {error}") from error
+
+        def inspect(value):
+            if isinstance(value, dict):
+                permissions = value.get("permissions")
+                if isinstance(permissions, dict) and "am-shield" in permissions:
+                    raise ValueError(f"Codex configuration defines permissions.am-shield: {path}")
+                for child in value.values():
+                    inspect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    inspect(child)
+            elif isinstance(value, str):
+                try:
+                    target = Path(value).expanduser()
+                    # Config paths are relative to their config directory;
+                    # command/helper arguments can instead be relative to cwd.
+                    targets = [(base / target).resolve() for base in (path.parent, repo)]
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise ValueError(f"Cannot resolve a path in Codex configuration {path}: {error}") from error
+                if any(target.is_relative_to(private) for target in targets):
+                    raise ValueError(f"Codex configuration names a path into the private folder: {path}")
+        try:
+            inspect(config)
+        except RecursionError as error:
+            raise ValueError(f"Cannot inspect Codex configuration {path}: {error}") from error
+        return config
+
+    user_path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    config = read_config(user_path)
+    markers = config.get("project_root_markers", [".git"])
+    if not isinstance(markers, list) or any(not isinstance(marker, str) for marker in markers):
+        raise ValueError(f"Invalid project_root_markers in Codex configuration {user_path}")
+    project_root = repo
+    for ancestor in (repo, *repo.parents):
+        if any((ancestor / marker).exists()
+               and not (marker == ".git" and (ancestor / marker).is_dir()
+                        and not (ancestor / marker / "HEAD").exists())
+               for marker in markers):
+            project_root = ancestor
+            break
+    project_directories = []
+    for directory in (repo, *repo.parents):
+        project_directories.append(directory)
+        path = directory / ".codex/config.toml"
+        if path != user_path:
+            read_config(path)
+        if directory == project_root:
+            break
+    # The installed Codex also reads matching main-checkout configs for hooks
+    # in linked worktrees, even though this launch disables those hooks.
+    for checkout in (repo, *repo.parents):
+        marker = checkout / ".git"
+        if marker.is_file():
+            try:
+                main = Path(os.fsdecode(git(checkout, "worktree", "list", "--porcelain", "-z",
+                                            text=False).split(b"\0", 1)[0].removeprefix(b"worktree ")))
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError(f"Cannot locate Codex project configuration via {marker}: {error}") from error
+            if main != checkout:
+                for directory in project_directories:
+                    if directory.is_relative_to(checkout) and (directory / ".codex").is_dir():
+                        read_config(main / directory.relative_to(checkout) / ".codex/config.toml")
+            break
+        if marker.is_dir() and (marker / "HEAD").exists():
+            break
+
+
 def launch(parser, args, result):
     global CLEANUP_FAILURES
     if args.web and args.role != "investigator":
@@ -1714,6 +1839,8 @@ def launch(parser, args, result):
               "private folder denied (codex permission profile)" if args.family == "codex" else
               "private folder hidden (bwrap)")
     result.header += f"Shield: {shield}\n"
+    if args.web:
+        check_web_configuration(args.family, repo, private)
     bwrap_prefix = []
     session_paths = []
     if shielded:
@@ -1830,7 +1957,7 @@ def launch(parser, args, result):
                                 f"Network: {'off (web tools only)' if args.web else 'on' if args.network else 'not requested (user config applies)'}\n"
                                 f"Requested environment: {header_value(environment)}\n" if args.family == "codex" else "")
                              + ("Requested sandbox: read-only tools (no shell)\n"
-                                "Requested environment: safe mode; no user/project/local settings; hooks disabled; strict MCP configuration\n"
+                                "Requested environment: safe mode; no user/project/local settings; user/project/plugin hooks disabled; strict MCP configuration\n"
                                 if args.web and args.family == "claude" else "")
                              + f"Author family: {args.author_family or ''}\n"
                              f"Same-family reason: {header_value(args.same_family_reason or '')}\n"
@@ -2124,8 +2251,8 @@ def launch(parser, args, result):
                 if args.web:
                     tools += ",WebSearch,WebFetch"
                     # Empty sources exclude command helpers and plugin settings;
-                    # safe mode also excludes installed customizations. This is
-                    # the documented per-session switch for every hook event.
+                    # safe mode also excludes installed customizations. Disable
+                    # hooks from user, project and plugin customizations.
                     settings["disableAllHooks"] = True
                 command = [executable, "-p", "--model", model, "--output-format", "text",
                            "--settings", json.dumps(settings), "--allowedTools",

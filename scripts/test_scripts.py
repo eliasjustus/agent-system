@@ -183,6 +183,15 @@ class ScriptsTest(unittest.TestCase):
         self.env.pop("AGENT_CODEX_EFFORT", None)
         self.env.pop("XDG_CACHE_HOME", None)
         self.env.pop("CODEX_HOME", None)
+        # Web policy checks must never inspect this host's policy files.
+        self.web_policy_paths = {}
+        for name in ("CLAUDE_MANAGED_SETTINGS", "CLAUDE_MANAGED_DROPINS", "CLAUDE_MANAGED_MCP",
+                     "CODEX_SYSTEM_CONFIG", "CODEX_REQUIREMENTS", "CODEX_MANAGED_CONFIG",
+                     "CLAUDE_MANAGED_PREFERENCES", "CLAUDE_USER_MANAGED_PREFERENCES",
+                     "CODEX_MANAGED_PREFERENCES", "CODEX_USER_MANAGED_PREFERENCES"):
+            path = self.base / "policy" / name
+            self.web_policy_paths[name] = path
+            self.env["AGENT_WEB_" + name] = str(path)
         # Ordinary launcher tests must not depend on this host's current load.
         for name, value in {"MEMORY_SOME": "101", "MEMORY_FULL": "101", "IO_FULL": "101",
                             "MEM_AVAILABLE": "0", "SWAP_FREE": "0", "CGROUP_HEADROOM": "0",
@@ -5961,6 +5970,230 @@ if "model_reasoning_effort=unsupported-test-value" in args:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), paths[:5])
 
+    def assert_web_config_refused(self, family, path):
+        scopes = set(self.scope_state.iterdir())
+        result = self.launch("investigator", family, "--web")
+        self.assert_launch_refused(result, str(path), scopes)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(Path(str(self.record) + ".discovery").exists())
+        self.assertFalse(Path(str(self.record) + ".bwrap").exists())
+
+    def assert_web_policy_locations(self, family):
+        check = runpy.run_path(str(ROOT / "scripts/run.py"))["check_web_configuration"]
+        env = {key: value for key, value in self.env.items() if not key.startswith("AGENT_WEB_")}
+        for platform, system in (("linux", "/etc/claude-code" if family == "claude" else "/etc/codex"),
+                                 ("darwin", "/Library/Application Support/ClaudeCode" if family == "claude" else "/etc/codex"),
+                                 ("win32", r"C:\Program Files\ClaudeCode" if family == "claude" else r"C:\ProgramData/OpenAI/Codex")):
+            names = (["managed-settings.json", "managed-settings.d", "managed-mcp.json"]
+                     if family == "claude" else ["config.toml", "requirements.toml"]
+                     + (["managed_config.toml"] if platform != "win32" else []))
+            expected = [Path(system) / name for name in names]
+            if platform == "darwin":
+                import pwd
+                domain = "com.anthropic.claudecode" if family == "claude" else "com.openai.codex"
+                expected += [Path("/Library/Managed Preferences") / suffix / (domain + ".plist")
+                             for suffix in ("", pwd.getpwuid(os.getuid()).pw_name)]
+            seen = []
+
+            def absent(path):
+                seen.append(path)
+                raise FileNotFoundError(path)
+
+            with self.subTest(platform=platform), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "platform", platform), \
+                    mock.patch.object(Path, "lstat", autospec=True, side_effect=absent):
+                check(family, self.repo, self.private)
+            self.assertEqual(seen[:len(expected)], expected)
+
+        # Filesystem inspection errors fail closed, even before a file can be read.
+        name = "CLAUDE_MANAGED_SETTINGS" if family == "claude" else "CODEX_SYSTEM_CONFIG"
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(Path, "lstat", side_effect=PermissionError("fixture policy denied")):
+            with self.assertRaisesRegex(ValueError, re.escape(str(self.web_policy_paths[name]))):
+                check(family, self.repo, self.private)
+
+    def test_WEB_config_row1_claude_managed_policy_refused(self):
+        self.assert_web_policy_locations("claude")
+        for name in ("CLAUDE_MANAGED_SETTINGS", "CLAUDE_MANAGED_DROPINS", "CLAUDE_MANAGED_MCP"):
+            path = self.web_policy_paths[name]
+            path.parent.mkdir(exist_ok=True)
+            for contents in ("", "{}", "invalid JSON"):
+                with self.subTest(name=name, contents=contents):
+                    if name.endswith("DROPINS"):
+                        path.mkdir()
+                        (path / "10-policy.json").write_text(contents)
+                    else:
+                        path.write_text(contents)
+                    self.assert_web_config_refused("claude", path)
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+        # Even a dangling policy link cannot establish absence of policy.
+        path.symlink_to(self.base / "missing-policy")
+        self.assert_web_config_refused("claude", path)
+
+    def test_WEB_config_row2_codex_managed_and_system_files_refused(self):
+        self.assert_web_policy_locations("codex")
+        for name in ("CODEX_SYSTEM_CONFIG", "CODEX_REQUIREMENTS", "CODEX_MANAGED_CONFIG"):
+            path = self.web_policy_paths[name]
+            path.parent.mkdir(exist_ok=True)
+            for contents in ("", "# empty policy\n", '[permissions.am-shield]\nextends=":workspace"\n',
+                             "invalid TOML ["):
+                with self.subTest(name=name, contents=contents):
+                    path.write_text(contents)
+                    self.assert_web_config_refused("codex", path)
+                    path.unlink()
+        path.mkdir()  # An unreadable/non-file policy layer is also refused.
+        self.assert_web_config_refused("codex", path)
+
+    def test_WEB_config_row3_shield_profile_in_user_or_project_refused(self):
+        child = self.repo / "nested/child"
+        child.mkdir(parents=True)
+        # Codex skips a .git directory without HEAD when finding the root.
+        (child / ".git").mkdir()
+        self.env["CODEX_HOME"] = str(self.home / "custom-codex")
+        paths = [Path(self.env["CODEX_HOME"]) / "config.toml",
+                 self.repo / ".codex/config.toml", self.repo / "nested/.codex/config.toml",
+                 child / ".codex/config.toml"]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for contents in ('[permissions.am-shield]\n',
+                             'permissions.am-shield = {extends=":workspace"}\n',
+                             '[profiles.other.permissions.am-shield]\nnetwork.enabled=true\n'):
+                with self.subTest(path=path, contents=contents):
+                    path.write_text(contents)
+                    scopes = set(self.scope_state.iterdir())
+                    result = self.launch("investigator", "codex", "--web", "--repo", child)
+                    self.assert_launch_refused(result, str(path), scopes)
+                    self.assertFalse(self.record.exists())
+                    self.assertFalse(Path(str(self.record) + ".discovery").exists())
+                    path.unlink()
+        # Custom markers extend discovery beyond the Git root; disabled root
+        # discovery instead loads only the investigated directory's config.
+        (self.base / "custom-root").touch()
+        outside = self.base / ".codex/config.toml"
+        outside.parent.mkdir()
+        outside.write_text('[permissions.am-shield]\n')
+        paths[0].write_text('project_root_markers=["custom-root"]\n')
+        self.assert_web_config_refused("codex", outside)
+        paths[0].write_text('project_root_markers=[]\n')
+        (child / ".git").rmdir()
+        result = self.launch("investigator", "codex", "--web", "--repo", child)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.record.unlink()
+        Path(str(self.record) + ".discovery").unlink()
+        paths[0].write_text("")
+        linked = self.base / "linked"
+        self.git("worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
+        (linked / ".codex").mkdir()
+        for contents in ('[permissions.am-shield]\n',
+                         'notify=[' + json.dumps(str(self.private)) + ']\n', 'invalid TOML ['):
+            with self.subTest(main_checkout_config=contents):
+                paths[1].write_text(contents)
+                scopes = set(self.scope_state.iterdir())
+                result = self.launch("investigator", "codex", "--web", "--repo", linked)
+                self.assert_launch_refused(result, str(paths[1]), scopes)
+                self.assertFalse(self.record.exists())
+                self.assertFalse(Path(str(self.record) + ".discovery").exists())
+
+    def test_WEB_config_row4_private_string_paths_under_any_key_refused(self):
+        self.private.mkdir()
+        alias = self.home / "alias"
+        alias.symlink_to(self.private, target_is_directory=True)
+        for path in (self.home / ".codex/config.toml", self.repo / ".codex/config.toml"):
+            path.parent.mkdir(exist_ok=True)
+            for value in (str(self.private), str(self.private / "missing"), "~/private/secret",
+                          "~/alias/secret", str(alias / "missing"),
+                          os.path.relpath(self.private / "missing", path.parent),
+                          os.path.relpath(self.private / "missing", self.repo)):
+                for contents in ("arbitrary=" + json.dumps(value),
+                                 "[unknown]\nlist=[{nested=[" + json.dumps(value) + "]}]"):
+                    with self.subTest(path=path, value=value, contents=contents):
+                        path.write_text(contents)
+                        self.assert_web_config_refused("codex", path)
+                        path.unlink()
+
+    def test_WEB_config_row5_unreadable_or_unparseable_files_refused(self):
+        paths = (self.home / ".codex/config.toml", self.repo / ".codex/config.toml")
+        for path in paths:
+            path.parent.mkdir(exist_ok=True)
+            for contents in (b"invalid TOML [", b"key='\xff'"):
+                with self.subTest(path=path, contents=contents):
+                    path.write_bytes(contents)
+                    self.assert_web_config_refused("codex", path)
+                    path.unlink()
+            for kind in ("directory", "dangling link", "fifo", "permission denied"):
+                with self.subTest(path=path, kind=kind):
+                    if kind == "directory":
+                        path.mkdir()
+                    elif kind == "dangling link":
+                        path.symlink_to(self.base / "absent")
+                    elif kind == "fifo":
+                        os.mkfifo(path)
+                    else:
+                        path.write_text("# readable TOML, simulated read error\n")
+                        self.inject_launcher(f'''
+import os
+original_open = os.open
+def denied_open(file, *args, **kwargs):
+    if os.fspath(file) == {str(path)!r}:
+        raise PermissionError("fixture read denied")
+    return original_open(file, *args, **kwargs)
+os.open = denied_open
+''')
+                    self.assert_web_config_refused("codex", path)
+                    if kind == "directory":
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                    self.env.pop("PYTHONPATH", None)
+
+    def test_WEB_config_row6_safe_local_configuration_proceeds(self):
+        user = self.home / ".codex/config.toml"
+        user.parent.mkdir()
+        # The neighbouring private-backup directory is not inside private.
+        user.write_text('web_search="disabled"\n[permissions.other]\nextends=":read-only"\n'
+                        'filesystem={"/unrelated"="deny"}\n'
+                        + 'other=' + json.dumps(str(self.private) + '-backup') + '\n')
+        project = self.repo / ".codex/config.toml"
+        project.parent.mkdir()
+        project.write_text('# permissions.am-shield is only a comment\nnotify=[]\n')
+        # A parent above the repository root is not a loaded project layer.
+        outside = self.base / ".codex/config.toml"
+        outside.parent.mkdir()
+        outside.write_text('[permissions.am-shield]\n')
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch("investigator", family, "--web")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.out.read_bytes().endswith(b"answer\n  unchanged\n"))
+
+    def test_WEB_config_row7_checks_do_not_run_without_web_for_any_role(self):
+        for path in self.web_policy_paths.values():
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("exists")
+        # These contents would be rejected for a web investigator.
+        for path in (self.home / ".codex/config.toml", self.repo / ".codex/config.toml"):
+            path.parent.mkdir(exist_ok=True)
+            path.write_text('[permissions.am-shield]\nfile=' + json.dumps(str(self.private)) + '\n')
+        self.inject_launcher('''
+import os
+original_stat, original_lstat = os.stat, os.lstat
+def checked_stat(original, path, *args, **kwargs):
+    if not isinstance(path, int) and "/policy/" in os.fspath(path):
+        raise AssertionError("web-only policy check ran without --web")
+    return original(path, *args, **kwargs)
+os.stat = lambda *args, **kwargs: checked_stat(original_stat, *args, **kwargs)
+os.lstat = lambda *args, **kwargs: checked_stat(original_lstat, *args, **kwargs)
+''')
+        for family in ("codex", "claude"):
+            for role in ("investigator", "builder", "verifier", "challenger", "reviewer"):
+                with self.subTest(family=family, role=role):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_WEB_P1_no_web_commands_match_frozen_baseline(self):
         # Full argv from 672bcd5, including ordering and JSON serialization.
         # Only the session-specific answer path is supplied by the fixture.
@@ -6185,7 +6418,7 @@ record = {"argv": args,'''))
                                 "--setting-sources", "", "--safe-mode", "--no-chrome"]
                     self.assertIn("Shield: private folder hidden (bwrap)\n", self.out.read_text())
                     self.assertIn("Requested sandbox: read-only tools (no shell)\n", self.out.read_text())
-                    self.assertIn("Requested environment: safe mode; no user/project/local settings; hooks disabled; strict MCP configuration\n",
+                    self.assertIn("Requested environment: safe mode; no user/project/local settings; user/project/plugin hooks disabled; strict MCP configuration\n",
                                   self.out.read_text())
                     wraps = [json.loads(line) for line in Path(str(self.record) + ".bwrap").read_text().splitlines()]
                     self.assertEqual(len(wraps), 2)
