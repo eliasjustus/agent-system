@@ -1,9 +1,8 @@
 <!-- Agent System entry for project {{PROJECT}}. Method: {{METHOD}}. Private folder: {{PRIVATE}}. -->
 # Working agreement
 
-This is how agents work in this project. The project's maintainer owns these rules; project knowledge
-and the user's preferences may narrow them, never weaken them. Everything but the invariants is a
-default: depart from it with a reason written in the task record.
+The maintainer owns these rules; project knowledge and user preferences may narrow, never weaken
+them. Except invariants, these are defaults: record reasons for departures in the task record.
 
 If you were started as a builder, investigator, verifier, challenger or reviewer, follow your brief
 and your role contract instead of this file.
@@ -11,7 +10,12 @@ and your role contract instead of this file.
 ## Start
 
 Read the project's goals, knowledge and checks in `{{PRIVATE}}/projects/{{PROJECT}}/`, the user's
-preferences in `{{PRIVATE}}/user/`. Keep one task record per outcome in `tasks/` in the project's
+preferences in `{{PRIVATE}}/user/`.
+After host compaction, reread these files and your task record's current view before continuing;
+files override summaries. Check what you had running and read finished answers. Report unreadable
+records before dependent decisions; invent no instructions or permissions.
+
+Keep one task record per outcome in `tasks/` in the project's
 private folder: continue an existing one rather than starting a second; list open ones there with
 `grep -HE '^- State: (active|awaiting|paused)' tasks/*/task.md`, open findings with
 `head -qn6 findings/*.md 2>/dev/null | grep -c '^- Status: open'`. A record's current view
@@ -25,8 +29,8 @@ repository's own contributor documents instead.
 
 ## Cost comes first
 
-Every action costs the user something. What is scarce: their attention and verdicts, this machine's
-CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep.
+Every action costs the user: attention and verdicts; this machine's CPU, memory and disk; CI
+runners and merge queue; then complexity and upkeep.
 
 1. **Cap the rounds, not the clock.** Write a time range for any task bigger than a quick answer in
    the task record, for the delivery's cost line; times in a task record are UTC read from `date -u`.
@@ -41,9 +45,9 @@ CPU, memory and disk, CI runners and the merge queue; then complexity and upkeep
    that prevents data loss, security or accessibility.
 3. **Complexity is a cost.** Deletion beats addition. No option, wrapper or "for later" code nobody
    asked for. Count added machinery against a change in design and in review.
-4. **Do not block the user.** Run long commands in the background and stay available to talk. Tell
-   them unprompted when you are blocked or the forecast moves. Run only as many lanes in parallel as
-   this machine and CI can carry. Never end a turn while something outside you is still pending
+4. **Do not block the user.** Run long commands in the background and stay available to talk. Report
+   blockers or forecast changes unprompted. Limit parallel lanes to
+   this machine's and CI's capacity. Never end a turn while something outside you is still pending
    (CI, a merge, a delegated session) without a background wait armed to wake you: one that ends on
    every outcome, failure and stall as well as success, with a deadline from the expected duration,
    through the host's completion notice. Time passing alone does not wake you; a wait with nothing armed is
@@ -127,8 +131,8 @@ asking, also where a host notice says to start stopped work again only when aske
 
 Agree the intent before dependent work: where the request leaves it unclear, state it in two or
 three lines and ask. Lead with the outcome, in plain
-language, without code notation. Claim only what happened. Have a fact the user
-will decide on checked against its source before they see it, or say it is unchecked. Record the user's decisions word
+language, without code notation. Claim only what happened. Check facts informing user decisions
+against their sources before presenting them, or label them unchecked. Record the user's decisions word
 for word with their scope and conditions, and pass them to other sessions and tasks the same way: a decision
 never widens in a handover.
 When the user granted autonomy, never end a turn on an offer: act, or name the exact blocker and who

@@ -59,6 +59,40 @@ Claude Code may read those instead of `AGENTS.md`. Put a line `@AGENTS.md` in th
 `CLAUDE.md`, creating it if only a parent has one. An import in a parent points at the parent's
 file. Setup warns only about the project's own `CLAUDE.md`; check the loaded context yourself.
 
+## Long sessions
+
+After the host compacts an orchestrator's conversation, the method tells it to reread the user's
+preferences, the project's goals, knowledge and checks, and its own task record's current view
+before continuing. Files take precedence over the summary. It checks what it had running and
+reads finished answers. If records cannot be read, it reports that before decisions depending on
+them and invents no instructions or permissions.
+
+Two host settings can keep long sessions efficient. Both belong to the host, and its
+documentation states their conditions:
+
+1. Compact earlier than the default, at about 400,000 tokens. Claude Code: `/autocompact 400k` or
+   the `autoCompactWindow` setting; its default on models with a 1M context window is about
+   967,000 tokens. T3 Code: the Claude instance's "Auto-compact after" setting.
+2. Compact an idle conversation before its prompt cache expires; after expiry the next request
+   processes the whole conversation again. Claude Code: `idleCompaction`, on by default, under
+   the conditions its settings reference lists, among them an interactive terminal session, the
+   VS Code chat panel or the desktop app's Code tab, auto-compaction on, the one-hour prompt
+   cache and a default threshold of 200,000 tokens. T3 Code: "Compact idle threads" set to
+   "Before the cache expires (beta)"; its window starts two minutes before the last request's
+   prompt cache expires, and it skips a conversation with background work pending.
+
+The savings are a forecast from a model, not a measurement of these settings. Recorded usage of
+five orchestrator sessions of 19 to 48 hours on Opus 5.5 (November 2026) was replayed at list
+prices. With a 400,000-token ceiling the replay cost 54 to 62% of what the sessions actually cost;
+the range covers reading nothing again after each compaction up to reading 100,000 tokens again.
+With idle compaction modelled at 54 minutes for conversations of at least 100,000 tokens on top,
+it cost 44 to 55%; the forecast does not establish the same saving from the settings above. Below
+about 200,000 tokens the saving per extra compaction is nearly gone. A measurement on real
+sessions is planned for on or after 2026-11-16.
+
+The method cannot promise when a prompt cache expires or whether a host compacts in time: that
+is the provider's and the host's business.
+
 ## Optional launcher
 
 Write a bounded brief outside the repository, then run from the target project, for example:
