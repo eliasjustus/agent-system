@@ -59,6 +59,33 @@ Claude Code may read those instead of `AGENTS.md`. Put a line `@AGENTS.md` in th
 `CLAUDE.md`, creating it if only a parent has one. An import in a parent points at the parent's
 file. Setup warns only about the project's own `CLAUDE.md`; check the loaded context yourself.
 
+## Long sessions
+
+After the host compacts an orchestrator's conversation, the method tells it to reread the user's
+preferences, the project's goals, knowledge and checks, and its own task record's current view
+before continuing. Files take precedence over the summary. It checks what it had running and
+reads finished answers. If records cannot be read, it reports that before decisions depending on
+them and invents no instructions or permissions.
+
+Two host settings can keep long sessions efficient:
+
+1. Compact at about 400,000 tokens instead of the host's default. In Claude Code, use
+   `/autocompact 400k` or `autoCompactWindow`; in T3 Code, use the Claude instance's
+   "Auto-compact after" setting.
+2. Compact an idle conversation before its stored copy expires. Claude Code does this itself only
+   in a terminal, the VS Code panel and its desktop app. In T3 Code, set "Compact idle threads" to
+   "Before the cache expires"; it skips conversations with background work pending.
+
+The savings are a forecast: replaying recorded usage from five orchestrator sessions of 19 to 48
+hours (Claude Code 2.1.321, Opus 5.5, November 2026) at list prices with a 400,000-token ceiling
+cost 54 to 62% of their actual cost; adding idle compaction cost 44 to 55%. Below about 200,000
+tokens, the saving per extra compaction is nearly gone. The maintainer is responsible for measuring
+these forecasts again on real sessions on or after 2026-11-16.
+
+These are the host's settings. The method cannot promise when a stored conversation expires:
+that is the provider's and the host's business, as is whether idle compaction skips conversations
+with background work pending.
+
 ## Optional launcher
 
 Write a bounded brief outside the repository, then run from the target project, for example:
