@@ -69,22 +69,28 @@ them and invents no instructions or permissions.
 
 Two host settings can keep long sessions efficient:
 
-1. Compact at about 400,000 tokens instead of the host's default. In Claude Code, use
-   `/autocompact 400k` or `autoCompactWindow`; in T3 Code, use the Claude instance's
-   "Auto-compact after" setting.
-2. Compact an idle conversation before its stored copy expires. Claude Code does this itself only
-   in a terminal, the VS Code panel and its desktop app. In T3 Code, set "Compact idle threads" to
-   "Before the cache expires"; it skips conversations with background work pending.
+1. Compact earlier than the host's default, at about 400,000 tokens. Claude Code compacts at
+   about 967,000 tokens by default on models with a 1M context window; use `/autocompact 400k` or
+   the `autoCompactWindow` setting. In T3 Code, use the Claude instance's "Auto-compact after"
+   setting.
+2. Compact an idle conversation before its prompt cache expires. After expiry the next request
+   pays to process the whole conversation again. Claude Code does this itself (`idleCompaction`,
+   on by default) only in an interactive terminal session, the VS Code chat panel and its desktop
+   app, for conversations of 200,000 tokens or more on the one-hour prompt cache, about an hour
+   after the last request. In T3 Code, set "Compact idle threads" to "Before the cache expires
+   (beta)": it compacts two minutes before the prompt cache expires and skips a conversation
+   with background work pending.
 
-The savings are a forecast: replaying recorded usage from five orchestrator sessions of 19 to 48
-hours (Claude Code 2.1.321, Opus 5.5, November 2026) at list prices with a 400,000-token ceiling
-cost 54 to 62% of their actual cost; adding idle compaction cost 44 to 55%. Below about 200,000
-tokens, the saving per extra compaction is nearly gone. The maintainer is responsible for measuring
-these forecasts again on real sessions on or after 2026-11-16.
+The savings are a forecast from a model, not a measurement of these settings. Recorded usage of
+five orchestrator sessions of 19 to 48 hours on Opus 5.5 (November 2026) was replayed at list
+prices. With a 400,000-token ceiling the replay cost 54 to 62% of what the sessions actually cost;
+the range covers a session reading nothing again after each compaction up to reading 100,000
+tokens again. With idle compaction of conversations of 100,000 tokens or more on top, a policy no
+host offers exactly, it cost 44 to 55%. Below about 200,000 tokens the saving per extra compaction
+is nearly gone. The maintainer measures again on real sessions on or after 2026-11-16.
 
-These are the host's settings. The method cannot promise when a stored conversation expires:
-that is the provider's and the host's business, as is whether idle compaction skips conversations
-with background work pending.
+These are the host's settings. The method cannot promise when a prompt cache expires or whether
+a host compacts in time: that is the provider's and the host's business.
 
 ## Optional launcher
 
