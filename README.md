@@ -67,30 +67,31 @@ before continuing. Files take precedence over the summary. It checks what it had
 reads finished answers. If records cannot be read, it reports that before decisions depending on
 them and invents no instructions or permissions.
 
-Two host settings can keep long sessions efficient:
+Two host settings can keep long sessions efficient. Both belong to the host, and its
+documentation states their conditions:
 
-1. Compact earlier than the host's default, at about 400,000 tokens. Claude Code compacts at
-   about 967,000 tokens by default on models with a 1M context window; use `/autocompact 400k` or
-   the `autoCompactWindow` setting. In T3 Code, use the Claude instance's "Auto-compact after"
-   setting.
-2. Compact an idle conversation before its prompt cache expires. After expiry the next request
-   pays to process the whole conversation again. Claude Code does this itself (`idleCompaction`,
-   on by default) only in an interactive terminal session, the VS Code chat panel and its desktop
-   app, for conversations of 200,000 tokens or more on the one-hour prompt cache, about an hour
-   after the last request. In T3 Code, set "Compact idle threads" to "Before the cache expires
-   (beta)": it compacts two minutes before the prompt cache expires and skips a conversation
-   with background work pending.
+1. Compact earlier than the default, at about 400,000 tokens. Claude Code: `/autocompact 400k` or
+   the `autoCompactWindow` setting; its default on models with a 1M context window is about
+   967,000 tokens. T3 Code: the Claude instance's "Auto-compact after" setting.
+2. Compact an idle conversation before its prompt cache expires; after expiry the next request
+   processes the whole conversation again. Claude Code: `idleCompaction`, on by default, under
+   the conditions its settings reference lists, among them an interactive terminal session, the
+   VS Code chat panel or the desktop app's Code tab, auto-compaction on, the one-hour prompt
+   cache and a default threshold of 200,000 tokens. T3 Code: "Compact idle threads" set to
+   "Before the cache expires (beta)"; its window starts two minutes before the last request's
+   prompt cache expires, and it skips a conversation with background work pending.
 
 The savings are a forecast from a model, not a measurement of these settings. Recorded usage of
 five orchestrator sessions of 19 to 48 hours on Opus 5.5 (November 2026) was replayed at list
 prices. With a 400,000-token ceiling the replay cost 54 to 62% of what the sessions actually cost;
-the range covers a session reading nothing again after each compaction up to reading 100,000
-tokens again. With idle compaction of conversations of 100,000 tokens or more on top, a policy no
-host offers exactly, it cost 44 to 55%. Below about 200,000 tokens the saving per extra compaction
-is nearly gone. The maintainer measures again on real sessions on or after 2026-11-16.
+the range covers reading nothing again after each compaction up to reading 100,000 tokens again.
+With idle compaction modelled at 54 minutes for conversations of at least 100,000 tokens on top,
+it cost 44 to 55%; the forecast does not establish the same saving from the settings above. Below
+about 200,000 tokens the saving per extra compaction is nearly gone. A measurement on real
+sessions is planned for on or after 2026-11-16.
 
-These are the host's settings. The method cannot promise when a prompt cache expires or whether
-a host compacts in time: that is the provider's and the host's business.
+The method cannot promise when a prompt cache expires or whether a host compacts in time: that
+is the provider's and the host's business.
 
 ## Optional launcher
 
