@@ -876,11 +876,7 @@ def worker_notes(repo, private, private_forms, role, family):
     """Read this launch's notes without following links out of the project folder."""
     with ExitStack() as opened:
         try:
-            root = Path(subprocess.check_output(
-                ["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
-                 "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL,
-                timeout=5).strip())
-            fd = os.open(root / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(repo / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             opened.callback(os.close, fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return "", "none"
@@ -899,7 +895,7 @@ def worker_notes(repo, private, private_forms, role, family):
                 directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                     dir_fd=directory)
                 opened.callback(os.close, directory)
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, ValueError):
             return "", "none"
         try:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,

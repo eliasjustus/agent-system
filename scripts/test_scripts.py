@@ -397,6 +397,7 @@ class ScriptsTest(unittest.TestCase):
 
     def test_NOTES_repair_plain_folder_launches_without_notes(self):
         self.notes_project("## invalid\nMust not be read.\n")
+        (self.repo / "AGENTS.md").unlink()
         shutil.rmtree(self.repo / ".git")
         for family in ("codex", "claude"):
             with self.subTest(family=family):
@@ -409,6 +410,18 @@ class ScriptsTest(unittest.TestCase):
                             'clones inside it (git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
                 self.assertEqual(record["stdin"], expected)
                 self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_plain_folder_with_entry_gets_project_notes(self):
+        contents = "## all\nShared environment fact.\n"
+        self.notes_project(contents)
+        shutil.rmtree(self.repo / ".git")
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                prompt = self.notes_launch("builder", family)
+                self.assertTrue(prompt.startswith(self.notes_prefix("builder")
+                                                  + self.NOTES_HEADING + contents))
+                self.assertIn("Worker notes: worker-notes.md; sections: all; words: 5\n",
+                              self.out.read_text())
 
     def test_NOTES_repair_entry_read_failures_keep_warning_and_launch(self):
         self.assertEqual(self.setup_project().returncode, 0)
@@ -517,27 +530,50 @@ os.open, Path.open = denied_open, denied_path_open
                             else:
                                 self.assertIn(f"({baseline});", prompt)
 
-    def test_NOTES_S1_git_root_from_linked_worktree_and_subdirectory(self):
+    def test_NOTES_S1_linked_worktree_and_role_specific_subdirectory_notes(self):
         self.notes_project()
         linked = self.base / "linked"
         self.git("worktree", "add", "--detach", str(linked), "HEAD")
         for repo in (self.repo, linked):
             subdir = repo / "subdirectory"
             subdir.mkdir()
-            # A subdirectory's entry must not select a different project.
-            (subdir / "AGENTS.md").write_text("<!-- Agent System entry for project wrong. -->\n")
-            wrong = self.private / "projects/wrong/worker-notes.md"
-            wrong.parent.mkdir(parents=True, exist_ok=True)
-            wrong.write_text("## unknown\nMust not be read.\n")
             for selected in (repo, subdir):
                 for role in ("builder", "verifier"):
                     for family in ("codex", "claude"):
                         with self.subTest(repo=selected, role=role, family=family):
                             prompt = self.notes_launch(role, family, "--repo", selected)
+                            if selected == subdir and role == "builder":
+                                record = json.loads(self.record.read_text())
+                                expected = (self.notes_prefix(role)
+                                            + f'\nTemporary folder: {record["tmpdir"]}; '
+                                            'removed when the session ends; create before or known-good '
+                                            'checkouts as shared clones inside it '
+                                            '(git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
+                                self.assertEqual(prompt, expected)
+                                self.assertIn("Worker notes: none\n", self.out.read_text())
+                                continue
                             self.assertIn(self.NOTES_HEADING + "## all\nShared environment fact.\n", prompt)
-                            self.assertNotIn("Must not be read", prompt)
                             self.assertIn("Worker notes: worker-notes.md; sections: all; words: 5\n",
                                           self.out.read_text())
+
+    def test_NOTES_repo_name_ending_in_space_uses_own_project(self):
+        contents = "## all\nOwn project environment fact.\n"
+        self.notes_project(contents)
+        sibling = self.repo
+        self.repo = self.base / "repo "
+        sibling.rename(self.repo)
+        sibling.mkdir()
+        (sibling / "AGENTS.md").write_text("<!-- Agent System entry for project sibling. -->\n")
+        other_notes = self.private / "projects/sibling/worker-notes.md"
+        other_notes.parent.mkdir()
+        other_notes.write_text("## all\nSibling project environment fact.\n")
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                prompt = self.notes_launch("builder", family)
+                self.assertIn(self.NOTES_HEADING + contents, prompt)
+                self.assertNotIn("Sibling project environment fact.", prompt)
+                self.assertIn("Worker notes: worker-notes.md; sections: all; words: 6\n",
+                              self.out.read_text())
 
     def test_NOTES_S2_section_intersections_and_family_ignore_model_names(self):
         headings = ("ALL", "BuIlDeR", "verifier", "codex", "CLAUDE", "all builder codex",
