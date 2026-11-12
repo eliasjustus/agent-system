@@ -481,7 +481,9 @@ session, while `all` matches everyone. The family comes from `--family`, indepen
 names. Keep the whole file within 400 whitespace-separated words, including headings, with no
 non-blank text before the first section. Do not name the private folder's path in the notes.
 A malformed file refuses builder and verifier launches with exit 2 and `Result: launch refused`;
-notes must be readable UTF-8 regular files, with no symlinks in the path beneath the private root.
+notes must be readable UTF-8 regular files with a single hard link; a symlinked notes file refuses.
+If the project cannot be located or its folder path cannot be opened without following symlinks,
+the launch proceeds without notes.
 Missing or empty notes, or no matching sections, leave the prompt unchanged. The single-line
 `Worker notes:` result field records the file, selected headings and attached word count, or
 that none applied. Running setup again preserves existing notes.

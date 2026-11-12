@@ -874,12 +874,12 @@ def check_entries(repo, method, private):
 
 def worker_notes(repo, private, private_forms, role, family):
     """Read this launch's notes without following links out of the project folder."""
-    try:
-        root = Path(subprocess.check_output(
-            ["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
-             "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL,
-            timeout=5).strip())
-        with ExitStack() as opened:
+    with ExitStack() as opened:
+        try:
+            root = Path(subprocess.check_output(
+                ["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
+                 "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL,
+                timeout=5).strip())
             fd = os.open(root / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             opened.callback(os.close, fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -889,20 +889,19 @@ def worker_notes(repo, private, private_forms, role, family):
             if len(first) > 4096:
                 return "", "none"
             first = first.decode("utf-8")
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return "", "none"
-    match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
-    if not match or match[1] in (".", ".."):
-        return "", "none"
-    path = private / "projects" / match[1] / "worker-notes.md"
-    try:
-        with ExitStack() as opened:
+            match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
+            if not match or match[1] in (".", ".."):
+                return "", "none"
+            path = private / "projects" / match[1] / "worker-notes.md"
             directory = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             opened.callback(os.close, directory)
             for name in ("projects", match[1]):
                 directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                     dir_fd=directory)
                 opened.callback(os.close, directory)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return "", "none"
+        try:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=directory)
             opened.callback(os.close, fd)
@@ -913,10 +912,10 @@ def worker_notes(repo, private, private_forms, role, family):
                 raise ValueError("link count is not 1")
             with os.fdopen(fd, encoding="utf-8", closefd=False) as notes:
                 contents = notes.read()
-    except FileNotFoundError:
-        return "", "none"
-    except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError(f"{path}: {error}") from error
+        except FileNotFoundError:
+            return "", "none"
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValueError(f"{path}: {error}") from error
     if any(form in contents for form in private_forms):
         raise ValueError(f"{path}: contains the private folder path")
     words = len(contents.split())

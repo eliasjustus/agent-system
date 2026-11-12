@@ -353,6 +353,48 @@ class ScriptsTest(unittest.TestCase):
 
     NOTES_HEADING = "\n## Project notes for this session's environment, supplied by the orchestrator\n"
 
+    def test_NOTES_locating_256_letter_project_id_launches_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        project_id = "p" * 256
+        (self.repo / "AGENTS.md").write_text(
+            f"<!-- Agent System entry for project {project_id}. -->\n")
+        self.git("add", "AGENTS.md")
+        self.git("commit", "-qm", "long project id")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    prompt = self.notes_launch(role, family)
+                    self.assertTrue(prompt.startswith(self.notes_prefix(role)))
+                    self.assertNotIn(self.NOTES_HEADING, prompt)
+                    self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_locating_file_or_unreadable_project_directories_launch_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        for relative in ("projects/demo", "projects"):
+            directory = self.private / relative
+            for kind in ("file", "unreadable"):
+                with self.subTest(relative=relative, kind=kind):
+                    saved = self.base / (directory.name + "-saved")
+                    mode = directory.stat().st_mode
+                    if kind == "file":
+                        directory.rename(saved)
+                        directory.write_text("Not a project directory.\n")
+                    else:
+                        directory.chmod(0)
+                    try:
+                        for role in ("builder", "verifier"):
+                            for family in ("codex", "claude"):
+                                with self.subTest(role=role, family=family):
+                                    prompt = self.notes_launch(role, family)
+                                    self.assertNotIn(self.NOTES_HEADING, prompt)
+                                    self.assertIn("Worker notes: none\n", self.out.read_text())
+                    finally:
+                        if kind == "file":
+                            directory.unlink()
+                            saved.rename(directory)
+                        else:
+                            directory.chmod(mode)
+
     def test_NOTES_repair_plain_folder_launches_without_notes(self):
         self.notes_project("## invalid\nMust not be read.\n")
         shutil.rmtree(self.repo / ".git")
@@ -591,7 +633,7 @@ os.open, Path.open = denied_open, denied_path_open
         self.assertEqual(target.read_text(), "## all\nOutside content.\n")
 
     def test_NOTES_S3_symlinked_project_directories_are_not_followed(self):
-        path = self.notes_project()
+        self.notes_project("## invalid\nMust not be read.\n")
         for relative in ("projects/demo", "projects"):
             with self.subTest(relative=relative):
                 directory = self.private / relative
@@ -599,8 +641,12 @@ os.open, Path.open = denied_open, denied_path_open
                 directory.rename(saved)
                 directory.symlink_to(saved, target_is_directory=True)
                 try:
-                    self.assert_launch_refused(self.launch(), "Not a directory")
-                    self.assertIn(str(path), self.out.read_text())
+                    for role in ("builder", "verifier"):
+                        for family in ("codex", "claude"):
+                            with self.subTest(role=role, family=family):
+                                prompt = self.notes_launch(role, family)
+                                self.assertNotIn(self.NOTES_HEADING, prompt)
+                                self.assertIn("Worker notes: none\n", self.out.read_text())
                 finally:
                     directory.unlink()
                     saved.rename(directory)
