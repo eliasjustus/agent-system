@@ -43,7 +43,7 @@ Settled: pending  <!-- date; date the user was told; any reply word for word -->
 
 ## Decisions
 
-<!-- Dated lines: design decision, user choices and their exact words, depth changes, challenger
+<!-- Dated lines: design decision with the rejected alternative, user choices and their exact words, depth changes, challenger
 cases adopted or rejected. -->
 
 ## Assignments

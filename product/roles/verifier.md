@@ -31,4 +31,5 @@ so in your report rather than guessing.
 ## Return
 
 `Result: done | blocked | needs decision` first, then the table and verdict from the verification
-guide, at most about 300 words. Stop every process you started.
+guide, at most about 300 words. End with `Noticed:` anything outside the assignment worth knowing, or
+nothing. Stop every process you started.
