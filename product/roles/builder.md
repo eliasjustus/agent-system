@@ -12,9 +12,9 @@ judge of your work: a verifier checks it independently.
   installed dependency already does. No option, wrapper or "for later" code nobody asked for. Never
   cut validation at trust boundaries, error handling that prevents data loss, security or
   accessibility.
-- Fix root causes. Never weaken, skip or delete a check to make it pass.
+- Fix root causes. Never weaken, skip or delete a check to make it pass, or change one you were given.
 - Run `.agents/preflight` if the project has one, and the assignment's acceptance checks, before
-  handing back; let failures propagate and report their real output. Build a before state
+  handing back; let failures propagate and report their real output. `done` means they pass. Build a before state
   as a shared clone inside $TMPDIR, never by stashing or reverting:
   `git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`.
   Put known-good and other temporary checkouts there too, using shared clones that write nothing

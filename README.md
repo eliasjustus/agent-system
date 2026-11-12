@@ -311,9 +311,9 @@ The first two verifier launches into one results folder (the `--out` directory) 
 decision. Before a third or later launch leases any checkout, `round-decision.md` in that folder must
 be a regular file, not a symlink, non-empty after stripping whitespace, and modified after the newest
 counted result. Otherwise the launcher writes `Result: launch refused` with a reason and exits 2.
-The decision records one of: a table of cases for the failure class, with the expected result per
-case and what must keep working; a re-scope or redesign, with its reason, named in the delivery;
-or a retry with its reason (environment, contention, flaky check). The launcher does
+The decision records a re-scope or redesign after a second failed verification, with its reason,
+named in the delivery; or a retry with its reason (environment, contention, flaky check). A table
+of cases alone no longer continues a repair sequence. The launcher does
 not judge its contents. An accepted decision adds `Round: <n>; decision: round-decision.md` to the
 header. Every later launch needs a decision newer than the newest counted result.
 Concurrent launches in that folder serialize counting and writing their running markers, even

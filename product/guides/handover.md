@@ -24,9 +24,8 @@ before a long measurement, review or probe the candidate cheaply first.
 Before verification, commit the candidate (`guides/verification.md`); challengers and reviewers
 read a snapshot that includes uncommitted work. Verifiers need
 `--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
-`--writable DIR` only when the work needs them. The third verifier launch into one `--out`
-directory needs a fresh `round-decision.md` there (`guides/recovery.md`), so give each repair
-sequence its own results folder. The header records what each session was given; the result file
+`--writable DIR` only when the work needs them. Give each repair sequence its own results folder
+(`guides/recovery.md`). The header records what each session was given; the result file
 decides what completed. The rest is in `run.py --help` and the Agent System README
 (github.com/eliasjustus/agent-system). Never relay or summarise a review before reading it in full.
 
@@ -43,9 +42,17 @@ private records when the brief needs them. Add `--web` for web research: that se
 the private folder, but can send out what it reads, so not for projects whose files must stay
 local.
 
+## Checks first (above the floor)
+
+Before the build, launch a verifier on the baseline (`--before none`, its own results folder) with
+the checks-first line in its brief. Treat the cases it adds like a challenger's. Keep its checks,
+and name a copy outside the private folder in the builder's brief and the judging verifier's, or
+that none could be written. The builder never changes a check: one it thinks wrong comes back to
+you.
+
 ## Long work
 
-Run builders and reviews in the background and stay available to the user. Before repeating
+Before repeating
 something that timed out, check whether it already took effect. Stop only the processes you
 started, by their recorded identity, never by name matching. Wait for launcher sessions with
 `python3 {{METHOD}}/run.py --wait <out>`, which ends however they end, never with a timed check-in:
@@ -66,6 +73,4 @@ already asked is not news (see `guides/delivery.md`).
 - A plan or synthesis you write from agents' answers is itself a candidate: before delivering it,
   have its consequential transformations (units, identities, arithmetic, rankings, dropped
   constraints) checked against those answers.
-- Builders come back when the work contradicts the design or scenarios, the scope changes, a check
-  fails for a reason that is not plainly an implementation defect, or the same failure repeats after
-  two attempts. Weaker models judge their limits poorly: review at checkpoints.
+- Weaker models judge their limits poorly: review at checkpoints.
