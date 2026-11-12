@@ -328,6 +328,553 @@ class ScriptsTest(unittest.TestCase):
                                "--private", self.private, "--method", self.method,
                                *extra)
 
+    def notes_project(self, contents="## all\nShared environment fact.\n"):
+        (self.repo / "AGENTS.md").write_text("<!-- Agent System entry for project demo. -->\n")
+        self.git("add", "AGENTS.md")
+        self.git("commit", "-qm", "project entry")
+        path = self.private / "projects/demo/worker-notes.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def notes_launch(self, role="builder", family="codex", *extra):
+        if role == "verifier":
+            self.round_decision()
+        result = self.launch(role, family, "--author-family",
+                             "claude" if family == "codex" else "codex", *extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(self.record.read_text())["stdin"]
+
+    def notes_prefix(self, role):
+        prompt = (self.method / "roles" / f"{role}.md").read_text()
+        if role == "verifier":
+            prompt += "\n" + (self.method / "guides/verification.md").read_text()
+        return prompt + "\n---\n" + self.brief.read_text()
+
+    NOTES_HEADING = "\n## Project notes for this session's environment, supplied by the orchestrator\n"
+
+    def test_NOTES_locating_256_letter_project_id_launches_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        project_id = "p" * 256
+        (self.repo / "AGENTS.md").write_text(
+            f"<!-- Agent System entry for project {project_id}. -->\n")
+        self.git("add", "AGENTS.md")
+        self.git("commit", "-qm", "long project id")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    prompt = self.notes_launch(role, family)
+                    self.assertTrue(prompt.startswith(self.notes_prefix(role)))
+                    self.assertNotIn(self.NOTES_HEADING, prompt)
+                    self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_locating_file_or_unreadable_project_directories_launch_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        for relative in ("projects/demo", "projects"):
+            directory = self.private / relative
+            for kind in ("file", "unreadable"):
+                with self.subTest(relative=relative, kind=kind):
+                    saved = self.base / (directory.name + "-saved")
+                    mode = directory.stat().st_mode
+                    if kind == "file":
+                        directory.rename(saved)
+                        directory.write_text("Not a project directory.\n")
+                    else:
+                        directory.chmod(0)
+                    try:
+                        for role in ("builder", "verifier"):
+                            for family in ("codex", "claude"):
+                                with self.subTest(role=role, family=family):
+                                    prompt = self.notes_launch(role, family)
+                                    self.assertNotIn(self.NOTES_HEADING, prompt)
+                                    self.assertIn("Worker notes: none\n", self.out.read_text())
+                    finally:
+                        if kind == "file":
+                            directory.unlink()
+                            saved.rename(directory)
+                        else:
+                            directory.chmod(mode)
+
+    def test_NOTES_repair_plain_folder_launches_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        (self.repo / "AGENTS.md").unlink()
+        shutil.rmtree(self.repo / ".git")
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch("builder", family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("not a git repository", result.stderr)
+                record = json.loads(self.record.read_text())
+                expected = (self.notes_prefix("builder") + f'\nTemporary folder: {record["tmpdir"]}; '
+                            'removed when the session ends; create before or known-good checkouts as shared '
+                            'clones inside it (git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
+                self.assertEqual(record["stdin"], expected)
+                self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_plain_folder_with_entry_gets_project_notes(self):
+        contents = "## all\nShared environment fact.\n"
+        self.notes_project(contents)
+        shutil.rmtree(self.repo / ".git")
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                prompt = self.notes_launch("builder", family)
+                self.assertTrue(prompt.startswith(self.notes_prefix("builder")
+                                                  + self.NOTES_HEADING + contents))
+                self.assertIn("Worker notes: worker-notes.md; sections: all; words: 5\n",
+                              self.out.read_text())
+
+    def test_NOTES_repair_entry_read_failures_keep_warning_and_launch(self):
+        self.assertEqual(self.setup_project().returncode, 0)
+        entry = self.repo / "AGENTS.md"
+        original = entry.read_bytes()
+        notes = self.private / "projects/demo/worker-notes.md"
+        notes.write_text("## invalid\nMust not be read.\n")
+        for case in ("ValueError", "PermissionError", "undecodable", "missing", "directory"):
+            with self.subTest(case=case):
+                self.env.pop("PYTHONPATH", None)
+                entry.write_bytes(original)
+                if case in ("ValueError", "PermissionError"):
+                    self.inject_launcher(f'''
+import os
+from pathlib import Path
+original_open, original_path_open = os.open, Path.open
+def denied_open(path, *args, **kwargs):
+    if str(path) == {str(entry)!r}:
+        raise {case}("forced entry read failure")
+    return original_open(path, *args, **kwargs)
+def denied_path_open(path, *args, **kwargs):
+    if str(path) == {str(entry)!r}:
+        raise {case}("forced entry read failure")
+    return original_path_open(path, *args, **kwargs)
+os.open, Path.open = denied_open, denied_path_open
+''')
+                elif case == "undecodable":
+                    entry.write_bytes(b"\xff\n")
+                else:
+                    entry.unlink()
+                    if case == "directory":
+                        entry.mkdir()
+                try:
+                    result = self.launch()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if case in ("ValueError", "PermissionError"):
+                        self.assertEqual(result.stderr.splitlines(), [
+                            f"Warning: cannot check {entry}: forced entry read failure"])
+                    elif case == "undecodable":
+                        self.assertIn(f"Warning: cannot check {entry}:", result.stderr)
+                    else:
+                        self.assertEqual(result.stderr, "")
+                    self.assertNotIn(self.NOTES_HEADING, json.loads(self.record.read_text())["stdin"])
+                    self.assertIn("Worker notes: none\n", self.out.read_text())
+                finally:
+                    if entry.is_dir():
+                        entry.rmdir()
+
+    def test_NOTES_repair_entry_is_regular_unlinked_and_first_line_bounded(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        entry = self.repo / "AGENTS.md"
+        target = self.base / "outside-entry"
+        original = entry.read_bytes()
+        target.write_bytes(original)
+        for case in ("fifo", "symlink", "long first line"):
+            with self.subTest(case=case):
+                entry.unlink()
+                if case == "fifo":
+                    os.mkfifo(entry)
+                elif case == "symlink":
+                    entry.symlink_to(target)
+                else:
+                    entry.write_bytes(original.rstrip(b"\n") + b" " * 8192 + b"\n")
+                process = self.start_launcher(role="builder")
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertNotIn(self.NOTES_HEADING, json.loads(self.record.read_text())["stdin"])
+                self.assertIn("Worker notes: none\n", self.out.read_text())
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_NOTES_repair_hardlinked_notes_refuse_before_agent_starts(self):
+        path = self.notes_project()
+        alias = self.repo / "agent-editable-notes"
+        os.link(path, alias)
+        alias.write_text("## all\nAgent supplied text.\n")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assert_launch_refused(result, "link count is not 1")
+                    self.assertIn(str(path), result.stderr)
+        self.assertEqual(alias.read_text(), "## all\nAgent supplied text.\n")
+
+    def test_NOTES_S1_all_roles_families_baselines_and_warm_pool(self):
+        contents = "## all\nShared environment fact.\n"
+        self.notes_project(contents)
+        baseline = self.git("rev-parse", "HEAD~1")
+        for family in ("codex", "claude"):
+            for role, before in (("builder", None), ("verifier", "none"), ("verifier", baseline)):
+                self.env["XDG_CACHE_HOME"] = str(self.base / f"cache-{role}-{family}-{before}")
+                for warm in (False, True):
+                    with self.subTest(role=role, family=family, before=before, warm=warm):
+                        prompt = self.notes_launch(role, family, *(
+                            ("--before", before) if before else ()))
+                        self.assertTrue(prompt.startswith(self.notes_prefix(role) + self.NOTES_HEADING
+                                                          + contents), prompt)
+                        self.assertEqual(prompt.count(self.NOTES_HEADING), 1)
+                        self.assertIn("Worker notes: worker-notes.md; sections: all; words: 5\n",
+                                      self.out.read_text())
+                        if role == "verifier":
+                            self.assertIn("Checkout: pool ", self.out.read_text())
+                            self.assertIn("warm reset" if warm else "deep clean: new slot", self.out.read_text())
+                            if before == "none":
+                                self.assertIn("Before checkout: none (--before none)", prompt)
+                            else:
+                                self.assertIn(f"({baseline});", prompt)
+
+    def test_NOTES_S1_linked_worktree_and_role_specific_subdirectory_notes(self):
+        self.notes_project()
+        linked = self.base / "linked"
+        self.git("worktree", "add", "--detach", str(linked), "HEAD")
+        for repo in (self.repo, linked):
+            subdir = repo / "subdirectory"
+            subdir.mkdir()
+            for selected in (repo, subdir):
+                for role in ("builder", "verifier"):
+                    for family in ("codex", "claude"):
+                        with self.subTest(repo=selected, role=role, family=family):
+                            prompt = self.notes_launch(role, family, "--repo", selected)
+                            if selected == subdir and role == "builder":
+                                record = json.loads(self.record.read_text())
+                                expected = (self.notes_prefix(role)
+                                            + f'\nTemporary folder: {record["tmpdir"]}; '
+                                            'removed when the session ends; create before or known-good '
+                                            'checkouts as shared clones inside it '
+                                            '(git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
+                                self.assertEqual(prompt, expected)
+                                self.assertIn("Worker notes: none\n", self.out.read_text())
+                                continue
+                            self.assertIn(self.NOTES_HEADING + "## all\nShared environment fact.\n", prompt)
+                            self.assertIn("Worker notes: worker-notes.md; sections: all; words: 5\n",
+                                          self.out.read_text())
+
+    def test_NOTES_repo_name_ending_in_space_uses_own_project(self):
+        contents = "## all\nOwn project environment fact.\n"
+        self.notes_project(contents)
+        sibling = self.repo
+        self.repo = self.base / "repo "
+        sibling.rename(self.repo)
+        sibling.mkdir()
+        (sibling / "AGENTS.md").write_text("<!-- Agent System entry for project sibling. -->\n")
+        other_notes = self.private / "projects/sibling/worker-notes.md"
+        other_notes.parent.mkdir()
+        other_notes.write_text("## all\nSibling project environment fact.\n")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    prompt = self.notes_launch(role, family)
+                    self.assertIn(self.NOTES_HEADING + contents, prompt)
+                    self.assertNotIn("Sibling project environment fact.", prompt)
+                    self.assertIn("Worker notes: worker-notes.md; sections: all; words: 6\n",
+                                  self.out.read_text())
+
+    def test_NOTES_S2_section_intersections_and_family_ignore_model_names(self):
+        headings = ("ALL", "BuIlDeR", "verifier", "codex", "CLAUDE", "all builder codex",
+                    "verifier claude", "all\tVERIFIER\tCODEX", "builder verifier", "codex claude",
+                    "all builder claude", "verifier codex claude")
+        sections = [f"## {heading}\nunique_fact_{number}\n" for number, heading in enumerate(headings)]
+        self.notes_project("".join(sections))
+        self.env.update(AGENT_CODEX_MODEL="claude-other-model", AGENT_CLAUDE_MODEL="gpt-other-model")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    prompt = self.notes_launch(role, family)
+                    matching = [number for number, heading in enumerate(headings)
+                                if all(word in ("all", role, family) for word in heading.lower().split())]
+                    attached = "".join(sections[number] for number in matching)
+                    self.assertTrue(prompt.startswith(self.notes_prefix(role) + self.NOTES_HEADING + attached))
+                    for number in range(len(sections)):
+                        self.assertEqual(f"unique_fact_{number}\n" in prompt, number in matching)
+                    names = ", ".join(" ".join(headings[number].split()) for number in matching)
+                    self.assertIn(f"Worker notes: worker-notes.md; sections: {names}; "
+                                  f"words: {len(attached.split())}\n", self.out.read_text())
+                    header = self.out.read_text().split("\n\n", 1)[0]
+                    self.assertNotIn("\t", header)
+
+    def test_NOTES_S3_malformed_headings_and_preamble_refuse_both_roles(self):
+        path = self.notes_project()
+        cases = (("## environment\nFact.\n", "invalid section heading"),
+                 ("## all builder extra\nFact.\n", "invalid section heading"),
+                 ("## \nFact.\n", "invalid section heading"),
+                 ("Nonblank preamble\n## all\nFact.\n", "non-blank text before"),
+                 ("# Title\n## all\nFact.\n", "non-blank text before"),
+                 ("## claude\nHidden.\n## unknown\nAlso hidden.\n", "invalid section heading"))
+        for role in ("builder", "verifier"):
+            for contents, problem in cases:
+                with self.subTest(role=role, contents=contents):
+                    path.write_text(contents)
+                    result = self.launch(role, "codex", "--author-family", "claude")
+                    self.assert_launch_refused(result, problem)
+                    self.assertIn(str(path), result.stderr)
+
+    def test_NOTES_S3_whole_file_word_limit_includes_unselected_sections(self):
+        path = self.notes_project("## claude\n" + "word " * 399)
+        self.assert_launch_refused(self.launch(), "401 words exceeds the 400-word limit")
+        self.assertIn(str(path), self.out.read_text())
+        path.write_text("## all\n" + "word " * 398)
+        prompt = self.notes_launch()
+        self.assertIn(self.NOTES_HEADING, prompt)
+        self.assertIn("words: 400\n", self.out.read_text())
+
+    def test_NOTES_S3_private_path_forms_refuse_even_in_unselected_sections(self):
+        path = self.notes_project()
+        alias = self.home / "alias-private"
+        alias.symlink_to(self.private, target_is_directory=True)
+        for form in (str(alias), str(self.private), "~/private", "~/alias-private"):
+            for role in ("builder", "verifier"):
+                with self.subTest(form=form, role=role):
+                    path.write_text("## claude\n" + form + "\n")
+                    result = self.launch(role, "codex", "--author-family", "claude",
+                                         "--private", "~/alias-private")
+                    self.assert_launch_refused(result, "contains the private folder path")
+                    self.assertIn(str(path), result.stderr)
+
+    def test_NOTES_S3_nonregular_unreadable_and_non_utf8_files_refuse(self):
+        path = self.notes_project()
+        target = self.base / "outside-notes"
+        target.write_text("## all\nOutside content.\n")
+        for kind, problem in (("directory", "not a regular file"), ("symlink", "symbolic link"),
+                              ("dangling", "symbolic link"), ("fifo", "not a regular file"),
+                              ("unreadable", "Permission denied"), ("non-utf8", "utf-8")):
+            for role in ("builder", "verifier"):
+                with self.subTest(kind=kind, role=role):
+                    path.unlink()
+                    if kind == "directory":
+                        path.mkdir()
+                    elif kind in ("symlink", "dangling"):
+                        path.symlink_to(target if kind == "symlink" else self.base / "missing")
+                    elif kind == "fifo":
+                        os.mkfifo(path)
+                    else:
+                        path.write_bytes(b"\xff" if kind == "non-utf8" else b"## all\nFact.\n")
+                        if kind == "unreadable":
+                            path.chmod(0)
+                    try:
+                        result = self.launch(role, "codex", "--author-family", "claude")
+                        self.assert_launch_refused(result, problem)
+                        self.assertIn(str(path), result.stderr)
+                    finally:
+                        if kind == "directory":
+                            path.rmdir()
+                        else:
+                            path.unlink()
+                        path.write_text("## all\nFact.\n")
+        self.assertEqual(target.read_text(), "## all\nOutside content.\n")
+
+    def test_NOTES_S3_symlinked_project_directories_are_not_followed(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        for relative in ("projects/demo", "projects"):
+            with self.subTest(relative=relative):
+                directory = self.private / relative
+                saved = self.base / (directory.name + "-saved")
+                directory.rename(saved)
+                directory.symlink_to(saved, target_is_directory=True)
+                try:
+                    for role in ("builder", "verifier"):
+                        for family in ("codex", "claude"):
+                            with self.subTest(role=role, family=family):
+                                prompt = self.notes_launch(role, family)
+                                self.assertNotIn(self.NOTES_HEADING, prompt)
+                                self.assertIn("Worker notes: none\n", self.out.read_text())
+                finally:
+                    directory.unlink()
+                    saved.rename(directory)
+
+    def test_NOTES_S4_none_applied_header_and_wait(self):
+        self.notes_project("## builder claude\nOther environment.\n")
+        for role in ("builder", "verifier"):
+            with self.subTest(role=role):
+                prompt = self.notes_launch(role)
+                self.assertNotIn(self.NOTES_HEADING, prompt)
+                self.assertIn("Worker notes: worker-notes.md; none applied; words: 0\n", self.out.read_text())
+                waited = self.run_script("run.py", "--wait", self.out)
+                self.assertEqual(waited.returncode, 0, waited.stderr)
+                self.assertIn(": completed, exit 0,", waited.stdout)
+
+    def test_NOTES_S4_notes_refusals_never_count_as_verifier_rounds(self):
+        path = self.notes_project("## invalid\nRefuse.\n")
+        for _ in range(3):
+            self.assert_launch_refused(self.launch("verifier", "codex", "--author-family", "claude"),
+                                       "invalid section heading")
+        waited = self.run_script("run.py", "--wait", self.out)
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        self.assertIn(": launch refused, exit 2,", waited.stdout)
+        path.write_text("## all\nUsable environment.\n")
+        for _ in range(2):
+            result = self.launch("verifier", "codex", "--author-family", "claude")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Round:", self.out.read_text())
+        self.record.unlink()
+        self.assert_launch_refused(self.launch("verifier", "codex", "--author-family", "claude"),
+                                   "round-decision.md", set(self.scope_state.iterdir()))
+
+    def test_NOTES_S5_edits_and_removal_are_seen_at_next_launch(self):
+        path = self.notes_project("## all\nFirst distinctive fact.\n")
+        first = self.notes_launch()
+        self.assertIn("First distinctive fact.", first)
+        path.write_text("## all\nSecond distinctive fact.\n")
+        second = self.notes_launch()
+        self.assertIn("Second distinctive fact.", second)
+        self.assertNotIn("First distinctive fact.", second)
+        path.unlink()
+        third = self.notes_launch()
+        self.assertNotIn(self.NOTES_HEADING, third)
+        self.assertNotIn("distinctive fact", third)
+        self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_P1_absent_empty_unmatched_or_invalid_project_preserves_prompt(self):
+        path = self.notes_project()
+        # These traps would refuse if an invalid id escaped its project folder.
+        (self.private / "worker-notes.md").write_text("## invalid\n")
+        (self.private / "projects/worker-notes.md").write_text("## invalid\n")
+        entry = self.repo / "AGENTS.md"
+        for family in ("codex", "claude"):
+            for case in ("absent", "empty", "blank", "unmatched", "no entry", "foreign entry",
+                         "missing project", ".", "..", "../demo", "/demo", "bad id", "bad/id", "demo./escape"):
+                with self.subTest(case=case, family=family):
+                    entry.write_text("<!-- Agent System entry for project demo. -->\n")
+                    path.unlink(missing_ok=True)
+                    if case == "empty":
+                        path.write_text("")
+                    elif case == "blank":
+                        path.write_text(" \n\t\n")
+                    elif case == "unmatched":
+                        path.write_text("## verifier\nOther role.\n")
+                    elif case != "absent":
+                        path.write_text("## invalid\n")
+                        if case == "no entry":
+                            entry.unlink()
+                        elif case == "foreign entry":
+                            entry.write_text("# Foreign entry\n")
+                        else:
+                            project_id = "missing" if case == "missing project" else case
+                            entry.write_text(f"<!-- Agent System entry for project {project_id}. -->\n")
+                    prompt = self.notes_launch("builder", family)
+                    record = json.loads(self.record.read_text())
+                    expected = (self.notes_prefix("builder") + f'\nTemporary folder: {record["tmpdir"]}; '
+                                'removed when the session ends; create before or known-good checkouts as shared '
+                                'clones inside it (git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
+                    self.assertEqual(prompt, expected)
+
+    def test_NOTES_P1_verifier_prompt_is_unchanged_without_applicable_notes(self):
+        path = self.notes_project()
+        baseline = self.git("rev-parse", "HEAD~1")
+        candidate = self.git("rev-parse", "HEAD")
+        for family in ("codex", "claude"):
+            for before in ("none", baseline):
+                for contents in (None, "", "## builder\nOther role.\n"):
+                    with self.subTest(family=family, before=before, contents=contents):
+                        path.unlink(missing_ok=True)
+                        if contents is not None:
+                            path.write_text(contents)
+                        prompt = self.notes_launch("verifier", family, "--before", before)
+                        record = json.loads(self.record.read_text())
+                        header = dict(line.split(": ", 1) for line in self.out.read_text().split("\n\n", 1)[0]
+                                      .splitlines() if ": " in line)
+                        expected = (self.notes_prefix("verifier") + f"\nSnapshot commit: {candidate}\n"
+                                    f"Checkout: {header['Checkout']}\nUntracked files left out: none\n"
+                                    "The launcher checks afterwards that the candidate's tracked files, index and HEAD "
+                                    "are unchanged and fails the result otherwise.\n"
+                                    f"\nBefore checkout: {header['Before checkout']}\n")
+                        if before != "none":
+                            expected += "Use this writable checkout for the before state.\n"
+                        expected += (f"\nEvidence folder: {Path(record['tmpdir']).parent / 'evidence'}; "
+                                     "only this folder is kept; nothing else in the session folder is kept.\n"
+                                     f"\nTemporary folder: {record['tmpdir']}; removed when the session ends")
+                        expected += (".\n" if before == "none" else
+                                     '; create known-good checkouts as shared clones inside it '
+                                     '(git clone --quiet --shared --no-checkout . "$TMPDIR/known-good").\n')
+                        self.assertEqual(prompt, expected)
+
+    def test_NOTES_P2_other_roles_never_open_notes_and_keep_exact_prompts(self):
+        path = self.notes_project()
+        self.env.update(GIT_AUTHOR_DATE="2026-01-01T00:00:00Z", GIT_COMMITTER_DATE="2026-01-01T00:00:00Z")
+        # An audit hook sees both descriptor-based and ordinary Python file opens,
+        # including attempted reads whose errors the launcher catches.
+        self.inject_launcher('''
+import os, sys
+def opened(event, args):
+    if event == "open" and str(args[0]).endswith("worker-notes.md"):
+        os.write(2, b"NOTES OPENED\\n")
+        raise PermissionError("notes must not be opened")
+sys.addaudithook(opened)
+''')
+        for role, family, extra in (("reviewer", "codex", ()), ("reviewer", "claude", ()),
+                                    ("challenger", "codex", ()), ("challenger", "claude", ()),
+                                    ("investigator", "codex", ()), ("investigator", "claude", ()),
+                                    ("investigator", "claude", ("--web",))):
+            with self.subTest(role=role, family=family, extra=extra):
+                path.unlink(missing_ok=True)
+                prompts = []
+                for malformed in (False, True):
+                    if malformed:
+                        path.write_bytes(b"\xff malformed notes")
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex", *extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("NOTES OPENED", result.stderr)
+                    prompts.append(json.loads(self.record.read_text())["stdin"])
+                self.assertEqual(*prompts)
+                self.assertNotIn("Worker notes:", self.out.read_text())
+                if role == "investigator" and not extra:
+                    self.assertIn("Shield: none (investigator)\n", self.out.read_text())
+
+    def test_NOTES_P3_brief_and_writable_refusals_keep_precedence(self):
+        self.notes_project("## invalid\n")
+        self.brief.write_text(str(self.private))
+        for family in ("codex", "claude"):
+            self.assert_launch_refused(self.launch("builder", family), "brief contains the private folder path")
+        self.brief.write_text("bounded assignment\n")
+        self.assert_launch_refused(self.launch("builder", "codex", "--writable", self.private),
+                                   "unsafe --writable root")
+
+    def test_NOTES_P4_setup_preserves_existing_notes(self):
+        path = self.notes_project()
+        for contents in (b"## all\nPersonal environment facts.\n", b"\xff personal malformed notes"):
+            path.write_bytes(contents)
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            for _ in range(2):
+                result = self.setup_project()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_NOTES_S1_installed_launcher_uses_own_project_and_private_root(self):
+        other = self.home / "other-private"
+        roots = (self.private, other)
+        for root_number, root in enumerate(roots):
+            for project_id in ("demo", "second"):
+                path = root / "projects" / project_id / "worker-notes.md"
+                path.parent.mkdir(parents=True)
+                path.write_text(f"## all\nOnly_{root_number}_{project_id}\n")
+        for installed_root in roots:
+            result = self.setup_project("--private", installed_root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for project_id in ("demo", "second"):
+                (self.repo / "AGENTS.md").write_text(f"<!-- Agent System entry for project {project_id}. -->\n")
+                for explicit in (None, *roots):
+                    for family in ("codex", "claude"):
+                        with self.subTest(default=installed_root, project=project_id, explicit=explicit, family=family):
+                            result = subprocess.run(
+                                [sys.executable, str(self.method / "run.py"), "--role", "builder",
+                                 "--family", family, "--brief", str(self.brief), "--out", str(self.out),
+                                 "--repo", str(self.repo), *(["--private", str(explicit)] if explicit else [])],
+                                env=self.env, cwd=self.repo, text=True, capture_output=True)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            prompt = json.loads(self.record.read_text())["stdin"]
+                            expected = f"Only_{roots.index(explicit or installed_root)}_{project_id}"
+                            facts = re.findall(r"Only_\d_\w+", prompt)
+                            self.assertEqual(facts, [expected])
+                            self.assertIn("Worker notes: worker-notes.md; sections: all; words: 3\n",
+                                          self.out.read_text())
+
     def verifier(self, family="codex", *extra, expected_code=0):
         self.round_decision()
         result = self.launch("verifier", family, "--author-family",

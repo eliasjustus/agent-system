@@ -7,6 +7,7 @@ if sys.version_info < (3, 13):
 
 import argparse
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from functools import partial
 import fcntl
@@ -871,6 +872,75 @@ def check_entries(repo, method, private):
         diagnostic(f"Warning: {path} differs from the installed method; see {command}")
 
 
+def worker_notes(repo, private, private_forms, role, family):
+    """Read this launch's notes without following links out of the project folder."""
+    with ExitStack() as opened:
+        try:
+            fd = os.open(repo / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            opened.callback(os.close, fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return "", "none"
+            with os.fdopen(fd, "rb", closefd=False) as entry:
+                first = entry.readline(4097)
+            if len(first) > 4096:
+                return "", "none"
+            first = first.decode("utf-8")
+            match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
+            if not match or match[1] in (".", ".."):
+                return "", "none"
+            path = private / "projects" / match[1] / "worker-notes.md"
+            directory = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            opened.callback(os.close, directory)
+            for name in ("projects", match[1]):
+                directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=directory)
+                opened.callback(os.close, directory)
+        except (OSError, ValueError):
+            return "", "none"
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+            opened.callback(os.close, fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("not a regular file")
+            if info.st_nlink != 1:
+                raise ValueError("link count is not 1")
+            with os.fdopen(fd, encoding="utf-8", closefd=False) as notes:
+                contents = notes.read()
+        except FileNotFoundError:
+            return "", "none"
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValueError(f"{path}: {error}") from error
+    if any(form in contents for form in private_forms):
+        raise ValueError(f"{path}: contains the private folder path")
+    words = len(contents.split())
+    if words > 400:
+        raise ValueError(f"{path}: {words} words exceeds the 400-word limit")
+    sections, headings = [], []
+    selected = False
+    seen_heading = False
+    for line in contents.splitlines(keepends=True):
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            readers = heading.lower().split()
+            if not readers or any(word not in ("all", "builder", "verifier", "codex", "claude")
+                                  for word in readers):
+                raise ValueError(f"{path}: invalid section heading {heading!r}")
+            seen_heading = True
+            selected = all(word in ("all", role, family) for word in readers)
+            if selected:
+                headings.append(" ".join(heading.split()))
+        elif not seen_heading and line.strip():
+            raise ValueError(f"{path}: non-blank text before the first ## heading")
+        if selected:
+            sections.append(line)
+    attached = "".join(sections)
+    summary = (f"{path.name}; sections: {', '.join(headings)}; words: {len(attached.split())}"
+               if headings else f"{path.name}; none applied; words: 0")
+    return attached, summary
+
+
 def review_leave_out(repo, private, head, snapshot):
     path = repo / "AGENTS.md"
     try:
@@ -1662,7 +1732,10 @@ def launch(parser, args, result):
     candidate, before_commit, untracked = "", "", []
     if args.role == "verifier":
         try:
-            repo = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+            # Not git(): it strips whitespace that can end a folder's name.
+            top = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
+                                           "rev-parse", "--show-toplevel"])
+            repo = Path(os.fsdecode(top.removesuffix(b"\n"))).resolve()
             candidate = git(repo, "rev-parse", "--verify", "HEAD^{commit}")
         except subprocess.CalledProcessError:
             parser.error("commit first: verifier requires a committed candidate")
@@ -1730,12 +1803,20 @@ def launch(parser, args, result):
         private_forms.add("~/" + str(private.relative_to(Path.home())))
     if shielded and any(path in brief for path in private_forms):
         parser.error("brief contains the private folder path")
+    notes, notes_header = "", ""
+    if args.role in ("builder", "verifier"):
+        notes, summary = worker_notes(repo, private, private_forms, args.role, args.family)
+        notes_header = f"Worker notes: {header_value(summary)}\n"
+        result.header += notes_header
     method = args.method.expanduser().resolve()
     check_entries(repo, args.method, args.private)
     prompt = (method / "roles" / f"{args.role}.md").read_text()
     if args.role == "verifier":
         prompt += "\n" + (method / "guides/verification.md").read_text()
     prompt += "\n---\n" + brief
+    if notes:
+        prompt += ("\n## Project notes for this session's environment, supplied by the orchestrator\n"
+                   + notes)
     model = (os.environ.get(f"AGENT_{args.family.upper()}_MODEL")
              or ("claude-opus-5-5" if args.family == "claude" else "gpt-6.1-sol"))
     executable = os.environ.get(f"AGENT_{args.family.upper()}_CMD") or args.family
@@ -1858,6 +1939,7 @@ def launch(parser, args, result):
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
                              + round_header
+                             + notes_header
                              + f"Executable: {header_value(executable)}\n"
                              + f"Shield: {shield}\n"
                              + ("Web access: requested\n" if args.web else "")

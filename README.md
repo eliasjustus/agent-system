@@ -466,6 +466,28 @@ Other roles retain their existing integration settings, including external MCP s
 builders, verifiers and investigators.
 Give checking sessions only the brief, role contract and evidence they need.
 
+### Project worker notes
+
+Put facts about what a worker's sandbox cannot do and the working alternative in
+`<private>/projects/<id>/worker-notes.md`. The launcher reads the project ID from the first line
+of `AGENTS.md` in the folder given as `--repo` (for a verifier, the root of that checkout). It
+reads notes anew for each builder and verifier launch and appends matching sections after the
+brief, under a fixed heading identifying the orchestrator as their supplier.
+Other roles do not read this file.
+
+Use `## all`, `## builder`, `## verifier`, `## codex`, `## claude`, or combinations such as
+`## builder codex`. Headings are case insensitive; every role or family word must match the
+session, while `all` matches everyone. The family comes from `--family`, independently of model
+names. Keep the whole file within 400 whitespace-separated words, including headings, with no
+non-blank text before the first section. Do not name the private folder's path in the notes.
+A malformed file refuses builder and verifier launches with exit 2 and `Result: launch refused`;
+notes must be readable UTF-8 regular files with a single hard link; a symlinked notes file refuses.
+If the project cannot be located or its folder path cannot be opened without following symlinks,
+the launch proceeds without notes.
+Missing or empty notes, or no matching sections, leave the prompt unchanged. The single-line
+`Worker notes:` result field records the file, selected headings and attached word count, or
+that none applied. Running setup again preserves existing notes.
+
 For a committed candidate, the manual route is a detached worktree at its exact commit:
 
 ```sh
