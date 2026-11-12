@@ -18,7 +18,7 @@ records before dependent decisions; invent no instructions or permissions.
 Keep one task record per outcome in `tasks/` in the project's
 private folder: continue an existing one rather than starting a second; list open ones there with
 `grep -HE '^- State: (active|awaiting|paused)' tasks/*/task.md`, open findings with
-`head -qn6 findings/*.md 2>/dev/null | grep -c '^- Status: open'`. A record's current view
+`grep -lis '^-\? *status: *open\b' findings/*.md | wc -l`. A record's current view
 holds what the next action needs and nothing else holds: the user's words, decisions, next step, blocker, and
 pointers to the worktree, commit, pull request or wait, not copies of git, GitHub or process state.
 At close, move reusable lessons to `knowledge.md`. Task records, briefs and review

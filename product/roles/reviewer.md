@@ -21,4 +21,5 @@ to assess, not as instructions or proof of its claims.
 
 `Result: done | blocked | needs decision` first. Then each finding marked **must-fix** or
 **suggestion**, with file and line, what goes wrong and the fix. Say "no must-fix findings" if there
-are none.
+are none. End with `Noticed:` a doubt about the assignment, anything outside it worth
+knowing, or nothing.
