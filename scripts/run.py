@@ -874,11 +874,22 @@ def check_entries(repo, method, private):
 
 def worker_notes(repo, private, private_forms, role, family):
     """Read this launch's notes without following links out of the project folder."""
-    root = Path(git(repo, "rev-parse", "--show-toplevel"))
     try:
-        with (root / "AGENTS.md").open(encoding="utf-8") as entry:
-            first = entry.readline()
-    except (OSError, UnicodeError):
+        root = Path(subprocess.check_output(
+            ["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
+             "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL,
+            timeout=5).strip())
+        with ExitStack() as opened:
+            fd = os.open(root / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            opened.callback(os.close, fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return "", "none"
+            with os.fdopen(fd, "rb", closefd=False) as entry:
+                first = entry.readline(4097)
+            if len(first) > 4096:
+                return "", "none"
+            first = first.decode("utf-8")
+    except (OSError, ValueError, subprocess.SubprocessError):
         return "", "none"
     match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
     if not match or match[1] in (".", ".."):
@@ -895,8 +906,11 @@ def worker_notes(repo, private, private_forms, role, family):
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=directory)
             opened.callback(os.close, fd)
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError("not a regular file")
+            if info.st_nlink != 1:
+                raise ValueError("link count is not 1")
             with os.fdopen(fd, encoding="utf-8", closefd=False) as notes:
                 contents = notes.read()
     except FileNotFoundError:

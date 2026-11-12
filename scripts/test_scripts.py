@@ -353,6 +353,104 @@ class ScriptsTest(unittest.TestCase):
 
     NOTES_HEADING = "\n## Project notes for this session's environment, supplied by the orchestrator\n"
 
+    def test_NOTES_repair_plain_folder_launches_without_notes(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        shutil.rmtree(self.repo / ".git")
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                result = self.launch("builder", family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("not a git repository", result.stderr)
+                record = json.loads(self.record.read_text())
+                expected = (self.notes_prefix("builder") + f'\nTemporary folder: {record["tmpdir"]}; '
+                            'removed when the session ends; create before or known-good checkouts as shared '
+                            'clones inside it (git clone --quiet --shared --no-checkout . "$TMPDIR/before").\n')
+                self.assertEqual(record["stdin"], expected)
+                self.assertIn("Worker notes: none\n", self.out.read_text())
+
+    def test_NOTES_repair_entry_read_failures_keep_warning_and_launch(self):
+        self.assertEqual(self.setup_project().returncode, 0)
+        entry = self.repo / "AGENTS.md"
+        original = entry.read_bytes()
+        notes = self.private / "projects/demo/worker-notes.md"
+        notes.write_text("## invalid\nMust not be read.\n")
+        for case in ("ValueError", "PermissionError", "undecodable", "missing", "directory"):
+            with self.subTest(case=case):
+                self.env.pop("PYTHONPATH", None)
+                entry.write_bytes(original)
+                if case in ("ValueError", "PermissionError"):
+                    self.inject_launcher(f'''
+import os
+from pathlib import Path
+original_open, original_path_open = os.open, Path.open
+def denied_open(path, *args, **kwargs):
+    if str(path) == {str(entry)!r}:
+        raise {case}("forced entry read failure")
+    return original_open(path, *args, **kwargs)
+def denied_path_open(path, *args, **kwargs):
+    if str(path) == {str(entry)!r}:
+        raise {case}("forced entry read failure")
+    return original_path_open(path, *args, **kwargs)
+os.open, Path.open = denied_open, denied_path_open
+''')
+                elif case == "undecodable":
+                    entry.write_bytes(b"\xff\n")
+                else:
+                    entry.unlink()
+                    if case == "directory":
+                        entry.mkdir()
+                try:
+                    result = self.launch()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if case in ("ValueError", "PermissionError"):
+                        self.assertEqual(result.stderr.splitlines(), [
+                            f"Warning: cannot check {entry}: forced entry read failure"])
+                    elif case == "undecodable":
+                        self.assertIn(f"Warning: cannot check {entry}:", result.stderr)
+                    else:
+                        self.assertEqual(result.stderr, "")
+                    self.assertNotIn(self.NOTES_HEADING, json.loads(self.record.read_text())["stdin"])
+                    self.assertIn("Worker notes: none\n", self.out.read_text())
+                finally:
+                    if entry.is_dir():
+                        entry.rmdir()
+
+    def test_NOTES_repair_entry_is_regular_unlinked_and_first_line_bounded(self):
+        self.notes_project("## invalid\nMust not be read.\n")
+        entry = self.repo / "AGENTS.md"
+        target = self.base / "outside-entry"
+        original = entry.read_bytes()
+        target.write_bytes(original)
+        for case in ("fifo", "symlink", "long first line"):
+            with self.subTest(case=case):
+                entry.unlink()
+                if case == "fifo":
+                    os.mkfifo(entry)
+                elif case == "symlink":
+                    entry.symlink_to(target)
+                else:
+                    entry.write_bytes(original.rstrip(b"\n") + b" " * 8192 + b"\n")
+                process = self.start_launcher(role="builder")
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertNotIn(self.NOTES_HEADING, json.loads(self.record.read_text())["stdin"])
+                self.assertIn("Worker notes: none\n", self.out.read_text())
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_NOTES_repair_hardlinked_notes_refuse_before_agent_starts(self):
+        path = self.notes_project()
+        alias = self.repo / "agent-editable-notes"
+        os.link(path, alias)
+        alias.write_text("## all\nAgent supplied text.\n")
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    result = self.launch(role, family, "--author-family",
+                                         "claude" if family == "codex" else "codex")
+                    self.assert_launch_refused(result, "link count is not 1")
+                    self.assertIn(str(path), result.stderr)
+        self.assertEqual(alias.read_text(), "## all\nAgent supplied text.\n")
+
     def test_NOTES_S1_all_roles_families_baselines_and_warm_pool(self):
         contents = "## all\nShared environment fact.\n"
         self.notes_project(contents)
