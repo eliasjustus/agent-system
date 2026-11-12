@@ -567,13 +567,14 @@ os.open, Path.open = denied_open, denied_path_open
         other_notes = self.private / "projects/sibling/worker-notes.md"
         other_notes.parent.mkdir()
         other_notes.write_text("## all\nSibling project environment fact.\n")
-        for family in ("codex", "claude"):
-            with self.subTest(family=family):
-                prompt = self.notes_launch("builder", family)
-                self.assertIn(self.NOTES_HEADING + contents, prompt)
-                self.assertNotIn("Sibling project environment fact.", prompt)
-                self.assertIn("Worker notes: worker-notes.md; sections: all; words: 6\n",
-                              self.out.read_text())
+        for role in ("builder", "verifier"):
+            for family in ("codex", "claude"):
+                with self.subTest(role=role, family=family):
+                    prompt = self.notes_launch(role, family)
+                    self.assertIn(self.NOTES_HEADING + contents, prompt)
+                    self.assertNotIn("Sibling project environment fact.", prompt)
+                    self.assertIn("Worker notes: worker-notes.md; sections: all; words: 6\n",
+                                  self.out.read_text())
 
     def test_NOTES_S2_section_intersections_and_family_ignore_model_names(self):
         headings = ("ALL", "BuIlDeR", "verifier", "codex", "CLAUDE", "all builder codex",

@@ -470,9 +470,9 @@ Give checking sessions only the brief, role contract and evidence they need.
 
 Put facts about what a worker's sandbox cannot do and the working alternative in
 `<private>/projects/<id>/worker-notes.md`. The launcher reads the project ID from the first line
-of `AGENTS.md` in the folder given as `--repo`. It reads notes anew for each builder and verifier
-launch and appends matching sections after the brief, under a fixed heading identifying the
-orchestrator as their supplier.
+of `AGENTS.md` in the folder given as `--repo` (for a verifier, the root of that checkout). It
+reads notes anew for each builder and verifier launch and appends matching sections after the
+brief, under a fixed heading identifying the orchestrator as their supplier.
 Other roles do not read this file.
 
 Use `## all`, `## builder`, `## verifier`, `## codex`, `## claude`, or combinations such as

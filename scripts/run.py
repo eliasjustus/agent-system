@@ -1732,7 +1732,10 @@ def launch(parser, args, result):
     candidate, before_commit, untracked = "", "", []
     if args.role == "verifier":
         try:
-            repo = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+            # Not git(): it strips whitespace that can end a folder's name.
+            top = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *GIT_CONFIG,
+                                           "rev-parse", "--show-toplevel"])
+            repo = Path(os.fsdecode(top.removesuffix(b"\n"))).resolve()
             candidate = git(repo, "rev-parse", "--verify", "HEAD^{commit}")
         except subprocess.CalledProcessError:
             parser.error("commit first: verifier requires a committed candidate")
