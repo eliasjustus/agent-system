@@ -34,9 +34,9 @@ runners and merge queue; then complexity and upkeep.
 
 1. **Cap the rounds, not the clock.** Write a time range for any task bigger than a quick answer in
    the task record, for the delivery's cost line; times in a task record are UTC read from `date -u`.
-   A candidate gets at most three rounds of check and repair: before the third, write the round
-   decision (`guides/recovery.md`); after a third failed round, end that repair sequence by
-   narrowing the scope or redesigning, recorded and named in the delivery, or report the blocker.
+   A candidate gets at most two verifications: after a second failed one, end that repair
+   sequence (`guides/recovery.md`) by narrowing the scope or redesigning, recorded and named in
+   the delivery, or report the blocker.
    Stop and wait for the user only when going on needs a decision that "Deciding" reserves for
    them, or adds load on something shared they use (CI, this machine while they work).
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
@@ -88,7 +88,8 @@ Answer each yes, no or unknown with the file or behavior that decides it, never 
 Unresolved consequential uncertainty means above. File count, wording and research alone never do.
 Decide again when an analysis turns into building or a repair touches saved state.
 
-**Above:** settled scenarios, a challenger, a separate builder, verification on the real system;
+**Above:** settled scenarios, a challenger, checks written before the build, a separate builder,
+verification on the real system;
 skipping one is a departure, recorded with its reason and named in the delivery. The real system
 means the changed behavior used as it is used for real, through its real interface and processes;
 a test suite that stands in for them is a narrower check, not this. **Below:** a short contract, a builder or your own edit, and one

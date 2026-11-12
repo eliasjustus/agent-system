@@ -29,16 +29,15 @@ symptom, and only the latest failure output. Earlier outputs stay in the task's 
 the baseline's behavior is shown to meet the settled scenarios for the failing part, the plan
 returns that part to it; new machinery needs a scenario the baseline cannot meet, named in the plan. When a
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
-cases to the scenarios before the repair, and have the builder exercise them before handing back,
-rather than letting verification find them one at a time.
+cases to the scenarios and the checks before the repair.
 
-After two verifier launches into one results folder (the `--out` directory), the launcher refuses
-another unless `round-decision.md` there is newer than the newest counted result. Write one of:
-the table of cases for the failure class, with the expected result per case and what must keep
-working; a re-scope or redesign, with its reason, named in the delivery; or a retry with its reason
-(environment, contention, flaky check). The launcher checks the file, not the decision's contents
-(what counts: the Agent System README).
-Each later verification needs a newer decision. Give each repair sequence its own results folder.
+A second failed verification ends the repair sequence: redesign or narrow the scope, with its
+reason, named in the delivery, and have new checks written first; or report the blocker. A failure
+of the environment, contention or a flaky check is not a failed verification: retry, with the
+reason. The launcher refuses a third verifier launch into one results folder (the `--out`
+directory) unless `round-decision.md` there, holding that decision, is newer than the newest
+counted result. It checks the file, not the decision's contents (what counts: the Agent System
+README). Each later verification needs a newer decision.
 
 After a repair, independently rerun the reproducer, the affected must-not-break checks and the required
 checks on the repaired candidate. Close a finding with recheck evidence or with evidence it was
@@ -48,13 +47,12 @@ mistaken.
 
 A changed hypothesis, a restored prerequisite or an uncertainty to resolve. One cheap retry of a
 plausibly transient failure is fine; keep both results. Repeated identical failures call for a
-different method, not more retries. A third failed round ends the repair sequence (the entry's
-round cap).
+different method, not more retries.
 
 ## Continue or stop
 
 Ordinary technical recovery needs no approval. If recovery cannot finish now, write down the blocker
 and what would let it resume, and deliver a reviewable candidate or a verified subset with its
 known gaps. Reducing scope is your decision, recorded with its reason and named in the delivery as a
-limit; it never turns missing verification into a pass. The round cap never relaxes
+limit; it never turns missing verification into a pass. The cap on verifications never relaxes
 an invariant or a scenario: stop and report instead.

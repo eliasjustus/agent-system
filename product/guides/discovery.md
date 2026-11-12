@@ -31,6 +31,7 @@ Draft them yourself, never the builder.
   updates, restart, recovery and removal.
 - Mark each **deliver** or **must not break**. Must not break is only for behavior that works today.
 - Then run the challenger (`guides/handover.md`) and adopt or reject each of its cases with a reason.
+- Then have the checks written, before the build (`guides/handover.md`).
 
 ## Tell the user once, then proceed
 

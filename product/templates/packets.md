@@ -23,8 +23,9 @@ Outcome: <one sentence>
 Scenarios or contract: <the agreed list, IDs and text>
 Design: <the decision, two to four sentences>
 Assignment: <exactly what to change, and where>
-Acceptance checks: <commands or observations, with expected results; for a repair, the failing
-check's route, or why the builder cannot run it>
+Acceptance checks: <the checks written first, where they are and how to run them; otherwise
+commands or observations, with expected results; for a repair, the failing check's route, or why
+the builder cannot run it>
 Estimate: <time range>
 Come back if: <task-specific conditions>
 Proven failures: <approaches an earlier builder proved fail, or none>
@@ -63,10 +64,13 @@ Deliver: <IDs and text>
 Must not break: <IDs and text>
 Candidate: <committed candidate>   Baseline: <commit, or none>
 Start the system: <commands, ports, data>
+Checks written first: <your kept copy and how to run it, or none>
 Evidence folder: named by the launcher
 ```
 
-Never add the builder's report, rationale or an explanation of the diff.
+Never add the builder's report, rationale or an explanation of the diff. To have the checks
+written first, give the baseline as the candidate, no baseline, and the line `Nothing is built
+yet: write the checks (contract: Checks first).`
 
 ## Reviewer
 

@@ -28,6 +28,14 @@ so in your report rather than guessing.
 - Count a check that did not run, was skipped or only exists as configuration as a pass. A permission
   failure is unverified, with the refused operation named.
 
+## Checks first
+
+If your brief says nothing is built yet, the baseline is your candidate. Write one runnable check
+per scenario, through the real interface, and for the cases the list missed. Show deliver checks
+failing for the reason under test and must-not-break checks passing. Save them in your evidence
+folder with one command that runs all. Report the table, your added cases and each scenario you
+could write no check for.
+
 ## Return
 
 `Result: done | blocked | needs decision` first, then the table and verdict from the verification
