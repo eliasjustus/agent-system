@@ -31,8 +31,9 @@ returns that part to it; new machinery needs a scenario the baseline cannot meet
 failure belongs to a class of cases (a race, a late or stale reply, a reload), add its neighbouring
 cases to the scenarios and the checks before the repair.
 
-A second failed verification ends the repair sequence: redesign or narrow the scope, with its
-reason, named in the delivery, and have new checks written first; or report the blocker. A failure
+A second failed verification ends the repair sequence, and a table of cases does not continue it:
+redesign or narrow the scope, with its reason, named in the delivery, and have new checks written
+first; or report the blocker. A failure
 of the environment, contention or a flaky check is not a failed verification: retry, with the
 reason. The launcher refuses a third verifier launch into one results folder (the `--out`
 directory) unless `round-decision.md` there, holding that decision, is newer than the newest

@@ -33,8 +33,8 @@ so in your report rather than guessing.
 If your brief says nothing is built yet, the baseline is your candidate. Write one runnable check
 per scenario, through the real interface, and for the cases the list missed. Show deliver checks
 failing for the reason under test and must-not-break checks passing. Save them in your evidence
-folder with one command that runs all. Report the table, your added cases and each scenario you
-could write no check for.
+folder with one command that runs all. Passing on a candidate and the verdict do not apply:
+report the table, your added cases and each scenario you could write no check for.
 
 ## Return
 
