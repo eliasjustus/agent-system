@@ -46,7 +46,7 @@ Result: done | blocked | needs decision
 Changed: <files>
 Checks: <command> -> <real result>, one line each
 Open: <questions, risks, anything not done>
-Noticed: <outside the assignment, or nothing>
+Noticed: <a doubt about the assignment, anything outside it, or nothing>
 ```
 
 Report what you observed, not what you expect.

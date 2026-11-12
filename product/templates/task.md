@@ -9,7 +9,7 @@
 - State: active  <!-- active | awaiting verdict | paused: <reason>; resume when <condition> | closed: <signed off by the request | accepted | abandoned | superseded by <id>> -->
 - Depth: undecided  <!-- above | below, with the three answers below -->
 - Owner: <session, date>
-- Estimate: <time range>; started <UTC time from date -u>  <!-- actual effort is added at close -->
+- Estimate: <time range>; started <UTC time from date -u>
 - Plan:
 - Now:
 - Next:
@@ -43,7 +43,7 @@ Settled: pending  <!-- date; date the user was told; any reply word for word -->
 
 ## Decisions
 
-<!-- Dated lines: design decision with the rejected alternative, user choices and their exact words, depth changes, challenger
+<!-- Dated lines: design decision with the rejected alternative and its reason, user choices and their exact words, depth changes, challenger
 cases adopted or rejected. -->
 
 ## Assignments
@@ -64,4 +64,4 @@ cases adopted or rejected. -->
 
 ## Log
 
-<!-- Dated events a successor needs, not narration. Keep the current view up to date. -->
+<!-- Dated events a successor needs, not narration. -->
