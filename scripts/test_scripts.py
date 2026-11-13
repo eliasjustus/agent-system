@@ -11383,5 +11383,84 @@ class MethodSizeTest(unittest.TestCase):
                              f"method text has {words} words, budget {self.BUDGET}: replace or remove "
                              "text for what you add, or raise BUDGET with the reason in the pull request")
 
+
+class CountTest(unittest.TestCase):
+    def run_count(self, tasks):
+        script = Path(__file__).with_name("count.py")
+        done = subprocess.run([sys.executable, str(script), str(tasks), "--json"],
+                              capture_output=True, text=True, check=True)
+        return {row["task"]: row for row in json.loads(done.stdout)}
+
+    def write(self, path, role, body, end="2026-01-01T01:30:00+00:00"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"Role: {role}\nFamily: codex\nStart UTC: 2026-01-01T00:00:00+00:00\n"
+                        f"End UTC: {end}\nExit code: 0\n\n{body}\n")
+
+    def test_COUNT_sessions_results_verdicts_and_cost_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tasks = Path(temporary)
+            one = tasks / "001"
+            self.write(one / "results/builder-1.md", "builder", "Result: blocked\n\nNo access.")
+            self.write(one / "results/builder-2.md", "builder", "Result: done")
+            self.write(one / "results/verifier-1.md", "verifier",
+                       "Result: done\n\nVerdict: pass on S1 alone\n\n**Verdict: fail** S2")
+            self.write(one / "results/verifier-2.md", "verifier", "Result: done\n\nIt passes.")
+            self.write(one / "results/v-evidence/fixture.md", "builder", "Result: done")
+            (one / "results/notes.md").write_text("Role: builder\nno start line\n")
+            (one / "task.md").write_text("# t\n- Cost: estimate 1 h, actual 2 h\n")
+            (tasks / "002").mkdir()
+            (tasks / "002/task.md").write_text("# nothing to count\n")
+            outside = tasks.parent / (tasks.name + "-outside.md")
+            self.write(outside, "builder", "Result: done")
+            self.addCleanup(outside.unlink)
+            (one / "results/link.md").symlink_to(outside)
+            os.mkfifo(one / "results/pipe.md")
+            (one / "results/builder-3.md").write_text(
+                "Role: builder\nStart UTC: 2026-01-01T00:00:00+00:00\nResult: interrupted\n"
+                "End UTC: 2026-01-01T01:00:00+00:00\nExit code: 130\n")
+            self.write(one / "results/verifier-3.md", "verifier", "Result: done\n\nVerdict: fail\n"
+                       + "y" * 999_900 + " then\nnot a line Verdict: pass " + "z" * 2_500_000)
+            self.write(one / "results/archive.txt", "challenger", "Result: done")
+            self.write(one / "results/big.md", "verifier",
+                       "Result: done\n" + "x" * 3_000_000 + "\n**Verdict**: **inconclusive**",
+                       end="2026-01-01T01:30:00")
+            self.write(one / "results/template.md", "verifier",
+                       "Result: done\n\n`Verdict: pass | fail | inconclusive`")
+            (one / "briefs").mkdir()
+            (one / "briefs/b.md").write_text("Example:\n```\nRole: builder\nStart UTC: 2026-01-01T00:00:00+00:00\n\nResult: done\n```\n")
+            self.write(one / "results/builder-2.log", "builder", "Result: done")
+            rows = self.run_count(tasks)
+        self.assertEqual(list(rows), ["001"])
+        roles = rows["001"]["roles"]
+        self.assertEqual(roles["builder"]["sessions"], 3)
+        self.assertEqual(roles["builder"]["results"], {"blocked": 1, "done": 1, "interrupted": 1})
+        self.assertAlmostEqual(roles["builder"]["hours"], 4.0)
+        self.assertEqual(roles["verifier"]["verdicts"], {"fail": 2, "inconclusive": 1, "none": 2})
+        self.assertEqual(roles["verifier"]["sessions"], 5)
+        self.assertAlmostEqual(roles["verifier"]["hours"], 6.0)
+        self.assertEqual(roles["challenger"]["sessions"], 1)
+        self.assertEqual(rows["001"]["cost"], "estimate 1 h, actual 2 h")
+
+    def test_COUNT_file_over_the_whole_read_limit_keeps_result_and_drops_verdict(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        self.addCleanup(sys.path.remove, str(Path(__file__).parent))
+        import count
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(count, "WHOLE", 2_000_000):
+            path = Path(temporary) / "verifier-1.md"
+            self.write(path, "verifier", "Result: done\n\nVerdict: fail\n" + "y" * 999_900
+                       + " then\nnot a line Verdict: pass " + "z" * 2_500_000)
+            found = count.session(count.read(path))
+        self.assertEqual((found["result"], found["verdict"], found["hours"]), ("done", "fail", 1.5))
+
+    def test_COUNT_running_session_counts_without_hours(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tasks = Path(temporary)
+            path = tasks / "003/results/reviewer-1.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("Role: reviewer\nStart UTC: 2026-01-01T00:00:00+00:00\nResult: running\n")
+            rows = self.run_count(tasks)
+        self.assertEqual(rows["003"]["roles"]["reviewer"],
+                         {"sessions": 1, "hours": 0.0, "results": {"running": 1}, "verdicts": {}})
+
 if __name__ == "__main__":
     unittest.main()
