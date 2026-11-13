@@ -846,6 +846,195 @@ sys.addaudithook(opened)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def hide_project(self, *lines):
+        self.notes_project()
+        self.hidden = self.home / "held out ä"
+        (self.hidden / "inner").mkdir(parents=True)
+        (self.hidden / "canary").write_text("held-out canary")
+        self.listfile = self.private / "projects/demo/hidden-folders.txt"
+        self.listfile.write_text("".join(f"{line}\n" for line in lines or (self.hidden,)), encoding="utf-8")
+
+    def hide_launch(self, role="builder", family="codex", *extra):
+        """Launch and return (result, header, the denied or mounted paths the agent was started with)."""
+        self.record.unlink(missing_ok=True)
+        wrapped = Path(str(self.record) + ".bwrap")
+        wrapped.unlink(missing_ok=True)
+        if role == "verifier":
+            self.round_decision()
+        result = self.launch(role, family, "--author-family",
+                             "codex" if family == "claude" else "claude", *extra)
+        header = self.out.read_text().split("\n\n", 1)[0]
+        if not self.record.exists():
+            return result, header, None
+        argv = json.loads(self.record.read_text())["argv"]
+        if family == "codex":
+            setting = next((item for item in argv if item.startswith("permissions.am-shield.filesystem=")), "")
+            policy = set(tomllib.loads(setting).get("permissions", {}).get("am-shield", {}).get("filesystem", {}))
+        else:
+            policy = set(json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"])
+            for line in wrapped.read_text().splitlines() if wrapped.exists() else ():
+                call = json.loads(line)["argv"]
+                policy.add(("mounts", tuple(zip(call, call[1:]))))
+        return result, header, policy
+
+    def assert_hidden(self, family, policy, folder, hidden=True):
+        folder = str(folder)
+        if family == "codex":
+            self.assertEqual(folder in policy, hidden, policy)
+            return
+        mounts = [item[1] for item in policy if isinstance(item, tuple)]
+        self.assertTrue(mounts)
+        for rule in (f"Read(/{folder}/**)", f"Edit(/{folder}/**)"):
+            self.assertEqual(rule in policy, hidden, policy)
+        for pairs in mounts:  # the probe and the session
+            self.assertEqual(("--tmpfs", folder) in pairs, hidden)
+            self.assertEqual(("--remount-ro", folder) in pairs, hidden)
+
+    def test_HIDE_listed_folders_are_hidden_from_builder_challenger_and_reviewer_only(self):
+        second = self.home / "second"
+        second.mkdir()
+        (self.home / "alias").symlink_to(second, target_is_directory=True)
+        self.hide_project("  # a comment", "", "  ~/held out ä  ", self.home / "held out ä/inner",
+                          self.home / "alias", second, second)
+        for family in ("codex", "claude"):
+            for role in ("builder", "challenger", "reviewer", "verifier", "investigator"):
+                with self.subTest(family=family, role=role):
+                    result, header, policy = self.hide_launch(role, family)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    applies = role in ("builder", "challenger", "reviewer")
+                    # Each folder once by its resolved path, of nested ones the outermost.
+                    line = f"Hidden folders: {self.hidden}, {second}".replace("ä", "\\xe4")  # as headers escape
+                    self.assertEqual(line in header.splitlines(), applies, header)
+                    self.assertEqual("Hidden folders:" in header, applies)
+                    if role != "investigator":
+                        self.assertEqual(self.private in map(Path, policy) if family == "codex"
+                                         else f"Read(/{self.private}/**)" in policy, True)
+                    if role == "investigator" and family == "claude":
+                        continue  # no shield at all: nothing to look for
+                    for folder in (self.hidden, second):
+                        self.assert_hidden(family, policy, folder, applies)
+                    self.assert_hidden(family, policy, self.home / "alias", False)
+                    self.assert_hidden(family, policy, self.hidden / "inner", False)
+
+    def test_HIDE_real_bubblewrap_shows_an_empty_folder_also_through_a_link(self):
+        real = shutil.which("bwrap")
+        probe = real and subprocess.run([real, "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
+                                         "--proc", "/proc", "--", "/usr/bin/true"], capture_output=True)
+        if not real or probe.returncode:
+            self.skipTest("no bubblewrap that may create a namespace here")
+        self.hide_project()
+        (self.bin / "bwrap").unlink()
+        (self.bin / "bwrap").symlink_to(real)
+        (self.bin / "true").symlink_to("/usr/bin/true")
+        link = self.home / "link"
+        link.symlink_to(self.hidden, target_is_directory=True)
+        public = self.home / "public"
+        public.write_text("public")
+        self.agent_extra(f"""seen = {{}}
+for name, folder in (("direct", {str(self.hidden)!r}), ("link", {str(link)!r})):
+    seen[name] = [sorted(os.listdir(folder)),
+                  subprocess.run(["/bin/cat", folder + "/canary"], capture_output=True).returncode]
+seen["public"] = pathlib.Path({str(public)!r}).read_text()
+record["seen"] = seen
+pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))""")
+        for role in ("builder", "reviewer"):
+            with self.subTest(role=role):
+                self.record.unlink(missing_ok=True)
+                result = self.launch(role, "claude", "--author-family", "codex")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                seen = json.loads(self.record.read_text())["seen"]
+                self.assertEqual(seen["public"], "public")
+                for name in ("direct", "link"):
+                    self.assertEqual(seen[name][0], [])
+                    self.assertNotEqual(seen[name][1], 0)
+        self.assertEqual((self.hidden / "canary").read_text(), "held-out canary")
+
+    def test_HIDE_list_that_cannot_be_honoured_refuses_before_any_agent_starts(self):
+        self.hide_project()
+        (self.home / "file").write_text("x")
+        (self.home / "bad[name").mkdir()
+        (self.home / "bad\x01name").mkdir()
+        (self.home / "to-repo").symlink_to(self.repo, target_is_directory=True)
+        cache = self.home / ".cache/am-pool/x"
+        cache.mkdir(parents=True)
+        entries = {"relative/folder": "absolute", self.home / "missing": "no such file",
+                   self.home / "file": "not a folder", self.repo: "overlaps", self.repo / ".git": "overlaps",
+                   self.base: "overlaps", self.home / "to-repo": "overlaps", self.private / "projects": "overlaps",
+                   cache: "overlaps", cache.parent.parent: "overlaps", self.home: "overlaps",
+                   self.method: "method folder", "/": "overlaps",
+                   self.home / "bad[name": "non-printing", self.home / "bad\x01name": "non-printing"}
+        for family in ("codex", "claude"):
+            for entry, reason in entries.items():
+                with self.subTest(family=family, entry=str(entry)):
+                    self.listfile.write_text(f"{self.hidden}\n{entry}\n")
+                    result, header, policy = self.hide_launch("reviewer", family)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIsNone(policy)
+                    self.assertIn("Result: launch refused\n", header)
+                    self.assertRegex(header.lower(), rf"(?m)^reason: .*hidden-folders\.txt: line 2: .*{reason}")
+                    self.assertEqual(list(self.scope_state.iterdir()), [])
+        peer = self.base / "peer"
+        for kind, reason in (("bytes", "utf-8"), ("link", "link count"), ("symlink", "symbolic"),
+                             ("folder", "regular file")):
+            with self.subTest(kind=kind):
+                self.listfile.unlink()
+                peer.unlink(missing_ok=True)
+                if kind == "bytes":
+                    self.listfile.write_bytes(b"\xff\n")
+                elif kind == "link":
+                    self.listfile.write_text(f"{self.hidden}\n")
+                    os.link(self.listfile, peer)
+                elif kind == "symlink":
+                    peer.write_text(f"{self.hidden}\n")
+                    self.listfile.symlink_to(peer)
+                else:
+                    self.listfile.mkdir()
+                result, header, policy = self.hide_launch("builder", "claude")
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(policy)
+                self.assertRegex(header.lower(), rf"(?m)^reason: .*hidden-folders\.txt: .*{reason}")
+                # Roles the list does not apply to never open it.
+                for role in ("verifier", "investigator"):
+                    self.assertEqual(self.hide_launch(role, "codex")[0].returncode, 0)
+                if kind == "folder":
+                    self.listfile.rmdir()
+                    self.listfile.touch()
+
+    def test_HIDE_writable_root_overlapping_a_hidden_folder_is_refused(self):
+        self.hide_project()
+        (self.home / "link").symlink_to(self.hidden, target_is_directory=True)
+        for root in (self.hidden, self.home / "link/inner", self.hidden / "new"):
+            with self.subTest(root=str(root)):
+                result, header, policy = self.hide_launch("builder", "codex", "--writable", root)
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(policy)
+                self.assertIn("must not open a hidden folder", header)
+                self.assertFalse((self.hidden / "new").exists())
+        result, header, policy = self.hide_launch("builder", "codex", "--writable", self.base / "cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_hidden("codex", policy, self.hidden)
+
+    def test_HIDE_nothing_the_repository_holds_selects_or_refuses_a_list(self):
+        self.hide_project()
+        self.listfile.write_bytes(b"\xff")  # refuses wherever it is read
+        entry = self.repo / "AGENTS.md"
+        peer = self.base / "entry"
+        peer.write_text("<!-- Agent System entry for project demo. -->\n")
+        for kind in ("missing", "symlink", "fifo", "other", "dotdot", "long"):
+            with self.subTest(kind=kind):
+                entry.unlink(missing_ok=True)
+                if kind == "symlink":
+                    entry.symlink_to(peer)
+                elif kind == "fifo":
+                    os.mkfifo(entry)
+                elif kind != "missing":
+                    name = {"other": "other", "dotdot": "..", "long": "p" * 5000}[kind]
+                    entry.write_text(f"<!-- Agent System entry for project {name}. -->\n")
+                result, header, policy = self.hide_launch("builder", "claude")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Hidden folders:", header)
+                self.assert_hidden("claude", policy, self.hidden, False)
+
     def test_NOTES_S1_installed_launcher_uses_own_project_and_private_root(self):
         other = self.home / "other-private"
         roots = (self.private, other)

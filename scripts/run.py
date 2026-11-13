@@ -871,31 +871,34 @@ def check_entries(repo, method, private):
         diagnostic(f"Warning: {path} differs from the installed method; see {command}")
 
 
-def worker_notes(repo, private, private_forms, role, family):
-    """Read this launch's notes without following links out of the project folder."""
+def project_file(repo, private, name):
+    """Read a file of this repository's project in the private records without following links
+    out of the project folder: its path and contents, or None when the repository names no
+    project or the project has no such file. Nothing the repository holds can refuse a launch,
+    make it wait or select another project; a file that exists and cannot be read safely raises."""
     with ExitStack() as opened:
         try:
             fd = os.open(repo / "AGENTS.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             opened.callback(os.close, fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return "", "none"
+                return None
             with os.fdopen(fd, "rb", closefd=False) as entry:
                 first = entry.readline(4097)
             if len(first) > 4096:
-                return "", "none"
+                return None
             first = first.decode("utf-8")
             match = re.match(r"<!-- Agent System entry for project ([\w.-]+)\.(?: |$)", first)
             if not match or match[1] in (".", ".."):
-                return "", "none"
-            path = private / "projects" / match[1] / "worker-notes.md"
+                return None
+            path = private / "projects" / match[1] / name
             directory = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             opened.callback(os.close, directory)
-            for name in ("projects", match[1]):
-                directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            for part in ("projects", match[1]):
+                directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                     dir_fd=directory)
                 opened.callback(os.close, directory)
         except (OSError, ValueError):
-            return "", "none"
+            return None
         try:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=directory)
@@ -905,12 +908,58 @@ def worker_notes(repo, private, private_forms, role, family):
                 raise ValueError("not a regular file")
             if info.st_nlink != 1:
                 raise ValueError("link count is not 1")
-            with os.fdopen(fd, encoding="utf-8", closefd=False) as notes:
-                contents = notes.read()
+            with os.fdopen(fd, encoding="utf-8", closefd=False) as file:
+                return path, file.read()
         except FileNotFoundError:
-            return "", "none"
+            return None
         except (OSError, UnicodeError, ValueError) as error:
             raise ValueError(f"{path}: {error}") from error
+
+
+def hidden_folders(repo, private, method, cache):
+    """The folders this repository's project hides from sessions that build or review, from
+    hidden-folders.txt in its private records: resolved, each once, of nested ones the outermost.
+    A list that cannot be honoured raises, so that no session starts unprotected."""
+    found = project_file(repo, private, "hidden-folders.txt")
+    if found is None:
+        return []
+    path, contents = found
+    home = Path.home().resolve()
+    apart = [repo, private, (cache / "am").resolve(), (cache / "am-pool").resolve()]
+    folders = set()
+    for number, line in enumerate(contents.split("\n"), 1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        try:
+            if entry.startswith("~/"):
+                entry = str(Path.home() / entry[2:])
+            if not entry.startswith("/"):
+                raise ValueError("not an absolute path")
+            # The permission rules of both agents carry the path: keep to what they take literally.
+            for name in (entry, str(folder := Path(os.path.realpath(entry, strict=True)))):
+                if not all(char.isprintable() and char not in "*?[]{}()\\" for char in name):
+                    raise ValueError("a non-printing character or one of * ? [ ] { } ( ) \\ in the path")
+            if not folder.is_dir():
+                raise ValueError("not a folder")
+            if any(folder.is_relative_to(other) or other.is_relative_to(folder) for other in apart):
+                raise ValueError("overlaps the repository, the private folder or the launcher's "
+                                 "session and checkout folders")
+            if any(other.is_relative_to(folder) for other in (home, method)):
+                raise ValueError("holds the home folder or the method folder")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{path}: line {number}: {error}") from error
+        folders.add(folder)
+    return sorted(folder for folder in folders
+                  if not any(folder != other and folder.is_relative_to(other) for other in folders))
+
+
+def worker_notes(repo, private, private_forms, role, family):
+    """Read this launch's notes without following links out of the project folder."""
+    found = project_file(repo, private, "worker-notes.md")
+    if found is None:
+        return "", "none"
+    path, contents = found
     if any(form in contents for form in private_forms):
         raise ValueError(f"{path}: contains the private folder path")
     words = len(contents.split())
@@ -1788,7 +1837,12 @@ def launch(parser, args, result):
     if not cache.is_absolute():
         cache = Path.home() / ".cache"
     roots = [path.expanduser().resolve() for path in args.writable]
+    # Verifiers run a project's held-out checks; investigators change nothing.
+    hidden = (hidden_folders(repo, private, args.method.expanduser().resolve(), cache)
+              if args.role in ("builder", "challenger", "reviewer") else [])
     for path in roots:
+        if any(path.is_relative_to(folder) or folder.is_relative_to(path) for folder in hidden):
+            parser.error(f"unsafe --writable root {path}: must not open a hidden folder")
         if (path in (Path("/"), Path.home().resolve()) or path.is_relative_to(private)
                 or private.is_relative_to(path)):
             parser.error(f"unsafe --writable root {path}: must not open home or the private folder")
@@ -1826,6 +1880,8 @@ def launch(parser, args, result):
     shield = ("none (investigator)" if not shielded else
               "private folder denied (codex permission profile)" if args.family == "codex" else
               "private folder hidden (bwrap)")
+    if hidden:
+        shield += "\nHidden folders: " + header_value(", ".join(map(str, hidden)))
     result.header += f"Shield: {shield}\n"
     if args.web:
         check_claude_web_configuration()
@@ -1858,6 +1914,8 @@ def launch(parser, args, result):
             return result.refused("Cannot find bwrap for private folder shield")
         bwrap_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
                          "--proc", "/proc", "--tmpfs", str(private), "--remount-ro", str(private)]
+        for path in hidden:
+            bwrap_prefix += ["--tmpfs", str(path), "--remount-ro", str(path)]
         for path in [*session_paths, *(path for path in (
                 Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
                 Path.home() / ".codex/ipc") if path.exists())]:
@@ -2180,7 +2238,7 @@ def launch(parser, args, result):
                 command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
                 if shielded:
                     filesystem = ", ".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
-                                           for path in [private, *session_paths])
+                                           for path in [private, *session_paths, *hidden])
                     command += ["-c", 'default_permissions="am-shield"',
                                 "-c", 'permissions.am-shield.extends="'
                                 + (":workspace" if writable else ":read-only") + '"',
@@ -2228,7 +2286,7 @@ def launch(parser, args, result):
                         raise ValueError(reason)
                 command += ["-"]
             else:
-                settings = {"permissions": {"deny": [f"{tool}(/{private}/**)"
+                settings = {"permissions": {"deny": [f"{tool}(/{path}/**)" for path in [private, *hidden]
                                                      for tool in ("Read", "Edit")] if shielded else []}}
                 tools = "Read,Grep,Glob,Bash,Write,Edit" if writable else "Read,Grep,Glob"
                 if args.web:

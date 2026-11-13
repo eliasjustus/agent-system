@@ -488,6 +488,35 @@ Missing or empty notes, or no matching sections, leave the prompt unchanged. The
 `Worker notes:` result field records the file, selected headings and attached word count, or
 that none applied. Running setup again preserves existing notes.
 
+### Hidden folders
+
+A project can keep folders away from the sessions that build and review. Put their paths in
+`<private>/projects/<id>/hidden-folders.txt`, one per line, absolute or starting with `~/`; blank
+lines and lines starting with `#` are skipped, and white space at the ends of a line is not part of
+the path. The launcher finds the file as it finds the worker notes, reads it at every builder,
+challenger and reviewer launch, and hides each folder with the private folder's shield: for Codex a
+deny entry in the permission profile, for Claude a read-only empty mount and Read/Edit deny
+settings. Verifiers, which run a project's held-out checks, and investigators do not read the list.
+The header names what was hidden in `Hidden folders:`, each folder once by its resolved path, of
+nested folders the outermost. Setup never creates or changes the list.
+
+A list that cannot be honoured refuses the launch with exit 2 and `Result: launch refused`, so that
+no session starts unprotected: a file that is not a readable UTF-8 regular file with a single hard
+link, or an entry that is relative, missing or not a folder, that holds a non-printing character or
+one of `* ? [ ] { } ( ) \`, that overlaps the repository, the private folder or the launcher's
+session and checkout-pool folders, or that holds the home folder or the method folder. An entry that
+is a symlink hides the folder it points to. A `--writable` root that overlaps a hidden folder is
+refused.
+
+What this does not cover: the shield's limits above (pre-existing hard links, bind mounts, services)
+apply, and copies of the data elsewhere stay readable. Sessions the launcher did not start are not
+covered: an orchestrator, and the subagents it starts itself, read everything. Folders inside the
+repository cannot be listed, and whatever is tracked in the repository or its history stays readable
+through Git. A session already running keeps the list it started with. The list is found through the
+first line of the repository's `AGENTS.md`; where the project cannot be located, the launch proceeds
+without hiding and without a `Hidden folders:` line, so a session that changes that line switches
+the hiding off for later launches.
+
 For a committed candidate, the manual route is a detached worktree at its exact commit:
 
 ```sh
