@@ -506,6 +506,14 @@ task's results folder before starting.
 Commit the candidate before verification. Uncommitted work may go through `run.py` for a
 challenger or reviewer snapshot.
 
+### Counting sessions
+
+`python3 scripts/count.py <tasks folder>` (in this repository, not installed) reads the result
+files under a project's task folders and prints, per task, the sessions, hours, results and
+verifier verdicts for each role, with the task's own `- Cost:` line; `--json` for further counting.
+It sees only what has a launcher header: work inside the orchestrator's own session, or by its
+subagents, is not counted. Folders whose name ends in `evidence` are skipped.
+
 ## Environment
 
 | Variable | Effect |
