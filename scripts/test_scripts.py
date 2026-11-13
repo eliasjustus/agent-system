@@ -11631,6 +11631,41 @@ class CountTest(unittest.TestCase):
             self.assertEqual(objects, sorted(path.name for path in (clone / ".git/objects/pack").iterdir()))
             self.assertAlmostEqual(json.loads(done.stdout)[0]["time"]["sessions"], 1.5)
 
+    def test_COUNT_TIME_git_settings_and_names_that_are_not_text_leave_the_history_read_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, pipe = Path(temporary) / "private", Path(temporary) / "pipe"
+            tasks = repository / "tasks"
+            subprocess.run(["git", "init", "-q", str(repository)], check=True, capture_output=True)
+            # Both folders exist only in the first commit, which `log.showRoot=false` hides from
+            # `git log`; one has a name that is not valid UTF-8.
+            odd = os.fsdecode(b"\xff071")
+            for name in ("070", odd):
+                (tasks / name).mkdir(parents=True)
+                (tasks / name / "task.md").write_text("one\n")
+            self.snapshot(repository, "2026-03-01T03:00:00+00:00")
+            os.mkfifo(pipe)
+            script = Path(__file__).with_name("count.py")
+            command = [sys.executable, str(script), str(tasks), "--now", "2026-03-02T00:00:00+00:00"]
+            # A file Git is told to read is a pipe nobody writes to: reading it would not return.
+            for setting, value in (("diff.orderFile", str(pipe)), ("mailmap.file", str(pipe)),
+                                   ("log.showRoot", "false"), ("log.follow", "true")):
+                with self.subTest(setting=setting):
+                    config = ["git", "-C", str(repository), "config"]
+                    subprocess.run([*config, setting, value], check=True)
+                    try:
+                        done = subprocess.run([*command, "--json"], capture_output=True, text=True,
+                                              timeout=60)
+                    finally:
+                        subprocess.run([*config, "--unset", setting], check=True)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    rows = {row["task"]: row for row in json.loads(done.stdout)}
+                    self.assertEqual(sorted(rows), ["070", odd])
+                    for row in rows.values():
+                        self.assertAlmostEqual(row["time"]["records"], 1.0)
+            done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("\\udcff071\n  time: elapsed 1.0 h", done.stdout)
+
     def test_COUNT_TIME_without_git_history_counts_sessions_and_says_so(self):
         with tempfile.TemporaryDirectory() as temporary:
             tasks = Path(temporary) / "tasks"

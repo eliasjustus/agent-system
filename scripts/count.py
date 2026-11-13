@@ -22,6 +22,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -97,18 +98,22 @@ def moment(text):
 def history(tasks):
     """When each task's folder changed: the commit times per task folder name, from the Git history
     of the repository holding `tasks`; None where no commit holds anything of the folder. Reads
-    only, whatever Git variables the caller's environment sets: nothing is fetched into a partial
-    clone, and no mailmap, pager, signature check or diff driver runs. A merge counts for the
-    paths in which it differs from its first parent: what changed on that line at that time."""
+    only, through Git's plumbing commands, whose output no Git setting of the user or of the
+    repository changes (order files, mailmaps, pagers, `log.*`), and whatever Git variables the
+    caller's environment sets; nothing is fetched into a partial clone (a Git too old to know
+    `--no-lazy-fetch` gives None). A merge counts for the paths in which it differs from its first
+    parent: what changed on that line at that time."""
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    environment.update(GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0")
+    git = ["git", "--no-pager", "--no-optional-locks", "--no-lazy-fetch", "-C", str(tasks)]
     try:
-        done = subprocess.run(
-            ["git", "--no-pager", "-C", str(tasks), "log", "--relative", "--name-only",
-             "--diff-merges=first-parent",
-             "--no-renames", "--no-ext-diff", "--no-textconv", "--no-show-signature",
-             "--no-use-mailmap", "-z", "--format=%x00%cI", "--", "."],
-            capture_output=True, stdin=subprocess.DEVNULL, env=environment, timeout=GIT_SECONDS)
+        done = subprocess.run([*git, "rev-list", "HEAD"], capture_output=True,
+                              stdin=subprocess.DEVNULL, env=environment, timeout=GIT_SECONDS)
+        if done.returncode == 0:
+            done = subprocess.run(
+                [*git, "diff-tree", "--stdin", "-r", "--root", "--relative", "--name-only",
+                 "--diff-merges=first-parent", "--no-renames", "--no-ext-diff", "--no-textconv",
+                 "-z", "--format=%x00%cI", "--", "."],
+                capture_output=True, input=done.stdout, env=environment, timeout=GIT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
@@ -116,7 +121,7 @@ def history(tasks):
     changed = {}
     # Per commit: NUL, its time, NUL, a newline, then the changed paths, each ended by NUL. A
     # path is never empty, so the empty field before a time is the only place a commit can start.
-    fields = done.stdout.decode("utf-8", errors="replace").split("\0")
+    fields = os.fsdecode(done.stdout).split("\0")  # names as the file system gives them
     when, first = None, False
     for index, field in enumerate(fields):
         if not field:
@@ -213,6 +218,7 @@ def main():
     if args.json:
         print(json.dumps(rows, indent=1))
         return
+    sys.stdout.reconfigure(errors="backslashreplace")  # a folder name need not be valid UTF-8
     for row in rows:
         print(row["task"])
         for name in ROLES:
