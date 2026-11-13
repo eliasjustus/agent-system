@@ -11419,7 +11419,7 @@ class CountTest(unittest.TestCase):
                 "Role: builder\nStart UTC: 2026-01-01T00:00:00+00:00\nResult: interrupted\n"
                 "End UTC: 2026-01-01T01:00:00+00:00\nExit code: 130\n")
             self.write(one / "results/verifier-3.md", "verifier", "Result: done\n\nVerdict: fail\n"
-                       + "y" * 999_900 + " then\nnot a line Verdict: pass " + "z" * 500_000)
+                       + "y" * 999_900 + " then\nnot a line Verdict: pass " + "z" * 2_500_000)
             self.write(one / "results/archive.txt", "challenger", "Result: done")
             self.write(one / "results/big.md", "verifier",
                        "Result: done\n" + "x" * 3_000_000 + "\n**Verdict**: **inconclusive**",
@@ -11440,6 +11440,17 @@ class CountTest(unittest.TestCase):
         self.assertAlmostEqual(roles["verifier"]["hours"], 6.0)
         self.assertEqual(roles["challenger"]["sessions"], 1)
         self.assertEqual(rows["001"]["cost"], "estimate 1 h, actual 2 h")
+
+    def test_COUNT_file_over_the_whole_read_limit_keeps_result_and_drops_verdict(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        self.addCleanup(sys.path.remove, str(Path(__file__).parent))
+        import count
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(count, "WHOLE", 2_000_000):
+            path = Path(temporary) / "verifier-1.md"
+            self.write(path, "verifier", "Result: done\n\nVerdict: fail\n" + "y" * 999_900
+                       + " then\nnot a line Verdict: pass " + "z" * 2_500_000)
+            found = count.session(count.read(path))
+        self.assertEqual((found["result"], found["verdict"], found["hours"]), ("done", "fail", 1.5))
 
     def test_COUNT_running_session_counts_without_hours(self):
         with tempfile.TemporaryDirectory() as temporary:

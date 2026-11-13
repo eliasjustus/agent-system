@@ -22,24 +22,25 @@ VERDICT = re.compile(r"^Verdict:\s*(pass|fail|inconclusive)\b(?!\s*\|)", re.M | 
 RESULT = re.compile(r"^Result:\s*(done|blocked|needs decision|running|launch refused|interrupted|"
                     r"killed|source check failed|[a-z]+)", re.M)
 COST = re.compile(r"^- Cost: (.*)$", re.M)
-PART = 1_000_000
+WHOLE = 32_000_000
 
 
 def read(path):
-    """The first and last megabyte of a regular file, never through a link, never blocking."""
+    """A regular file's text, never through a link, never blocking. Of a file over 32 MB only the
+    complete lines of its first megabyte: header and result, no verdict."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
-        size = os.fstat(fd).st_size if stat.S_ISREG(os.fstat(fd).st_mode) else -1
-        if size < 0:
+        status = os.fstat(fd)
+        if not stat.S_ISREG(status.st_mode):
             return None
-        if size <= 2 * PART:
-            data = os.pread(fd, 2 * PART, 0)
-        else:  # whole lines only on both sides of the unread middle
-            head, tail = os.pread(fd, PART, 0), os.pread(fd, PART, size - PART)
-            data = head[:head.rfind(b"\n") + 1] + tail[tail.find(b"\n") + 1:]
+        if status.st_size <= WHOLE:
+            data = os.pread(fd, WHOLE, 0)
+        else:
+            data = os.pread(fd, 1_000_000, 0)
+            data = data[:data.rfind(b"\n") + 1]
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
