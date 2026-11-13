@@ -11647,8 +11647,11 @@ class CountTest(unittest.TestCase):
             script = Path(__file__).with_name("count.py")
             command = [sys.executable, str(script), str(tasks), "--now", "2026-03-02T00:00:00+00:00"]
             # A file Git is told to read is a pipe nobody writes to: reading it would not return.
+            ran = Path(temporary) / "monitor-ran"
             for setting, value in (("diff.orderFile", str(pipe)), ("mailmap.file", str(pipe)),
-                                   ("log.showRoot", "false"), ("log.follow", "true")):
+                                   ("log.showRoot", "false"), ("log.follow", "true"),
+                                   ("i18n.logOutputEncoding", "UTF-16"),
+                                   ("core.fsmonitor", f"touch {shlex.quote(str(ran))}; false")):
                 with self.subTest(setting=setting):
                     config = ["git", "-C", str(repository), "config"]
                     subprocess.run([*config, setting, value], check=True)
@@ -11662,6 +11665,7 @@ class CountTest(unittest.TestCase):
                     self.assertEqual(sorted(rows), ["070", odd])
                     for row in rows.values():
                         self.assertAlmostEqual(row["time"]["records"], 1.0)
+                    self.assertFalse(ran.exists(), "the configured file-monitor program ran")
             done = subprocess.run(command, capture_output=True, text=True, timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertIn("\\udcff071\n  time: elapsed 1.0 h", done.stdout)

@@ -97,14 +97,16 @@ def moment(text):
 
 def history(tasks):
     """When each task's folder changed: the commit times per task folder name, from the Git history
-    of the repository holding `tasks`; None where no commit holds anything of the folder. Reads
-    only, through Git's plumbing commands, whose output no Git setting of the user or of the
-    repository changes (order files, mailmaps, pagers, `log.*`), and whatever Git variables the
-    caller's environment sets; nothing is fetched into a partial clone (a Git too old to know
-    `--no-lazy-fetch` gives None). A merge counts for the paths in which it differs from its first
-    parent: what changed on that line at that time."""
+    of the repository holding `tasks`; None where no commit holds anything of the folder. Read
+    with Git's plumbing commands, which do not follow the settings for `git log` and for showing
+    differences, with the caller's Git variables removed, without the file-monitor program and
+    without fetching into a partial clone (a Git too old to know `--no-lazy-fetch` gives None).
+    Git's configuration is otherwise trusted, as by every Git command run on the folder. A merge
+    counts for the paths in which it differs from its first parent: what changed on that line at
+    that time."""
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    git = ["git", "--no-pager", "--no-optional-locks", "--no-lazy-fetch", "-C", str(tasks)]
+    git = ["git", "--no-pager", "--no-optional-locks", "--no-lazy-fetch", "-c", "core.fsmonitor=false",
+           "-C", str(tasks)]
     try:
         done = subprocess.run([*git, "rev-list", "HEAD"], capture_output=True,
                               stdin=subprocess.DEVNULL, env=environment, timeout=GIT_SECONDS)
@@ -112,7 +114,7 @@ def history(tasks):
             done = subprocess.run(
                 [*git, "diff-tree", "--stdin", "-r", "--root", "--relative", "--name-only",
                  "--diff-merges=first-parent", "--no-renames", "--no-ext-diff", "--no-textconv",
-                 "-z", "--format=%x00%cI", "--", "."],
+                 "--encoding=UTF-8", "-z", "--format=%x00%cI", "--", "."],
                 capture_output=True, input=done.stdout, env=environment, timeout=GIT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return None
