@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Count launcher sessions per task from their result files. Reads only.
 
-Usage: python3 scripts/count.py <tasks folder> [--json]
+Usage: python3 scripts/count.py <tasks folder> [--json] [--now <time>]
 
 Counts what the launcher's header shows: sessions, hours, results and verifier verdicts per role.
 Work done inside the orchestrator's own session, or by its subagents, has no header and is not
 counted; a task's own `- Cost:` line is printed beside the counts for that. Folders whose name ends
 in `evidence` are skipped: they hold checkers' fixtures, which can look like results.
+
+Also estimates how much of a task's time was waiting. Something worked during a launcher session
+(its header's start to end) and in the hour before each commit that changed the task's folder, read
+from the Git history of the repository holding the tasks folder (a private folder committed every
+hour). Elapsed runs from the first activity to the last, or to now while the record's first
+`- State:` line says active, awaiting or paused; waiting is the part with no activity. An estimate:
+a whole hour counts for any change in it, and work that touched neither the folder nor a launcher
+session is not seen. Whether a wait was wanted is not judged.
 """
 import argparse
 import json
 import os
 import re
 import stat
-from datetime import datetime
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROLES = ("builder", "verifier", "challenger", "reviewer", "investigator")
@@ -22,7 +32,11 @@ VERDICT = re.compile(r"^Verdict:\s*(pass|fail|inconclusive)\b(?!\s*\|)", re.M | 
 RESULT = re.compile(r"^Result:\s*(done|blocked|needs decision|running|launch refused|interrupted|"
                     r"killed|source check failed|[a-z]+)", re.M)
 COST = re.compile(r"^- Cost: (.*)$", re.M)
+STATE = re.compile(r"^- State: (.*)$", re.M)
+OPEN = ("active", "awaiting", "paused")
 WHOLE = 32_000_000
+WINDOW = timedelta(hours=1)  # the interval of the snapshots whose commits show a folder changed
+GIT_SECONDS = 120
 
 
 def read(path):
@@ -55,23 +69,120 @@ def session(text):
     head = dict(line.split(": ", 1) for line in lines if ": " in line)
     if not text.startswith("Role: ") or head.get("Role") not in ROLES or "Start UTC" not in head:
         return None
-    hours = None
+    hours = span = None
     try:
+        start = moment(head["Start UTC"])
+        span = (start, start)  # with no usable end time a session is a moment, not still running
+        end = moment(head["End UTC"])
+        if end > start:
+            span = (start, end)
+        # The hours per role keep their earlier rule: none when only one of the two times names
+        # a zone. The span reads a time without a zone as UTC, as the field's name says.
         hours = (datetime.fromisoformat(head["End UTC"])
                  - datetime.fromisoformat(head["Start UTC"])).total_seconds() / 3600
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         pass
     result = RESULT.search(re.sub(r"[*`]", "", text))
     verdicts = VERDICT.findall(re.sub(r"[*`]", "", body)) if head["Role"] == "verifier" else []
     return {"role": head["Role"], "family": head.get("Family", ""), "hours": hours,
             "result": result[1].strip() if result else "none",
-            "verdict": verdicts[-1].lower() if verdicts else None}
+            "verdict": verdicts[-1].lower() if verdicts else None, "span": span}
 
 
-def count(tasks):
+def moment(text):
+    """A time from a header, Git or the command line; one without a zone is UTC."""
+    value = datetime.fromisoformat(text.strip())
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def history(tasks):
+    """When each task's folder changed: the commit times per task folder name, from the Git history
+    of the repository holding `tasks`; None where no commit holds anything of the folder. Read
+    with Git's plumbing commands, which do not follow the settings for `git log` and for showing
+    differences, with the caller's Git variables removed, without the file-monitor program and
+    without fetching into a partial clone (a Git too old to know `--no-lazy-fetch` gives None).
+    Git's configuration is otherwise trusted, as by every Git command run on the folder. A merge
+    counts for the paths in which it differs from its first parent: what changed on that line at
+    that time."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    git = ["git", "--no-pager", "--no-optional-locks", "--no-lazy-fetch", "-c", "core.fsmonitor=false",
+           "-C", str(tasks)]
+    try:
+        done = subprocess.run([*git, "rev-list", "HEAD"], capture_output=True,
+                              stdin=subprocess.DEVNULL, env=environment, timeout=GIT_SECONDS)
+        if done.returncode == 0:
+            done = subprocess.run(
+                [*git, "diff-tree", "--stdin", "-r", "--root", "--relative", "--name-only",
+                 "--diff-merges=first-parent", "--no-renames", "--no-ext-diff", "--no-textconv",
+                 "--encoding=UTF-8", "-z", "--format=%x00%cI", "--", "."],
+                capture_output=True, input=done.stdout, env=environment, timeout=GIT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    changed = {}
+    # Per commit: NUL, its time, NUL, a newline, then the changed paths, each ended by NUL. A
+    # path is never empty, so the empty field before a time is the only place a commit can start.
+    fields = os.fsdecode(done.stdout).split("\0")  # names as the file system gives them
+    when, first = None, False
+    for index, field in enumerate(fields):
+        if not field:
+            when = None
+            if index + 1 < len(fields):
+                try:
+                    when = moment(fields[index + 1])
+                except ValueError:
+                    pass
+            first = None  # the next field is the time itself
+        elif first is None:
+            first = True
+        elif when:
+            name = field[1:] if first and field.startswith("\n") else field
+            first = False
+            task, below, _ = name.partition("/")
+            if below:
+                changed.setdefault(task, set()).add(when)
+    return changed or None
+
+
+def union(spans):
+    """Hours covered by the spans, overlaps counted once."""
+    seconds, edge = 0.0, None
+    for start, end in sorted(spans):
+        if edge is None or start > edge:
+            seconds += (end - start).total_seconds()
+            edge = end
+        elif end > edge:
+            seconds += (end - edge).total_seconds()
+            edge = end
+    return seconds / 3600
+
+
+def spent(sessions, commits, record, now):
+    """Elapsed, active and waiting time of one task as of `now`; None without any activity."""
+    sessions = [(start, min(end, now)) for start, end in sessions if start <= now]
+    changes = [(when - WINDOW, when) for when in commits or () if when <= now]
+    both = sessions + changes
+    if not both:
+        return None
+    state = STATE.search(record or "")
+    is_open = bool(state and state[1].startswith(OPEN))
+    first, last = min(start for start, _ in both), max(end for _, end in both)
+    elapsed = ((now if is_open else last) - first).total_seconds() / 3600
+    active = union(both)
+    return {"elapsed": elapsed, "active": active, "sessions": union(sessions),
+            "records": None if commits is None else union(changes),
+            "waiting": 1 - active / elapsed if elapsed > 0 else None,
+            "open": is_open, "idle": (now - last).total_seconds() / 3600 if is_open else None}
+
+
+def count(tasks, now=None):
+    now = now or datetime.now(timezone.utc)
+    changed = history(tasks)
     rows = []
     for task in sorted(p for p in tasks.iterdir() if p.is_dir() and not p.is_symlink()):
-        row = {"task": task.name, "cost": None, "roles": {}}
+        row = {"task": task.name, "cost": None, "roles": {}, "time": None}
+        spans = []
         record = read(task / "task.md")
         cost = COST.findall(record) if record else []
         row["cost"] = cost[-1].strip() if cost else None
@@ -86,11 +197,14 @@ def count(tasks):
                                                                "results": {}, "verdicts": {}})
                 role["sessions"] += 1
                 role["hours"] += found["hours"] or 0
+                if found["span"]:
+                    spans.append(found["span"])
                 role["results"][found["result"]] = role["results"].get(found["result"], 0) + 1
                 if found["role"] == "verifier":
                     verdict = found["verdict"] or "none"
                     role["verdicts"][verdict] = role["verdicts"].get(verdict, 0) + 1
-        if row["roles"] or row["cost"]:
+        row["time"] = spent(spans, None if changed is None else changed.get(task.name, ()), record, now)
+        if row["roles"] or row["cost"] or row["time"]:
             rows.append(row)
     return rows
 
@@ -99,11 +213,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("tasks", type=Path)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--now", type=moment, metavar="TIME",
+                        help="count the time figures as of this moment (ISO 8601; default: now)")
     args = parser.parse_args()
-    rows = count(args.tasks)
+    rows = count(args.tasks, args.now)
     if args.json:
         print(json.dumps(rows, indent=1))
         return
+    sys.stdout.reconfigure(errors="backslashreplace")  # a folder name need not be valid UTF-8
     for row in rows:
         print(row["task"])
         for name in ROLES:
@@ -117,6 +234,17 @@ def main():
             print(f"  {name}: " + "; ".join(parts))
         if row["cost"]:
             print(f"  cost line: {row['cost']}")
+        time = row["time"]
+        if time:
+            parts = (f"sessions {time['sessions']:.1f}; no Git history of the folder"
+                     if time["records"] is None else
+                     f"folder changes {time['records']:.1f}, sessions {time['sessions']:.1f}")
+            line = f"  time: elapsed {time['elapsed']:.1f} h; active {time['active']:.1f} h ({parts})"
+            if time["waiting"] is not None:
+                line += f"; waiting about {time['waiting']:.0%}"
+            if time["open"]:
+                line += f"; open, last activity {time['idle']:.1f} h ago"
+            print(line)
 
 
 if __name__ == "__main__":

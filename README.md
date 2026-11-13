@@ -515,6 +515,21 @@ It sees only what has a launcher header: work inside the orchestrator's own sess
 subagents, is not counted. Folders whose name ends in `evidence` are skipped; of a file larger than
 32 MB only the first megabyte is read, so its verdict may be missed.
 
+It also estimates how much of each task's time was waiting: `time: elapsed … h; active … h (folder
+changes …, sessions …); waiting about …%`, and for a task whose record's first `- State:` line says
+active, awaiting or paused, the time since its last activity. Something worked during a launcher
+session (its header's start to end; one without an end time counts as a moment) and in the hour
+before each commit that changed the task's folder, read from the Git history of the repository
+holding the tasks folder; this needs the private folder to be committed regularly, about every hour.
+Elapsed runs from the first activity to the last, or to now for an open task. The figure is an
+estimate: a whole hour counts for any change in it, and work that touched neither the folder nor a
+launcher session is not seen. On nine tasks whose waiting had been reconstructed by hand from
+transcripts it gave the same elapsed time within about an hour and the same order of tasks, and read
+0 to 25 percentage points lower. The history is read with the Git on the path under the user's and
+the repository's Git configuration, which is trusted as for any Git command; a Git too old for
+`--no-lazy-fetch` gives no history. It does not judge whether a wait was wanted. `--now <time>`
+counts as of an earlier moment.
+
 ## Environment
 
 | Variable | Effect |
