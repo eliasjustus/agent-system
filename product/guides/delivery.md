@@ -90,4 +90,5 @@ folder (`templates/finding.md`). A problem with the method is recorded there as 
 `core`, and may also be reported to the method's upstream repository. Record the evidence, then
 continue the product work. A method change made from findings names the failure it addresses and
 prefers a check or a tool over new prose; added text replaces or removes at least as much, unless
-the change says why it cannot.
+the change says why it cannot. The challenger and checks written first answer what today's models miss:
+retest them when the models change.

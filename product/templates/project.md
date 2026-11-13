@@ -19,6 +19,8 @@ commit.
 
 ## How to run and check
 
+Name one fast check that runs inside the checkers' restricted environment.
+
 ## Decisions
 
 ## Pitfalls

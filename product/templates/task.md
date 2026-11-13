@@ -16,7 +16,7 @@
 - Open for user: nothing
 
 <!-- Below the floor, the depth answers, contract, proof and verdict may be one short paragraph each
-instead of these sections. -->
+instead of these sections. A discussion or analysis keeps only the current view, Decisions and Log. -->
 
 ## Depth
 

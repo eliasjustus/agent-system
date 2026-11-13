@@ -19,7 +19,7 @@ Use the three questions in the entry. Write each answer so a stranger could chec
 folder's first import get no collection while later scans do", not "small change". Reassess when you
 find another owner of the state, the design changes, or a check fails for an unexplained reason.
 **Moving above:** stop dependent work, keep what is valid and add the missing safeguards; work you
-built yourself goes to a separate builder and full verification. **Moving below** needs another
+built yourself gets full verification. **Moving below** needs another
 agent to confirm the trigger never applied. Settled scenarios are never removed by a depth change.
 
 ## Scenarios (above the floor)
@@ -30,7 +30,8 @@ Draft them yourself, never the builder.
   to where the user sees it, including other paths to it. For saved state, follow creation, defaults,
   updates, restart, recovery and removal.
 - Mark each **deliver** or **must not break**. Must not break is only for behavior that works today.
-- Then run the challenger (`guides/handover.md`) and adopt or reject each of its cases with a reason.
+- Then run the challenger (`guides/handover.md`) and adopt or reject each of its cases with a
+  reason; reject one that widens the outcome beyond the request.
 - Then have the checks written, before the build (`guides/handover.md`).
 
 ## Tell the user once, then proceed
