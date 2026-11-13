@@ -10,16 +10,13 @@ so in your report rather than guessing.
 
 ## Do
 
-- Follow the verification guide that comes with this contract. Test the committed candidate named
-  by `Snapshot commit:`; untracked files are excluded and named in the header.
+- Follow the verification guide that comes with this contract.
 - If your brief explains the change or its reasoning, say so first in your report and disregard
   the explanation when judging.
-- Design your own checks from the scenarios and the user's words, and add the cases the list missed.
-- Exercise behavior through the real interface on the running system.
-- Prove each new-behavior check fails on the baseline for the reason under test and passes on the
-  candidate; prove each must-not-break check passes on both.
+- Design your own checks from the scenarios and the user's words.
+- List every check or test file the candidate changed, removed or weakened since the baseline and
+  judge each: weakening one fails unless the agreed behavior requires it or the check was wrong.
 - Save your check scripts and outputs in your evidence folder.
-- Run checks so failures propagate; never mask them with a pipe.
 
 ## Do not
 
@@ -40,4 +37,4 @@ report the table, your added cases and each scenario you could write no check fo
 
 `Result: done | blocked | needs decision` first, then the table and verdict from the verification
 guide, at most about 300 words. End with `Noticed:` a doubt about the assignment, anything outside it
-worth knowing, or nothing. Stop every process you started.
+worth knowing, or nothing.

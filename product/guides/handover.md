@@ -1,9 +1,9 @@
 # Handover: builders and reviews
 
-## Choose the builder
+## Build or hand over
 
-Use **Codex** for self-contained assignments with settled outcome, design and acceptance checks.
-Otherwise use a **Claude** builder.
+Invariant 1 says when: a brief carries less than you hold. Hand over to **Codex** when outcome,
+design and acceptance checks are settled, otherwise to a **Claude** builder.
 
 ## Briefs
 
@@ -47,8 +47,7 @@ local.
 Before the build, launch a verifier on the baseline (`--before none`, its own results folder) with
 the checks-first line in its brief. Treat the cases it adds like a challenger's. Keep its checks,
 and name a copy outside the private folder in the builder's brief and the judging verifier's, or
-that none could be written. The builder never changes a check: one it thinks wrong comes back to
-you.
+that none could be written. Whoever builds never changes a check: a builder brings one it thinks wrong back to you.
 
 ## Long work
 

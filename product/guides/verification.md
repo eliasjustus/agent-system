@@ -1,7 +1,5 @@
 # Verification
 
-Read by the orchestrator before sending the verifier, and given to the verifier with its contract.
-
 ## Environment
 
 Commit before verification. The launcher refuses staged or unstaged tracked changes and tests only
@@ -12,8 +10,8 @@ Pool checkouts are reset before use; ignored build output remains warm.
 If a check depends on an ignored file other than build output it produces itself, or a failure looks
 environmental, report it and ask the orchestrator for a rerun with `--clean-checkout`, keeping both
 results. Custom build scripts may reuse stale ignored output,
-so establish which build actually ran. Gradle can also retain stale output from removed tasks.
-When a candidate removes Gradle tasks or generated source folders, verify with `--clean-checkout`.
+so establish which build actually ran. When a candidate removes build tasks or generated source
+folders, verify with `--clean-checkout`.
 
 Use the cheapest real environment that exercises the behavior: the running service over its real
 interface, a real browser for a component, a real repository or filesystem. A narrower environment
@@ -37,7 +35,6 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
   use the writable **Before checkout** named in the prompt and header for the baseline. The launcher
   resets and cleans it like the candidate; do not delete either pool checkout.
   Afterwards, the launcher fails the result if the candidate's tracked files, index or HEAD changed.
-  Verifiers require `--before <commit>` or `--before none`.
   With `--before none`, there is no before checkout; if you need one after all, make an ad-hoc
   shared clone at the baseline commit inside $TMPDIR
   (`git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`).
@@ -57,7 +54,9 @@ Run checks so failures propagate. Never hide a failed command behind `tail` or a
 
 The scenario list is someone else's framing. Add at least one case aimed at what it most likely
 missed: another path to the same result, state over time, an input the wording implies. Report
-variations you chose not to test as untested. To call a reported defect not real, address the
+variations you chose not to test as untested. A finding fails the candidate only where the agreed
+outcome is not delivered, something that works today breaks, data is lost or security is
+weakened; anything else goes under `Noticed:` and starts no repair. To call a reported defect not real, address the
 reported entry point and conditions; a safe path elsewhere does not refute it.
 
 ## Report
@@ -68,8 +67,8 @@ Candidate: <commit you verified>
 | S1 | fail: <why> | pass | <file in your evidence folder> |
 ```
 
-Then your own cases and what they showed, anything unverified and why, and your verdict: pass, fail
-(with the scenario) or inconclusive (with the next question to answer).
+Then your own cases and what they showed, anything unverified and why, and on its own line
+`Verdict: pass | fail | inconclusive`, with the scenario or the next question to answer.
 
 Stop every process you started and remove your temporary checkouts. Leave launcher pool slots
 registered and in place for reuse.

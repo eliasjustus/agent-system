@@ -55,10 +55,9 @@ runners and merge queue; then complexity and upkeep.
 
 ## Invariants
 
-1. The builder is never the only judge of its work. Above the floor, the orchestrator does not build,
-   except to apply a repair to an already built candidate that a reviewer or verifier spelled out
-   exactly and that needs no further design; an independent check then covers it. Missing
-   features and repairs that need design go back to a builder.
+1. Whoever builds is never the only judge of the work: an independent check covers it. Build
+   yourself when the work is sequential and rests on what you already know; hand over parts that
+   are independent and have fixed checks.
 2. Above the floor, settle the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
    the rules. Commit the candidate before verifying; untracked files are excluded and named by
@@ -88,24 +87,21 @@ Answer each yes, no or unknown with the file or behavior that decides it, never 
 Unresolved consequential uncertainty means above. File count, wording and research alone never do.
 Decide again when an analysis turns into building or a repair touches saved state.
 
-**Above:** settled scenarios, a challenger, checks written before the build, a separate builder,
+**Above:** settled scenarios, a challenger, checks written before the build,
 verification on the real system;
 skipping one is a departure, recorded with its reason and named in the delivery. The real system
 means the changed behavior used as it is used for real, through its real interface and processes;
-a test suite that stands in for them is a narrower check, not this. **Below:** a short contract, a builder or your own edit, and one
-counterexample you tried; if you edited it yourself, a verifier still checks it.
+a test suite that stands in for them is a narrower check, not this. **Below:** a short contract, written before the first edit, and one
+counterexample you tried; a verifier checks it.
 
 ## Roles and models
 
-- **Orchestrator** (you): the most capable model available. Frames, decides depth, writes briefs,
-  judges, talks to the user.
-- **Builder:** Codex for settled, well-specified work; Claude for work that still needs judgment.
+- **Orchestrator** (you): the most capable model available. Frames, decides depth, builds or
+  hands over, judges, talks to the user.
 - **Verifier, challenger, reviewer:** the model named in the user's `models.md` in their
   preferences folder; without one, any available model. Each runs in its own session with no author context, on its own committed
   checkout for verification; Codex challengers and reviewers read their snapshot through Git.
 - **Investigator:** research, analysis or a design draft that changes nothing.
-
-Read `guides/handover.md` before delegating.
 
 ## Guides: read each at its moment
 
