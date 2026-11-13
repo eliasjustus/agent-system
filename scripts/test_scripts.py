@@ -11415,6 +11415,11 @@ class CountTest(unittest.TestCase):
             self.addCleanup(outside.unlink)
             (one / "results/link.md").symlink_to(outside)
             os.mkfifo(one / "results/pipe.md")
+            (one / "results/builder-3.md").write_text(
+                "Role: builder\nStart UTC: 2026-01-01T00:00:00+00:00\nResult: interrupted\n"
+                "End UTC: 2026-01-01T01:00:00+00:00\nExit code: 130\n")
+            self.write(one / "results/verifier-3.md", "verifier", "Result: done\n\nVerdict: fail\n"
+                       + "y" * 999_900 + " then\nnot a line Verdict: pass " + "z" * 500_000)
             self.write(one / "results/archive.txt", "challenger", "Result: done")
             self.write(one / "results/big.md", "verifier",
                        "Result: done\n" + "x" * 3_000_000 + "\n**Verdict**: **inconclusive**",
@@ -11427,12 +11432,12 @@ class CountTest(unittest.TestCase):
             rows = self.run_count(tasks)
         self.assertEqual(list(rows), ["001"])
         roles = rows["001"]["roles"]
-        self.assertEqual(roles["builder"]["sessions"], 2)
-        self.assertEqual(roles["builder"]["results"], {"blocked": 1, "done": 1})
-        self.assertAlmostEqual(roles["builder"]["hours"], 3.0)
-        self.assertEqual(roles["verifier"]["verdicts"], {"fail": 1, "inconclusive": 1, "none": 2})
-        self.assertEqual(roles["verifier"]["sessions"], 4)
-        self.assertAlmostEqual(roles["verifier"]["hours"], 4.5)
+        self.assertEqual(roles["builder"]["sessions"], 3)
+        self.assertEqual(roles["builder"]["results"], {"blocked": 1, "done": 1, "interrupted": 1})
+        self.assertAlmostEqual(roles["builder"]["hours"], 4.0)
+        self.assertEqual(roles["verifier"]["verdicts"], {"fail": 2, "inconclusive": 1, "none": 2})
+        self.assertEqual(roles["verifier"]["sessions"], 5)
+        self.assertAlmostEqual(roles["verifier"]["hours"], 6.0)
         self.assertEqual(roles["challenger"]["sessions"], 1)
         self.assertEqual(rows["001"]["cost"], "estimate 1 h, actual 2 h")
 

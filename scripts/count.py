@@ -35,9 +35,11 @@ def read(path):
         size = os.fstat(fd).st_size if stat.S_ISREG(os.fstat(fd).st_mode) else -1
         if size < 0:
             return None
-        data = os.pread(fd, PART, 0)
-        if size > PART:
-            data += b"\n" + os.pread(fd, PART, max(PART, size - PART))
+        if size <= 2 * PART:
+            data = os.pread(fd, 2 * PART, 0)
+        else:  # whole lines only on both sides of the unread middle
+            head, tail = os.pread(fd, PART, 0), os.pread(fd, PART, size - PART)
+            data = head[:head.rfind(b"\n") + 1] + tail[tail.find(b"\n") + 1:]
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
@@ -46,10 +48,10 @@ def read(path):
 
 
 def session(text):
-    """A launcher result starts with its header: `Role:` first, up to a blank or `Result:` line."""
-    lines = text.split("\n")
-    end = next((i for i, line in enumerate(lines) if not line or line.startswith("Result:")), len(lines))
-    head = dict(line.split(": ", 1) for line in lines[:end] if ": " in line)
+    """A launcher result starts with its header: `Role:` first, up to a blank line."""
+    block, _, body = text.partition("\n\n")
+    lines = block.split("\n")
+    head = dict(line.split(": ", 1) for line in lines if ": " in line)
     if not text.startswith("Role: ") or head.get("Role") not in ROLES or "Start UTC" not in head:
         return None
     hours = None
@@ -58,9 +60,8 @@ def session(text):
                  - datetime.fromisoformat(head["Start UTC"])).total_seconds() / 3600
     except (KeyError, ValueError, TypeError):
         pass
-    plain = re.sub(r"[*`]", "", "\n".join(lines[end:]))
-    result = RESULT.search(plain)
-    verdicts = VERDICT.findall(plain) if head["Role"] == "verifier" else []
+    result = RESULT.search(re.sub(r"[*`]", "", text))
+    verdicts = VERDICT.findall(re.sub(r"[*`]", "", body)) if head["Role"] == "verifier" else []
     return {"role": head["Role"], "family": head.get("Family", ""), "hours": hours,
             "result": result[1].strip() if result else "none",
             "verdict": verdicts[-1].lower() if verdicts else None}
