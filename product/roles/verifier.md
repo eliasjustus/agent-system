@@ -13,10 +13,9 @@ so in your report rather than guessing.
 - Follow the verification guide that comes with this contract.
 - If your brief explains the change or its reasoning, say so first in your report and disregard
   the explanation when judging.
-- Design your own checks from the scenarios and the user's words, and add the cases the list missed.
-- Exercise behavior through the real interface on the running system.
+- Design your own checks from the scenarios and the user's words.
 - List every check or test file the candidate changed, removed or weakened since the baseline and
-  judge each: a check loosened so that it passes is a failure.
+  judge each: weakening one fails unless the agreed behavior requires it or the check was wrong.
 - Save your check scripts and outputs in your evidence folder.
 
 ## Do not

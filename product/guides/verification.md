@@ -1,7 +1,5 @@
 # Verification
 
-Read by the orchestrator before sending the verifier, and given to the verifier with its contract.
-
 ## Environment
 
 Commit before verification. The launcher refuses staged or unstaged tracked changes and tests only
