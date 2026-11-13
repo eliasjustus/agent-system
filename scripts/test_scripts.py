@@ -889,6 +889,9 @@ sys.addaudithook(opened)
         for pairs in mounts:  # the probe and the session
             self.assertEqual(("--tmpfs", folder) in pairs, hidden)
             self.assertEqual(("--remount-ro", folder) in pairs, hidden)
+            if hidden:  # no later mount on the folder undoes the read-only one
+                last = max(index for index, pair in enumerate(pairs) if pair[1] == folder)
+                self.assertEqual(pairs[last][0], "--remount-ro")
 
     def test_HIDE_listed_folders_are_hidden_from_builder_challenger_and_reviewer_only(self):
         second = self.home / "second\xa0folder"  # a no-break space is no control character
@@ -919,6 +922,8 @@ sys.addaudithook(opened)
                         continue  # no shield at all: nothing to look for
                     for folder in (self.hidden, second):
                         self.assert_hidden(family, policy, folder, applies)
+                    if applies:
+                        self.assert_hidden(family, policy, runtime)
                     self.assert_hidden(family, policy, self.home / "alias", False)
                     self.assert_hidden(family, policy, self.hidden / "inner", False)
 

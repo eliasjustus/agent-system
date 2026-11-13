@@ -1916,12 +1916,13 @@ def launch(parser, args, result):
             return result.refused("Cannot find bwrap for private folder shield")
         bwrap_prefix = [os.path.abspath(bwrap), "--unshare-user", "--unshare-pid", "--dev-bind", "/", "/",
                          "--proc", "/proc", "--tmpfs", str(private), "--remount-ro", str(private)]
-        for path in hidden:
-            bwrap_prefix += ["--tmpfs", str(path), "--remount-ro", str(path)]
         for path in [*session_paths, *(path for path in (
                 Path(f"/tmp/cc-daemon-{os.getuid()}"), Path(f"/tmp/codex-daemon-{os.getuid()}"),
                 Path.home() / ".codex/ipc") if path.exists())]:
             bwrap_prefix += ["--tmpfs", str(path)]
+        # Last, so that a listed folder the mounts above also cover ends read-only.
+        for path in hidden:
+            bwrap_prefix += ["--tmpfs", str(path), "--remount-ro", str(path)]
         # Unset inside bwrap: the outer systemd-run scope keeps its environment.
         for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
                      "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
