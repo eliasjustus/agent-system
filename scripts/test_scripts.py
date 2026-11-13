@@ -891,11 +891,16 @@ sys.addaudithook(opened)
             self.assertEqual(("--remount-ro", folder) in pairs, hidden)
 
     def test_HIDE_listed_folders_are_hidden_from_builder_challenger_and_reviewer_only(self):
-        second = self.home / "second"
+        second = self.home / "second\xa0folder"  # a no-break space is no control character
         second.mkdir()
         (self.home / "alias").symlink_to(second, target_is_directory=True)
-        self.hide_project("  # a comment", "", "  ~/held out ä  ", self.home / "held out ä/inner",
-                          self.home / "alias", second, second)
+        # A folder the session shield already covers may be listed as well.
+        runtime = self.base / "runtime"
+        runtime.mkdir()
+        self.env["XDG_RUNTIME_DIR"] = str(runtime)
+        # "~//x" is x in the home folder, never /x.
+        self.hide_project("  # a comment", "", "  ~//held out ä  ", self.home / "held out ä/inner",
+                          self.home / "alias", second, second, runtime)
         for family in ("codex", "claude"):
             for role in ("builder", "challenger", "reviewer", "verifier", "investigator"):
                 with self.subTest(family=family, role=role):
@@ -903,7 +908,8 @@ sys.addaudithook(opened)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     applies = role in ("builder", "challenger", "reviewer")
                     # Each folder once by its resolved path, of nested ones the outermost.
-                    line = f"Hidden folders: {self.hidden}, {second}".replace("ä", "\\xe4")  # as headers escape
+                    line = "".join(char if char.isascii() else ascii(char)[1:-1]  # as headers escape
+                                   for char in f"Hidden folders: {self.hidden}, {second}, {runtime}")
                     self.assertEqual(line in header.splitlines(), applies, header)
                     self.assertEqual("Hidden folders:" in header, applies)
                     if role != "investigator":
@@ -954,6 +960,10 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))""")
         (self.home / "file").write_text("x")
         (self.home / "bad[name").mkdir()
         (self.home / "bad\x01name").mkdir()
+        # A carriage return inside a name is part of the name, not a line end, though both halves exist.
+        Path(f"{self.home}/cr/a\r{self.home}/b").mkdir(parents=True)
+        for name in ("cr/a", "b"):
+            (self.home / name).mkdir()
         (self.home / "to-repo").symlink_to(self.repo, target_is_directory=True)
         cache = self.home / ".cache/am-pool/x"
         cache.mkdir(parents=True)
@@ -962,7 +972,8 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))""")
                    self.base: "overlaps", self.home / "to-repo": "overlaps", self.private / "projects": "overlaps",
                    cache: "overlaps", cache.parent.parent: "overlaps", self.home: "overlaps",
                    self.method: "method folder", "/": "overlaps",
-                   self.home / "bad[name": "non-printing", self.home / "bad\x01name": "non-printing"}
+                   self.home / "bad[name": "control character", self.home / "bad\x01name": "control character",
+                   f"{self.home}/cr/a\r{self.home}/b": "control character"}
         for family in ("codex", "claude"):
             for entry, reason in entries.items():
                 with self.subTest(family=family, entry=str(entry)):

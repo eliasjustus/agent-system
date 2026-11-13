@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+import unicodedata
 
 
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
@@ -871,7 +872,7 @@ def check_entries(repo, method, private):
         diagnostic(f"Warning: {path} differs from the installed method; see {command}")
 
 
-def project_file(repo, private, name):
+def project_file(repo, private, name, newline=None):
     """Read a file of this repository's project in the private records without following links
     out of the project folder: its path and contents, or None when the repository names no
     project or the project has no such file. Nothing the repository holds can refuse a launch,
@@ -908,7 +909,7 @@ def project_file(repo, private, name):
                 raise ValueError("not a regular file")
             if info.st_nlink != 1:
                 raise ValueError("link count is not 1")
-            with os.fdopen(fd, encoding="utf-8", closefd=False) as file:
+            with os.fdopen(fd, encoding="utf-8", newline=newline, closefd=False) as file:
                 return path, file.read()
         except FileNotFoundError:
             return None
@@ -920,26 +921,27 @@ def hidden_folders(repo, private, method, cache):
     """The folders this repository's project hides from sessions that build or review, from
     hidden-folders.txt in its private records: resolved, each once, of nested ones the outermost.
     A list that cannot be honoured raises, so that no session starts unprotected."""
-    found = project_file(repo, private, "hidden-folders.txt")
+    found = project_file(repo, private, "hidden-folders.txt", newline="")  # a carriage return is no line end
     if found is None:
         return []
     path, contents = found
     home = Path.home().resolve()
     apart = [repo, private, (cache / "am").resolve(), (cache / "am-pool").resolve()]
     folders = set()
+    def literal(name):  # the permission rules of both agents carry the path as written
+        if any(unicodedata.category(char) == "Cc" or char in "*?[]{}()\\" for char in name):
+            raise ValueError("a control character or one of * ? [ ] { } ( ) \\ in the path")
     for number, line in enumerate(contents.split("\n"), 1):
         entry = line.strip()
         if not entry or entry.startswith("#"):
             continue
         try:
             if entry.startswith("~/"):
-                entry = str(Path.home() / entry[2:])
+                entry = str(Path.home()) + entry[1:]
             if not entry.startswith("/"):
                 raise ValueError("not an absolute path")
-            # The permission rules of both agents carry the path: keep to what they take literally.
-            for name in (entry, str(folder := Path(os.path.realpath(entry, strict=True)))):
-                if not all(char.isprintable() and char not in "*?[]{}()\\" for char in name):
-                    raise ValueError("a non-printing character or one of * ? [ ] { } ( ) \\ in the path")
+            literal(entry)
+            literal(str(folder := Path(os.path.realpath(entry, strict=True))))
             if not folder.is_dir():
                 raise ValueError("not a folder")
             if any(folder.is_relative_to(other) or other.is_relative_to(folder) for other in apart):
@@ -2238,7 +2240,7 @@ def launch(parser, args, result):
                 command = [executable, "exec", "-m", model, "-c", f"model_reasoning_effort={effort}"]
                 if shielded:
                     filesystem = ", ".join(json.dumps(str(path), ensure_ascii=False) + '="deny"'
-                                           for path in [private, *session_paths, *hidden])
+                                           for path in dict.fromkeys([private, *session_paths, *hidden]))
                     command += ["-c", 'default_permissions="am-shield"',
                                 "-c", 'permissions.am-shield.extends="'
                                 + (":workspace" if writable else ":read-only") + '"',
