@@ -72,10 +72,13 @@ def session(text):
     try:
         start = moment(head["Start UTC"])
         span = (start, start)  # with no usable end time a session is a moment, not still running
+        end = moment(head["End UTC"])
+        if end > start:
+            span = (start, end)
+        # The hours per role keep their earlier rule: none when only one of the two times names
+        # a zone. The span reads a time without a zone as UTC, as the field's name says.
         hours = (datetime.fromisoformat(head["End UTC"])
                  - datetime.fromisoformat(head["Start UTC"])).total_seconds() / 3600
-        if hours > 0:
-            span = (start, start + timedelta(hours=hours))
     except (KeyError, ValueError, TypeError, OverflowError):
         pass
     result = RESULT.search(re.sub(r"[*`]", "", text))
@@ -94,27 +97,41 @@ def moment(text):
 def history(tasks):
     """When each task's folder changed: the commit times per task folder name, from the Git history
     of the repository holding `tasks`; None where no commit holds anything of the folder. Reads
-    only, whatever Git variables the caller's environment sets."""
+    only, whatever Git variables the caller's environment sets: nothing is fetched into a partial
+    clone, and no mailmap, pager, signature check or diff driver runs. A merge counts for the
+    paths in which it differs from its first parent: what changed on that line at that time."""
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0")
     try:
         done = subprocess.run(
-            ["git", "--no-pager", "-c", "core.quotepath=off", "-C", str(tasks), "log", "--relative",
-             "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-show-signature",
-             "-z", "--format=%x01%cI", "--", "."],
+            ["git", "--no-pager", "-C", str(tasks), "log", "--relative", "--name-only",
+             "--diff-merges=first-parent",
+             "--no-renames", "--no-ext-diff", "--no-textconv", "--no-show-signature",
+             "--no-use-mailmap", "-z", "--format=%x00%cI", "--", "."],
             capture_output=True, stdin=subprocess.DEVNULL, env=environment, timeout=GIT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
         return None
     changed = {}
-    # Each commit: \x01, its time, NUL, a newline, then the changed paths, each ended by NUL.
-    for entry in done.stdout.decode("utf-8", errors="replace").split("\x01")[1:]:
-        stamp, _, names = entry.partition("\0")
-        try:
-            when = moment(stamp)
-        except ValueError:
-            continue
-        for name in names.lstrip("\n").split("\0"):
+    # Per commit: NUL, its time, NUL, a newline, then the changed paths, each ended by NUL. A
+    # path is never empty, so the empty field before a time is the only place a commit can start.
+    fields = done.stdout.decode("utf-8", errors="replace").split("\0")
+    when, first = None, False
+    for index, field in enumerate(fields):
+        if not field:
+            when = None
+            if index + 1 < len(fields):
+                try:
+                    when = moment(fields[index + 1])
+                except ValueError:
+                    pass
+            first = None  # the next field is the time itself
+        elif first is None:
+            first = True
+        elif when:
+            name = field[1:] if first and field.startswith("\n") else field
+            first = False
             task, below, _ = name.partition("/")
             if below:
                 changed.setdefault(task, set()).add(when)
