@@ -11385,11 +11385,20 @@ class MethodSizeTest(unittest.TestCase):
 
 
 class CountTest(unittest.TestCase):
-    def run_count(self, tasks):
+    def run_count(self, tasks, *arguments, env=None):
         script = Path(__file__).with_name("count.py")
-        done = subprocess.run([sys.executable, str(script), str(tasks), "--json"],
-                              capture_output=True, text=True, check=True)
+        done = subprocess.run([sys.executable, str(script), str(tasks), "--json", *arguments],
+                              capture_output=True, text=True, check=True, env=env)
         return {row["task"]: row for row in json.loads(done.stdout)}
+
+    def snapshot(self, repository, when):
+        """Commit everything in `repository` as the private folder's snapshot job would, at `when`."""
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
+        for command in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                        "commit", "-q", "--allow-empty", "-m", "snapshot"]):
+            subprocess.run(["git", "-C", str(repository), *command], check=True, env=environment,
+                           capture_output=True)
 
     def write(self, path, role, body, end="2026-01-01T01:30:00+00:00"):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -11461,6 +11470,93 @@ class CountTest(unittest.TestCase):
             rows = self.run_count(tasks)
         self.assertEqual(rows["003"]["roles"]["reviewer"],
                          {"sessions": 1, "hours": 0.0, "results": {"running": 1}, "verdicts": {}})
+
+    def test_COUNT_TIME_elapsed_active_and_waiting_from_sessions_and_folder_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "private"
+            tasks = repository / "projects/p/tasks"
+            subprocess.run(["git", "init", "-q", str(repository)], check=True, capture_output=True)
+            closed, opened, quiet = tasks / "010", tasks / "011", tasks / "012"
+            # 010, closed: a session 00:00-01:30, folder changes seen at 03:00 and 10:00, and a
+            # session 02:30-03:30 that overlaps the hour before the first snapshot.
+            self.write(closed / "results/builder-1.md", "builder", "Result: done")
+            (closed / "results/builder-2").write_text(
+                "Role: builder\nStart UTC: 2026-01-01T02:30:00+00:00\n"
+                "End UTC: 2026-01-01T03:30:00+00:00\nExit code: 0\n\nResult: done\n")
+            (closed / "task.md").write_text("# t\n- State: closed: signed off by the request\n"
+                                            "- Next: `- State: active` is only quoted here\n")
+            # 011, open: one folder change, then nothing.
+            opened.mkdir(parents=True)
+            (opened / "task.md").write_text("# t\n\n- State: paused: resume when asked\n")
+            self.snapshot(repository, "2026-01-01T03:00:00+00:00")
+            (closed / "task.md").write_text((closed / "task.md").read_text() + "- Log: more\n")
+            self.snapshot(repository, "2026-01-01T10:00:00+00:00")
+            # 012: two changes a day apart are two hours of activity, not a day; a session with no
+            # end time is a moment, not running for ever.
+            quiet.mkdir()
+            (quiet / "task.md").write_text("# t\n- State: done, closed\n")
+            (quiet / "running").write_text(
+                "Role: reviewer\nStart UTC: 2026-01-02T20:00:00+00:00\nResult: running\n")
+            self.snapshot(repository, "2026-01-02T03:00:00+00:00")
+            (quiet / "task.md").write_text("# t\n- State: done, closed\n- more\n")
+            self.snapshot(repository, "2026-01-03T03:00:00+00:00")
+            # A later change to 011 lies after --now and must not count.
+            (opened / "note").write_text("later\n")
+            self.snapshot(repository, "2026-01-09T00:00:00+00:00")
+            elsewhere = Path(temporary) / "elsewhere"
+            subprocess.run(["git", "init", "-q", str(elsewhere)], check=True, capture_output=True)
+            before = subprocess.run(["git", "-C", str(repository), "status", "--porcelain=v2", "--branch"],
+                                    capture_output=True, text=True, check=True).stdout
+            hostile = dict(os.environ, GIT_DIR=str(elsewhere / ".git"), GIT_WORK_TREE=str(elsewhere))
+            rows = self.run_count(tasks, "--now", "2026-01-04T12:00:00+00:00", env=hostile)
+            after = subprocess.run(["git", "-C", str(repository), "status", "--porcelain=v2", "--branch"],
+                                   capture_output=True, text=True, check=True).stdout
+            text = subprocess.run([sys.executable, str(Path(__file__).with_name("count.py")), str(tasks),
+                                   "--now", "2026-01-04T12:00:00+00:00"],
+                                  capture_output=True, text=True, check=True).stdout
+        self.assertEqual(before, after)
+        time = rows["010"]["time"]
+        self.assertFalse(time["open"])
+        self.assertIsNone(time["idle"])
+        self.assertAlmostEqual(time["elapsed"], 10.0)   # 00:00 to the last activity, 10:00
+        self.assertAlmostEqual(time["sessions"], 2.5)   # 00:00-01:30 and 02:30-03:30
+        self.assertAlmostEqual(time["records"], 2.0)    # 02:00-03:00 and 09:00-10:00
+        self.assertAlmostEqual(time["active"], 4.0)     # 00:00-01:30, 02:00-03:30, 09:00-10:00
+        self.assertAlmostEqual(time["waiting"], 0.6)
+        time = rows["011"]["time"]
+        self.assertTrue(time["open"])
+        self.assertAlmostEqual(time["elapsed"], 82.0)   # 02:00 on the 1st to --now
+        self.assertAlmostEqual(time["active"], 1.0)
+        self.assertAlmostEqual(time["idle"], 81.0)
+        self.assertAlmostEqual(time["waiting"], 81 / 82)
+        time = rows["012"]["time"]
+        self.assertAlmostEqual(time["records"], 2.0)
+        self.assertAlmostEqual(time["sessions"], 0.0)
+        self.assertAlmostEqual(time["elapsed"], 25.0)   # 02:00 on the 2nd to 03:00 on the 3rd
+        self.assertAlmostEqual(time["active"], 2.0)
+        self.assertIn("time: elapsed 10.0 h; active 4.0 h (folder changes 2.0, sessions 2.5); "
+                      "waiting about 60%", text)
+        self.assertIn("waiting about 99%; open, last activity 81.0 h ago", text)
+
+    def test_COUNT_TIME_without_git_history_counts_sessions_and_says_so(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tasks = Path(temporary) / "tasks"
+            self.write(tasks / "020/results/builder-1.md", "builder", "Result: done")
+            self.write(tasks / "020/results/builder-2.md", "builder", "Result: done",
+                       end="2026-01-01T05:00:00+00:00")
+            (tasks / "021").mkdir()
+            (tasks / "021/task.md").write_text("# nothing happened here\n- State: active\n")
+            environment = dict(os.environ, GIT_CEILING_DIRECTORIES=temporary)
+            rows = self.run_count(tasks, env=environment)
+            text = subprocess.run([sys.executable, str(Path(__file__).with_name("count.py")), str(tasks)],
+                                  capture_output=True, text=True, check=True, env=environment).stdout
+        self.assertEqual(list(rows), ["020"])
+        time = rows["020"]["time"]
+        self.assertIsNone(time["records"])
+        self.assertAlmostEqual(time["elapsed"], 5.0)
+        self.assertAlmostEqual(time["active"], 5.0)
+        self.assertAlmostEqual(time["waiting"], 0.0)
+        self.assertIn("(sessions 5.0; no Git history of the folder)", text)
 
 if __name__ == "__main__":
     unittest.main()
