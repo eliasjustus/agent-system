@@ -11414,13 +11414,26 @@ class CountTest(unittest.TestCase):
             self.write(outside, "builder", "Result: done")
             self.addCleanup(outside.unlink)
             (one / "results/link.md").symlink_to(outside)
+            os.mkfifo(one / "results/pipe.md")
+            self.write(one / "results/archive.txt", "challenger", "Result: done")
+            self.write(one / "results/big.md", "verifier",
+                       "Result: done\n" + "x" * 3_000_000 + "\n**Verdict**: **inconclusive**",
+                       end="2026-01-01T01:30:00")
+            self.write(one / "results/template.md", "verifier",
+                       "Result: done\n\n`Verdict: pass | fail | inconclusive`")
+            (one / "briefs").mkdir()
+            (one / "briefs/b.md").write_text("Example:\n```\nRole: builder\nStart UTC: 2026-01-01T00:00:00+00:00\n\nResult: done\n```\n")
+            self.write(one / "results/builder-2.log", "builder", "Result: done")
             rows = self.run_count(tasks)
         self.assertEqual(list(rows), ["001"])
         roles = rows["001"]["roles"]
         self.assertEqual(roles["builder"]["sessions"], 2)
         self.assertEqual(roles["builder"]["results"], {"blocked": 1, "done": 1})
         self.assertAlmostEqual(roles["builder"]["hours"], 3.0)
-        self.assertEqual(roles["verifier"]["verdicts"], {"fail": 1, "none": 1})
+        self.assertEqual(roles["verifier"]["verdicts"], {"fail": 1, "inconclusive": 1, "none": 2})
+        self.assertEqual(roles["verifier"]["sessions"], 4)
+        self.assertAlmostEqual(roles["verifier"]["hours"], 4.5)
+        self.assertEqual(roles["challenger"]["sessions"], 1)
         self.assertEqual(rows["001"]["cost"], "estimate 1 h, actual 2 h")
 
     def test_COUNT_running_session_counts_without_hours(self):

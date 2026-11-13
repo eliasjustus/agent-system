@@ -12,42 +12,55 @@ import argparse
 import json
 import os
 import re
+import stat
 from datetime import datetime
 from pathlib import Path
 
 ROLES = ("builder", "verifier", "challenger", "reviewer", "investigator")
-HEADER = re.compile(r"^(Role|Family|Start UTC|End UTC): ?(.*)$")
-RESULT = re.compile(r"^\**Result:\**\s*([a-z ]+)", re.M)
-VERDICT = re.compile(r"^\**Verdict:\**\s*\**(pass|fail|inconclusive)\b", re.M | re.I)
+SIDECARS = (".log", ".lock")
+VERDICT = re.compile(r"^Verdict:\s*(pass|fail|inconclusive)\b(?!\s*\|)", re.M | re.I)
+RESULT = re.compile(r"^Result:\s*(done|blocked|needs decision|running|launch refused|interrupted|"
+                    r"killed|source check failed|[a-z]+)", re.M)
 COST = re.compile(r"^- Cost: (.*)$", re.M)
-LIMIT = 3_000_000
+PART = 1_000_000
 
 
 def read(path):
+    """The first and last megabyte of a regular file, never through a link, never blocking."""
     try:
-        if path.is_symlink() or path.stat().st_size > LIMIT:
-            return None
-        return path.read_text(encoding="utf-8", errors="replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
+    try:
+        size = os.fstat(fd).st_size if stat.S_ISREG(os.fstat(fd).st_mode) else -1
+        if size < 0:
+            return None
+        data = os.pread(fd, PART, 0)
+        if size > PART:
+            data += b"\n" + os.pread(fd, PART, max(PART, size - PART))
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def session(text):
-    head = {}
-    for line in text.split("\n", 40)[:40]:
-        match = HEADER.match(line)
-        if match:
-            head.setdefault(match[1], match[2].strip())
-    if head.get("Role") not in ROLES or "Start UTC" not in head:
+    """A launcher result starts with its header: `Role:` first, up to a blank or `Result:` line."""
+    lines = text.split("\n")
+    end = next((i for i, line in enumerate(lines) if not line or line.startswith("Result:")), len(lines))
+    head = dict(line.split(": ", 1) for line in lines[:end] if ": " in line)
+    if not text.startswith("Role: ") or head.get("Role") not in ROLES or "Start UTC" not in head:
         return None
     hours = None
     try:
         hours = (datetime.fromisoformat(head["End UTC"])
                  - datetime.fromisoformat(head["Start UTC"])).total_seconds() / 3600
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         pass
-    result = RESULT.search(text)
-    verdicts = VERDICT.findall(text) if head["Role"] == "verifier" else []
+    plain = re.sub(r"[*`]", "", "\n".join(lines[end:]))
+    result = RESULT.search(plain)
+    verdicts = VERDICT.findall(plain) if head["Role"] == "verifier" else []
     return {"role": head["Role"], "family": head.get("Family", ""), "hours": hours,
             "result": result[1].strip() if result else "none",
             "verdict": verdicts[-1].lower() if verdicts else None}
@@ -63,7 +76,7 @@ def count(tasks):
         for folder, folders, files in os.walk(task):
             folders[:] = [name for name in folders if not name.endswith("evidence")]
             for name in sorted(files):
-                text = read(Path(folder) / name) if name.endswith(".md") else None
+                text = None if name.endswith(SIDECARS) else read(Path(folder) / name)
                 found = session(text) if text else None
                 if not found:
                     continue

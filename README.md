@@ -512,7 +512,8 @@ challenger or reviewer snapshot.
 files under a project's task folders and prints, per task, the sessions, hours, results and
 verifier verdicts for each role, with the task's own `- Cost:` line; `--json` for further counting.
 It sees only what has a launcher header: work inside the orchestrator's own session, or by its
-subagents, is not counted. Folders whose name ends in `evidence` are skipped.
+subagents, is not counted. Folders whose name ends in `evidence` are skipped; of a file larger than
+two megabytes only the first and last megabyte are read.
 
 ## Environment
 
