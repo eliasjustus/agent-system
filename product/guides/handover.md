@@ -21,7 +21,7 @@ Verifiers, challengers and reviewers run in their own session, using the model n
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
-Review the first verification's candidate before or during verification; cheaply probe or review before long measurements.
+Run any review on the first verification's candidate, not after; cheaply probe or review before long measurements.
 
 Commit before verification (`guides/verification.md`); challengers and reviewers see uncommitted work too. Verifiers need
 `--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
