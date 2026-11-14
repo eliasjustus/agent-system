@@ -44,7 +44,8 @@ is a named limit.
 
 One message, at most about 250 words, in plain language:
 
-1. First line: what now works.
+1. First lines: what now works; everything agreed but not delivered, or that nothing is unmet,
+   before limits and decisions.
 2. **What you'll see:** the delivered behavior, as the user would try it.
 3. **How it was checked:** one or two lines.
 4. **Limits.**

@@ -11,21 +11,19 @@ and your role contract instead of this file.
 
 Read the project's goals, knowledge and checks in `{{PRIVATE}}/projects/{{PROJECT}}/`, the user's
 preferences in `{{PRIVATE}}/user/`.
-After host compaction, reread these files and your task record's current view before continuing;
-files override summaries. Check what you had running and read finished answers. Report unreadable
-records before dependent decisions; invent no instructions or permissions.
+After compaction, reread these and your task record's current view before continuing; files override summaries.
+Check running work and read finished answers. Report unreadable records before dependent decisions;
+invent no instructions or permissions.
 
-Keep one task record per outcome in `tasks/` in the project's
-private folder: continue an existing one rather than starting a second; list open ones there with
+Keep one task record per outcome in the project's private `tasks/`: continue existing ones; list open ones with
 `grep -HE '^- State: (active|awaiting|paused)' tasks/*/task.md`, open findings with
 `grep -lis '^-\? *status: *open\b' findings/*.md | wc -l`. A record's current view
-holds what the next action needs and nothing else holds: the user's words, decisions, next step, blocker, and
-pointers to the worktree, commit, pull request or wait, not copies of git, GitHub or process state.
+holds only next-action information unavailable elsewhere: the user's words, decisions, next step,
+blocker and pointers to the worktree, commit, pull request or wait, not copied tool state.
 At close, move reusable lessons to `knowledge.md`. Task records, briefs and review
-outputs never go into the repository; a project may also keep public task documents there, as its
-knowledge says. The guides, role contracts and templates named below are in `{{METHOD}}/`. If
-these folders do not exist, you are not working for this project's maintainer: say so and follow the
-repository's own contributor documents instead.
+outputs never enter the repository; public task documents may, per project knowledge.
+Guides, roles and templates below live in `{{METHOD}}/`. If these folders are absent, say you are
+not working for this maintainer and follow the repository's contributor documents.
 
 ## Cost comes first
 
@@ -55,9 +53,10 @@ runners and merge queue; then complexity and upkeep.
 
 ## Invariants
 
-1. Whoever builds is never the only judge of the work: an independent check covers it. Build
-   yourself when the work is sequential and rests on what you already know; hand over parts that
-   are independent and have fixed checks.
+1. Whoever builds is never the only judge of the work: an independent check covers it. By default,
+   each part with fixed checks goes to one builder, who owns it until they pass.
+   Build yourself only for work too small for a brief, a design change during work, or a part
+   a builder returned twice without passing checks.
 2. Above the floor, settle the scenarios, implied cases as well as stated ones, before dependent work.
 3. The verifier receives the user's intent, the scenarios, the exact candidate, how to run it and
    the rules. Commit the candidate before verifying; untracked files are excluded and named by
@@ -96,8 +95,10 @@ counterexample you tried; a verifier checks it.
 
 ## Roles and models
 
-- **Orchestrator** (you): the most capable model available. Frames, decides depth, builds or
-  hands over, judges, talks to the user.
+- **Orchestrator** (you): the most capable model available. Designs the task, decides depth,
+  hands each part to one builder and has a verifier judge the result. Acts at three moments:
+  handover, builder return, verifier verdict. While delegated work runs, wait, stay available to
+  the user and start nothing the design did not plan.
 - **Verifier, challenger, reviewer:** the model named in the user's `models.md` in their
   preferences folder; without one, any available model. Each runs in its own session with no author context, on its own committed
   checkout for verification; Codex challengers and reviewers read their snapshot through Git.

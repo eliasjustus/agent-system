@@ -63,6 +63,7 @@ reported entry point and conditions; a safe path elsewhere does not refute it.
 
 ```
 Candidate: <commit you verified>
+Unmet: <everything agreed that this candidate does not deliver, or nothing>
 | ID | Before | After | Evidence |
 | S1 | fail: <why> | pass | <file in your evidence folder> |
 ```

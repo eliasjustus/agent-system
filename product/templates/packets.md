@@ -1,9 +1,8 @@
 # Briefs
 
-Save each brief in the task folder as `briefs/<role>-<n>.md`. A brief never names the private folder
-or anything in it, except an investigator without `--web` who needs the records. Each role also receives its `roles/` contract. Include the user's decisions that bear on the work, word for
-word with their conditions, and the prerequisites earlier checks of the task proved, within what
-each role may receive.
+Save briefs as `briefs/<role>-<n>.md` in the task folder. Never name private paths, except for an
+investigator without `--web` needing records. Supply the `roles/` contract, relevant user decisions
+verbatim with conditions, and prerequisites earlier checks proved, within the role's permissions.
 
 ## Investigator
 
@@ -17,17 +16,18 @@ Leave alone: <running processes, worktrees or files not to touch>
 
 ## Builder
 
+Promise results, not implementation. One builder per part; never give two builders parts changing the same files.
+
 ```
 You are a builder. Follow the builder contract.
 Outcome: <one sentence>
 Scenarios or contract: <the agreed list, IDs and text>
-Design: <the decision, two to four sentences>
-Assignment: <exactly what to change, and where>
-Acceptance checks: <the checks written first, where they are and how to run them; otherwise
-commands or observations, with expected results; for a repair, the failing check's route, or why
-the builder cannot run it>
+Why: <need and design promises>
+Assignment: <bounded part owned>
+Left out: <exclusions>
+Acceptance checks: <checks written first: path and command; otherwise commands or observations and
+expected results; for repairs, reproducer route or why it cannot run>
 Estimate: <time range>
-Come back if: <task-specific conditions>
 Proven failures: <approaches an earlier builder proved fail, or none>
 ```
 

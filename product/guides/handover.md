@@ -2,14 +2,17 @@
 
 ## Build or hand over
 
-Invariant 1 says when: a brief carries less than you hold. Hand over to **Codex** when outcome,
-design and acceptance checks are settled, otherwise to a **Claude** builder.
+By default, each part with fixed checks goes to one builder, who owns it until they pass.
+Build yourself only for work too small for a brief, a design change during work, or a
+part a builder returned twice without passing checks. Whoever builds is never the only judge.
+Hand over to **Codex** when outcome, design and acceptance checks are settled, otherwise to a
+**Claude** builder.
 
 ## Briefs
 
-Write every brief from `templates/packets.md` and put nothing else in. Every role but an
-investigator without `--web` is shut out of the private folder, so a brief carries everything the
-role needs.
+Use only `templates/packets.md`; briefs must suffice without private records, except for investigators
+without `--web`. Builder briefs state promises, reasons, exclusions and checks deciding
+done, not how to build. One builder per part; never give two builders parts changing the same files.
 
 ## Run reviews
 
@@ -18,29 +21,25 @@ Verifiers, challengers and reviewers run in their own session, using the model n
 
 `python3 {{METHOD}}/run.py --role verifier --family codex --brief <brief> --out <task folder>/results/verifier-1.md --before <baseline commit>`
 
-When the work will get a review, run it on the same candidate as its first verification, not after;
-before a long measurement, review or probe the candidate cheaply first.
+Review the first verification's candidate before or during verification; cheaply probe or review before long measurements.
 
-Before verification, commit the candidate (`guides/verification.md`); challengers and reviewers
-read a snapshot that includes uncommitted work. Verifiers need
+Commit before verification (`guides/verification.md`); challengers and reviewers see uncommitted work too. Verifiers need
 `--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
 `--writable DIR` only when the work needs them. Give each repair sequence its own results folder
-(`guides/recovery.md`). The header records what each session was given; the result file
-decides what completed. The rest is in `run.py --help` and the Agent System README
-(github.com/eliasjustus/agent-system). Never relay or summarise a review before reading it in full.
+(`guides/recovery.md`). Headers record session inputs; result files decide completion.
+See `run.py --help` and the Agent System README (github.com/eliasjustus/agent-system).
+Read reviews in full before relaying or summarising.
 
-Without the launcher, the same safeguards apply: a detached worktree at the exact committed
-candidate (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
+Without the launcher: a detached worktree at the exact committed candidate
+(`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
 (an executable regular file that exits 0 and leaves tracked files matching the candidate), a
-fresh session using the model named in the user's `models.md`, with the role contract, the brief and, for a verifier,
+fresh session using the user's `models.md` model, with contract, brief and, for a verifier,
 `guides/verification.md`; its answer and evidence kept unedited in `results/`; the same written
 decision from the third verification on; the worktree removed afterwards.
 
-Investigations, research and analyses that change nothing run the same way with `--role
-investigator`: in the repository itself, read-only, and allowed to read the
-private records when the brief needs them. Add `--web` for web research: that session cannot read
-the private folder, but can send out what it reads, so not for projects whose files must stay
-local.
+Read-only investigations run likewise with `--role investigator`: in the repository, with private
+records when needed. Add `--web` for web research: private records are then hidden, but readable
+files can leave the machine, so never for projects whose files must stay local.
 
 ## Checks first (above the floor)
 

@@ -2,7 +2,12 @@
 
 Agent System gives the owner's projects one consistent way for AI coding agents to work, and one
 way to set it up. Agents clarify the user's intent, agree what “done” means, weigh the cost of
-their work, and have a separate session check it.
+their work, and have a separate session check it. The session holding the task designs it, a builder
+builds each part by default, and a verifier judges the result. While delegated work runs, the task's
+session waits, stays available to the user and starts nothing outside the design. Builders decide
+implementation details and return once, after finishing everything independent of open design
+questions; they keep the acceptance checks unchanged. Reports and delivery messages name unmet
+agreements before limits and decisions.
 The aim is complete, verified changes for as little of the user's attention as possible.
 
 The method is plain instructions that Claude Code and Codex load in a project. The launcher for
