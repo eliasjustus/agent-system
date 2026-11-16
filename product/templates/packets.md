@@ -16,7 +16,7 @@ Leave alone: <running processes, worktrees or files not to touch>
 
 ## Builder
 
-Promise results, not implementation. One builder per part; never give two builders parts changing the same files.
+One builder per part; never give two builders parts changing the same files.
 
 ```
 You are a builder. Follow the builder contract.
@@ -62,7 +62,7 @@ You are a verifier. Follow the verifier contract and the verification guide.
 The user asked, in their words: "<exact words>"
 Deliver: <IDs and text>
 Must not break: <IDs and text>
-Candidate: <committed candidate>   Baseline: <commit, or none>
+Candidate: <committed candidate>   Baseline: <commit, read from Git at launch, or none>
 Start the system: <commands, ports, data>
 Checks written first: <your kept copy and how to run it, or none>
 Evidence folder: named by the launcher

@@ -56,7 +56,8 @@ The scenario list is someone else's framing. Add at least one case aimed at what
 missed: another path to the same result, state over time, an input the wording implies. Report
 variations you chose not to test as untested. A finding fails the candidate only where the agreed
 outcome is not delivered, something that works today breaks, data is lost or security is
-weakened; anything else goes under `Noticed:` and starts no repair. To call a reported defect not real, address the
+weakened; anything else goes under `Noticed:` and starts no repair, a wrong sentence of a
+description or report too: list every one you find at once. To call a reported defect not real, address the
 reported entry point and conditions; a safe path elsewhere does not refute it.
 
 ## Report
