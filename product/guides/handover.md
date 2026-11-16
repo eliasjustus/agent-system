@@ -20,16 +20,15 @@ Verifiers, challengers and reviewers run in their own session, using the model n
 
 Run any review on the first verification's candidate, not after; cheaply probe or review before long measurements.
 
-Commit before verification (`guides/verification.md`); challengers and reviewers see uncommitted work too. Verifiers need
-`--before <commit>` or `--before none`. Give Codex builders and verifiers `--network` or
+Challengers and reviewers see uncommitted work too. Give Codex builders and verifiers `--network` or
 `--writable DIR` only when the work needs them. Give each repair sequence its own results folder
 (`guides/recovery.md`). Headers record session inputs; result files decide completion.
 See `run.py --help` and the Agent System README (github.com/eliasjustus/agent-system).
 Read reviews in full before relaying or summarising.
 
-The statements of a readme, report or design are not a verifier's scenarios: a reviewer of a text
-(`templates/packets.md`) lists every one its sources do not support, at once.
-A corrected sentence starts no new verification: the reviewer rechecks the changed passages.
+A readme's, report's or design's statements are not a verifier's scenarios: a reviewer of a text
+lists every one its sources do not support, at once.
+A corrected sentence starts no new verification: the reviewer rechecks it.
 
 Without the launcher: a detached worktree at the exact committed candidate
 (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
@@ -70,8 +69,7 @@ already asked is not news (see `guides/delivery.md`).
 - A prerequisite a check proved (an environment variable, a path limit, a lock, a launch option)
   goes into every later brief of the task; what a worker's sandbox refuses, with the working
   alternative, into the project's `worker-notes.md`, which the launcher attaches to builders'
-  and verifiers' briefs (Agent System README).
+  and verifiers' briefs.
 - A plan or synthesis you write from agents' answers is itself a candidate: before delivering it,
   have its consequential transformations (units, identities, arithmetic, rankings, dropped
   constraints) checked against those answers.
-- Weaker models judge their limits poorly: review at checkpoints.
