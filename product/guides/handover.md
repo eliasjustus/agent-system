@@ -2,17 +2,14 @@
 
 ## Build or hand over
 
-By default, each part with fixed checks goes to one builder, who owns it until they pass.
-Build yourself only for work too small for a brief, a design change during work, or a
-part a builder returned twice without passing checks. Whoever builds is never the only judge.
-Hand over to **Codex** when outcome, design and acceptance checks are settled, otherwise to a
-**Claude** builder.
+Who builds: the entry's invariant 1. Hand over to **Codex** when outcome, design and acceptance
+checks are settled, otherwise to a **Claude** builder.
 
 ## Briefs
 
 Use only `templates/packets.md`; briefs must suffice without private records, except for investigators
 without `--web`. Builder briefs state promises, reasons, exclusions and checks deciding
-done, not how to build. One builder per part; never give two builders parts changing the same files.
+done, not how to build.
 
 ## Run reviews
 
@@ -29,6 +26,10 @@ Commit before verification (`guides/verification.md`); challengers and reviewers
 (`guides/recovery.md`). Headers record session inputs; result files decide completion.
 See `run.py --help` and the Agent System README (github.com/eliasjustus/agent-system).
 Read reviews in full before relaying or summarising.
+
+The statements of a readme, report or design are not a verifier's scenarios: a reviewer of a text
+(`templates/packets.md`) lists every one its sources do not support, at once.
+A corrected sentence starts no new verification: the reviewer rechecks the changed passages.
 
 Without the launcher: a detached worktree at the exact committed candidate
 (`git worktree add --detach <checkout> <commit>`), `.agents/preflight` first if present
@@ -67,7 +68,9 @@ already asked is not news (see `guides/delivery.md`).
 - Read the answer before acting on it. Answer every must-fix finding in the task record: fixed, or
   rejected with its reason. A later cleanup error does not erase a completed answer.
 - A prerequisite a check proved (an environment variable, a path limit, a lock, a launch option)
-  goes into every later brief of the task.
+  goes into every later brief of the task; what a worker's sandbox refuses, with the working
+  alternative, into the project's `worker-notes.md`, which the launcher attaches to builders'
+  and verifiers' briefs (Agent System README).
 - A plan or synthesis you write from agents' answers is itself a candidate: before delivering it,
   have its consequential transformations (units, identities, arithmetic, rankings, dropped
   constraints) checked against those answers.
