@@ -108,7 +108,8 @@ counterexample you tried; a verifier checks it.
 
 Discovery, scenarios and design: `guides/discovery.md` · before delegating: `guides/handover.md` ·
 before verifying: `guides/verification.md` · a failed or unclear check: `guides/recovery.md` ·
-delivery and verdict: `guides/delivery.md` · taking over or pausing: `guides/takeover.md`.
+delivery and verdict: `guides/delivery.md` · taking over or pausing: `guides/takeover.md` ·
+a study of approaches: `guides/research.md`.
 
 ## Deciding
 
