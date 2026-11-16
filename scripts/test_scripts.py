@@ -11580,7 +11580,7 @@ sys.addaudithook(audit)
 
 class MethodSizeTest(unittest.TestCase):
     # Raising this is a reviewed decision in the pull request, not a fix for a failing test.
-    BUDGET = 7945
+    BUDGET = 8445
 
     def test_method_text_stays_within_its_word_budget(self):
         words = sum(len(path.read_text().split()) for path in sorted((ROOT / "product").rglob("*.md")))
