@@ -4,6 +4,9 @@ For a study that asks which approaches exist and which to pursue, where the answ
 or the next experiments. A routine choice inside a step (a library, a flag, a known fix) follows the
 ordinary rungs instead.
 
+The session holding the study keeps the notes and the ledger, downloads and runs experiments; an
+investigator may run part of the survey within its role and returns rows for the notes.
+
 ## Before the choice
 
 1. Read the project's ledger of approaches tried (one row each: source, tried or not, figures,
@@ -39,5 +42,5 @@ Before delivery, two checks by sessions without author context: the **process**,
 transcript's search log, the notes, the new ledger rows and the report (survey before the choice,
 open searches open, levels matching the log, rows for every "considered" and absence statement,
 three candidates per area checked against the ledger, ledger appended); and the **text**, the report
-against its sources (every unsupported, overstated or contradicted statement, absence claims first,
-arithmetic recomputed). Name both verdicts in the delivery.
+against its sources (`templates/packets.md`, reviewer of a text, with arithmetic recomputed).
+Name both verdicts in the delivery.
