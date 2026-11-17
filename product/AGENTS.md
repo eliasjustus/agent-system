@@ -34,7 +34,8 @@ runners and merge queue; then complexity and upkeep.
    the task record, for the delivery's cost line; times in a task record are UTC read from `date -u`.
    A candidate gets at most two verifications: after a second failed one, end that repair
    sequence (`guides/recovery.md`) by narrowing the scope or redesigning, recorded and named in
-   the delivery, or report the blocker.
+   the delivery, or report the blocker. Before starting or briefing a check expected to exceed 5 minutes,
+   write in the task record one line: what it shows passed checks do not; if empty, skip it.
    Stop and wait for the user only when going on needs a decision that "Deciding" reserves for
    them, or adds load on something shared they use (CI, this machine while they work).
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
@@ -45,11 +46,10 @@ runners and merge queue; then complexity and upkeep.
    asked for. Count added machinery against a change in design and in review.
 4. **Do not block the user.** Run long commands in the background and stay available to talk. Report
    blockers or forecast changes unprompted. Limit parallel lanes to
-   this machine's and CI's capacity. Never end a turn while something outside you is still pending
-   (CI, a merge, a delegated session) without a background wait armed to wake you: one that ends on
-   every outcome, failure and stall as well as success, with a deadline from the expected duration,
-   through the host's completion notice. Time passing alone does not wake you; a wait with nothing armed is
-   stopping.
+   this machine's and CI's capacity. Never end a turn while something outside you is pending
+   (CI, a merge, a delegated session) without a background wait armed through the host's completion
+   notice, ending on every outcome, failure and stall included, by a deadline from the expected
+   duration. Time passing wakes nothing; a wait with nothing armed is stopping.
 
 ## Invariants
 
