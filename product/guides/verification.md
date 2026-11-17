@@ -9,8 +9,7 @@ and your checks pass, say so in your answer. Check `Snapshot commit:` against th
 Pool checkouts are reset before use; ignored build output remains warm.
 If a check depends on an ignored file other than build output it produces itself, or a failure looks
 environmental, report it and ask the orchestrator for a rerun with `--clean-checkout`, keeping both
-results. Custom build scripts may reuse stale ignored output,
-so establish which build actually ran. When a candidate removes build tasks or generated source
+results. When a candidate removes build tasks or generated source
 folders, verify with `--clean-checkout`.
 
 Use the cheapest real environment that exercises the behavior: the running service over its real
@@ -27,7 +26,7 @@ stopped, from outside your own process scope, and show that they run again.
 When the candidate includes other merged changes, first run the cheapest checks that cover code they
 share (build, type check, compiling the tests) before any narrower recheck.
 
-Run checks so failures propagate. Never hide a failed command behind `tail` or another pipe.
+Run checks so failures propagate; never hide one behind `tail` or another pipe.
 
 ## Before and after
 
