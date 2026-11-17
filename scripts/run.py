@@ -1242,7 +1242,7 @@ def remove_unused_storage(cache):
 
     root = cache / "am"
     try:
-        if not real_folder(root):
+        if not os.path.lexists(root) or not real_folder(root):
             return
         entries = sorted(root.iterdir())
         # A session's scope exists in the cgroup tree while any of its processes run.
@@ -1259,21 +1259,33 @@ def remove_unused_storage(cache):
         # Only the launcher's layout: tempfile's 8 letters and a tmp folder.
         if not re.fullmatch(r"[a-z0-9_]{8}", name):
             continue
+        marker = folder / ".removing"
         try:
-            if not real_folder(folder) or not real_folder(folder / "tmp"):
+            if not real_folder(folder):
+                continue
+            # Removal refreshes folder times, so a started one carries a marker instead.
+            def present(path, kind):
+                # Only absence is silent; an unreadable folder is reported below.
+                try:
+                    return kind(path.lstat().st_mode)
+                except FileNotFoundError:
+                    return False
+            started = present(marker, stat.S_ISREG)
+            if not started and not present(folder / "tmp", stat.S_ISDIR):
                 continue
             if any(unit.endswith(f"-{name}.scope") for unit in scopes):
                 continue
-            # Cheap test first, then every entry: a running session writes deep inside.
-            if now - max([folder.lstat().st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
-                                                      for entry in os.scandir(folder)]) <= SESSION_RETENTION_DAYS * 86400:
-                continue
-            latest = 0
-            for parent, directories, files in os.walk(folder):
-                for item in directories + files:
-                    latest = max(latest, os.lstat(os.path.join(parent, item)).st_mtime)
-            if now - latest <= SESSION_RETENTION_DAYS * 86400:
-                continue
+            if not started:
+                # Cheap test first, then every entry: a running session writes deep inside.
+                if now - max([folder.lstat().st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
+                                                          for entry in os.scandir(folder)]) <= SESSION_RETENTION_DAYS * 86400:
+                    continue
+                latest = 0
+                for parent, directories, files in os.walk(folder):
+                    for item in directories + files:
+                        latest = max(latest, os.lstat(os.path.join(parent, item)).st_mtime)
+                if now - latest <= SESSION_RETENTION_DAYS * 86400:
+                    continue
             if users is None:
                 users = session_users()
             if users is None or any(Path(path).is_relative_to(folder) for path in users):
@@ -1282,9 +1294,11 @@ def remove_unused_storage(cache):
             if lock is None:
                 continue
             try:
-                # tmp goes last, so an interrupted removal still has the launcher's layout.
-                for entry in sorted(os.scandir(folder), key=lambda entry: entry.name == "tmp"):
-                    remove_checkout_tree(Path(entry.path))
+                os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+                for entry in os.scandir(folder):
+                    if entry.name != ".removing":
+                        remove_checkout_tree(Path(entry.path))
+                marker.unlink()
                 folder.rmdir()
             finally:
                 os.close(lock)
