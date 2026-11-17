@@ -1177,8 +1177,8 @@ def remove_unused_storage(cache):
     """Best effort: remove the launcher's own expired slots and session folders."""
     now = time.time()
 
-    def unlocked(path, flags):
-        # A held lock means a live owner; a failed probe means "keep".
+    def locked_out(path, flags=os.O_RDONLY | os.O_DIRECTORY):
+        # Our exclusive lock means no live owner; a failed probe means "keep".
         try:
             descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
@@ -1190,82 +1190,129 @@ def remove_unused_storage(cache):
             os.close(descriptor)
             return None
 
-    for pool in sorted((cache / "am-pool").glob("*-" + "[0-9a-f]" * 12)):
-        if pool.is_symlink() or not pool.is_dir():
+    def real_folder(path):
+        info = path.lstat()
+        return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+
+    pools = cache / "am-pool"
+    try:
+        listed = sorted(pools.glob("*-" + "[0-9a-f]" * 12)) if real_folder(pools) else []
+    except OSError:
+        listed = []
+    for pool in listed:
+        try:
+            if not real_folder(pool):
+                continue
+            pool_lock = locked_out(pool)
+        except OSError:
             continue
-        for number in range(1, POOL_SLOTS + 1):
-            slot, metadata = pool / f"slot-{number}", pool / f"slot-{number}.json"
-            try:
-                info = metadata.lstat()
-                if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
-                    continue
-                lock = unlocked(pool / f"slot-{number}.lock", os.O_RDONLY)
-                if lock is None:
-                    continue
+        if pool_lock is None:
+            continue
+        try:
+            for number in range(1, POOL_SLOTS + 1):
+                slot, metadata = pool / f"slot-{number}", pool / f"slot-{number}.json"
                 try:
-                    if metadata.lstat().st_mtime != info.st_mtime:
+                    info = metadata.lstat()
+                    if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
                         continue
-                    for path in (slot, metadata.with_suffix(".json.tmp")):
-                        if os.path.lexists(path):
-                            remove_checkout_tree(path)
-                    # Metadata last: an interrupted removal is retried by a later launch.
-                    metadata.unlink()
-                finally:
-                    os.close(lock)
-            except FileNotFoundError:
-                pass
-            except Exception as error:
-                diagnostic(f"Storage cleanup skipped {slot}: {error}")
+                    checkout_metadata(metadata)
+                    # A launcher checkout is a linked worktree: .git is a file.
+                    if os.path.lexists(slot) and not (real_folder(slot)
+                                                      and stat.S_ISREG((slot / ".git").lstat().st_mode)):
+                        continue
+                    lock = locked_out(pool / f"slot-{number}.lock", os.O_RDONLY)
+                    if lock is None:
+                        continue
+                    try:
+                        if metadata.lstat().st_mtime != info.st_mtime:
+                            continue
+                        for path in (slot, metadata.with_suffix(".json.tmp")):
+                            if os.path.lexists(path):
+                                remove_checkout_tree(path)
+                        # Metadata last: an interrupted removal is retried by a later launch.
+                        metadata.unlink()
+                    finally:
+                        os.close(lock)
+                except FileNotFoundError:
+                    pass
+                except Exception as error:
+                    diagnostic(f"Storage cleanup skipped {slot}: {error}")
+        finally:
+            os.close(pool_lock)
 
     root = cache / "am"
-    # A session's scope exists in the cgroup tree while any of its processes run.
     try:
-        scopes = {entry.name for entry in os.scandir(agents_slice())}
-    except FileNotFoundError:
-        scopes = set()
-    except OSError as error:
-        diagnostic(f"Storage cleanup skipped session folders: cannot read scopes: {error}")
-        return
-    try:
+        if not real_folder(root):
+            return
         entries = sorted(root.iterdir())
-    except OSError:
+        # A session's scope exists in the cgroup tree while any of its processes run.
+        try:
+            scopes = {entry.name for entry in os.scandir(agents_slice())}
+        except FileNotFoundError:
+            scopes = set()
+    except OSError as error:
+        diagnostic(f"Storage cleanup skipped session folders: {error}")
         return
+    users = None
     for folder in entries:
-        expired = folder.name.startswith(".expired-")
-        name = folder.name.removeprefix(".expired-")
-        # Only folders with the launcher's name and layout: tempfile's 8 letters and tmp/.
+        name = folder.name
+        # Only the launcher's layout: tempfile's 8 letters and a tmp folder.
         if not re.fullmatch(r"[a-z0-9_]{8}", name):
             continue
         try:
-            info = folder.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            if not real_folder(folder) or not real_folder(folder / "tmp"):
                 continue
-            if not expired:
-                if not stat.S_ISDIR((folder / "tmp").lstat().st_mode):
-                    continue
-                if any(unit.endswith(f"-{name}.scope") for unit in scopes):
-                    continue
-                activity = max([info.st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
-                                                  for entry in os.scandir(folder)])
-                if now - activity <= SESSION_RETENTION_DAYS * 86400:
-                    continue
-            lock = unlocked(folder, os.O_RDONLY | os.O_DIRECTORY)
+            if any(unit.endswith(f"-{name}.scope") for unit in scopes):
+                continue
+            # Cheap test first, then every entry: a running session writes deep inside.
+            if now - max([folder.lstat().st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
+                                                      for entry in os.scandir(folder)]) <= SESSION_RETENTION_DAYS * 86400:
+                continue
+            latest = 0
+            for parent, directories, files in os.walk(folder):
+                for item in directories + files:
+                    latest = max(latest, os.lstat(os.path.join(parent, item)).st_mtime)
+            if now - latest <= SESSION_RETENTION_DAYS * 86400:
+                continue
+            if users is None:
+                users = session_users()
+            if users is None or any(Path(path).is_relative_to(folder) for path in users):
+                continue
+            lock = locked_out(folder)
             if lock is None:
                 continue
             try:
-                if not expired:
-                    target = root / (".expired-" + name)
-                    if os.path.lexists(target):
-                        continue
-                    folder.rename(target)
-                    folder = target
-                remove_checkout_tree(folder)
+                # tmp goes last, so an interrupted removal still has the launcher's layout.
+                for entry in sorted(os.scandir(folder), key=lambda entry: entry.name == "tmp"):
+                    remove_checkout_tree(Path(entry.path))
+                folder.rmdir()
             finally:
                 os.close(lock)
         except FileNotFoundError:
             pass
         except Exception as error:
             diagnostic(f"Storage cleanup skipped {folder}: {error}")
+
+
+def session_users():
+    """Working folders and TMPDIRs of this user's processes, or None if unreadable."""
+    paths = []
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            paths.append(os.readlink(process / "cwd"))
+            for item in (process / "environ").read_bytes().split(b"\0"):
+                if item.startswith((b"TMPDIR=", b"TMP=", b"TEMP=")):
+                    paths.append(os.fsdecode(item.split(b"=", 1)[1]))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as error:
+            diagnostic(f"Storage cleanup skipped session folders: cannot read {process}: {error}")
+            return None
+    return paths
 
 
 def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
@@ -1500,8 +1547,19 @@ def checkout_changes(repo, previous, commit, force_clean, untracked=None):
     return "; ".join(reasons), distance
 
 
-def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=(), before_commit="",
-                   reserved=None):
+def lease_checkout(*args, **kwargs):
+    # Ranking reads slots before locking them; storage cleanup skips a pool while
+    # any launcher holds this shared lock on the pool folder.
+    ranking = []
+    try:
+        return choose_checkout(*args, ranking=ranking, **kwargs)
+    finally:
+        for descriptor in ranking:
+            os.close(descriptor)
+
+
+def choose_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=(), before_commit="",
+                    reserved=None, ranking=None):
     # Reftable keeps per-worktree refs in admin/reftable, which the pool's
     # admin-state reset cannot discard. Bypass it before creating any slots.
     if git(repo, "config", "--default=files", "--get", "extensions.refStorage") == "reftable":
@@ -1514,6 +1572,9 @@ def lease_checkout(repo, cache, commit, fresh, leases, force_clean, untracked=()
     key = hashlib.sha256(os.fsencode(common)).hexdigest()[:12]
     pool = (cache / "am-pool" / f"{Path(main).name}-{key}").resolve()
     pool.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(pool, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    ranking.append(descriptor)
+    fcntl.flock(descriptor, fcntl.LOCK_SH)
     failures = []
     reservation = None
     excluded = set()

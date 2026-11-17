@@ -6539,9 +6539,9 @@ subprocess.check_output = fail
 
     def test_POOL_R7_readme_documents_orphan_pool_cleanup_and_full_fallback(self):
         readme = (ROOT / "README.md").read_text()
-        for phrase in ("full temporary checkout", "du -sh <cache>/am-pool/*",
-                       "Moved, renamed or deleted repositories", "never reclaimed automatically",
-                       "git -C /path/to/project worktree prune"):
+        for phrase in ("full temporary checkout", "more than **7 days**",
+                       "pools of moved or deleted repositories", "more than **14 days**",
+                       "git worktree prune"):
             self.assertIn(phrase, readme)
 
     def test_S4_old_python_refused_before_writes_or_launch(self):
