@@ -5443,7 +5443,7 @@ subprocess.run([sys.executable, "-c",
                     writable = role in ("builder", "verifier")
                     evidence = str(Path(record["tmpdir"]).parent / "evidence")
                     if family == "codex":
-                        expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]
+                        expected = ["exec", "-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=high"]
                         if role == "investigator":
                             expected += ["-s", "read-only"]
                         else:
@@ -6816,7 +6816,7 @@ os.lstat = lambda *args, **kwargs: checked_stat(original_lstat, *args, **kwargs)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.record.read_text())
                 if family == "codex":
-                    expected = ["exec", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high",
+                    expected = ["exec", "-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=high",
                                 "-s", "read-only", "-C", str(self.repo), "-o",
                                 str(Path(record["tmpdir"]).parent / "answer"), "-"]
                 else:
@@ -7161,7 +7161,7 @@ tempfile.TemporaryDirectory.cleanup = cleanup
                     args = record["argv"]
                     writable = role in ("builder", "verifier")
                     if family == "codex":
-                        self.assertEqual(args[:5], ["exec", "-m", "gpt-6.1-sol", "-c",
+                        self.assertEqual(args[:5], ["exec", "-m", "gpt-6.2-sol", "-c",
                                                    "model_reasoning_effort=high"])
                         if role == "investigator":
                             self.assertEqual(args[args.index("-s") + 1], "read-only")
