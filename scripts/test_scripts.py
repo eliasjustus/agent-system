@@ -7511,6 +7511,23 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 self.assertEqual(record["argv"][record["argv"].index("-m") + 1], "literal-$HOME")
                 self.assertTrue((self.scope_state / (unit + ".stop")).exists())
 
+    def test_L2_session_memory_high_override_and_invalid_values(self):
+        for value, expected in (("512M", "512M"), ("1024T", "1024T"), ("garbage", "16G"), ("0", "16G"),
+                                ("1025T", "16G"), ("16777216T", "16G"), ("18446744073709551616", "16G"),
+                                ("256M\nMemoryMax=1", "16G")):
+            with self.subTest(value=value):
+                self.env["AGENT_SESSION_MEMORY_HIGH"] = value
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                unit = [line[7:] for line in self.out.read_text().splitlines() if line.startswith("Scope: ")][0]
+                args = json.loads((self.scope_state / unit).read_text())
+                self.assertEqual(args[args.index("-p") + 1], "MemoryHigh=" + expected)
+                self.assertNotIn("MemoryMax", " ".join(args[:args.index("--")]))
+                if expected == "16G":
+                    self.assertIn("AGENT_SESSION_MEMORY_HIGH is invalid", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+
     def test_gradle_registry_is_session_local_and_preserves_caller_environment(self):
         self.agent_extra('''
 record["gradle_opts"] = os.environ.get("GRADLE_OPTS")

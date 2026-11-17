@@ -1999,7 +1999,8 @@ def launch(parser, args, result):
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
         # Each scope's own limit throttles one runaway session before agents.slice fills.
         memory_high = os.environ.get("AGENT_SESSION_MEMORY_HIGH", SESSION_MEMORY_HIGH)
-        if not re.fullmatch(r"[1-9][0-9]*[KMGT]?", memory_high):
+        matched = re.fullmatch(r"([1-9][0-9]{0,15})([KMGT]?)", memory_high)
+        if not matched or int(matched[1]) * 1024 ** " KMGT".index(matched[2] or " ") > 1024**5:
             diagnostic(f"AGENT_SESSION_MEMORY_HIGH is invalid ({ascii(memory_high)}); "
                        f"using the default {SESSION_MEMORY_HIGH}")
             memory_high = SESSION_MEMORY_HIGH
