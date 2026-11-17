@@ -1226,9 +1226,14 @@ def remove_unused_storage(cache):
                     try:
                         if metadata.lstat().st_mtime != info.st_mtime:
                             continue
-                        for path in (slot, metadata.with_suffix(".json.tmp")):
-                            if os.path.lexists(path):
-                                remove_checkout_tree(path)
+                        if os.path.lexists(slot):
+                            # .git goes last, so an interrupted removal still looks like a checkout.
+                            for entry in os.scandir(slot):
+                                if entry.name != ".git":
+                                    remove_checkout_tree(Path(entry.path))
+                            remove_checkout_tree(slot)
+                        if os.path.lexists(metadata.with_suffix(".json.tmp")):
+                            remove_checkout_tree(metadata.with_suffix(".json.tmp"))
                         # Metadata last: an interrupted removal is retried by a later launch.
                         metadata.unlink()
                     finally:

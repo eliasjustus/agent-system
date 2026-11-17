@@ -631,8 +631,8 @@ repository's pool under its cache root, including pools of moved or deleted repo
 - a pool slot whose last lease is more than **7 days** old (the modification time of its
   `slot-N.json`, which every lease rewrites) and whose lock no session holds: its checkout and
   metadata go, its lock file stays; the next lease of that slot builds it cold;
-- a session folder under `<cache>/am` whose last activity (the newest modification time of the
-  folder and its top-level entries) is more than **14 days** old, whose launcher no longer holds
+- a session folder under `<cache>/am` whose last activity (the newest modification time of
+  anything in it) is more than **14 days** old, whose launcher no longer holds
   its lock and whose `agent-*-<folder>.scope` is not loaded. This includes a folder a result
   header names as kept after a failed save or stop: copy what you need from it within 14 days.
 
