@@ -651,8 +651,8 @@ the launch's result; the first launch after folders expire takes as long as remo
 protections are against what agents leave inside their own checkout and session folder (links,
 pipes, read-only output) and against other launchers. Sessions that can write elsewhere in the
 cache (Claude sessions, whose shield hides only the private folder, and the user's own sessions)
-are trusted not to replace, mount or plant folders there. Each launch reads every file of a session folder that looks expired, until it is
-removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
+are trusted not to replace, mount or plant folders there. Each launch reads every file of a launcher session folder whose top-level
+entries are all older than 14 days and whose scope is not loaded, until it is removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
 removed slots stay in their repository until `git worktree prune` or Git's own expiry; the next
 lease of the slot replaces its own.
 
