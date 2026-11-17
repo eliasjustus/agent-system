@@ -581,7 +581,7 @@ counts as of an earlier moment.
 | Variable | Effect |
 | --- | --- |
 | `AGENT_CLAUDE_MODEL` | Claude launcher model and the builder definitions generated at setup; default `claude-opus-5-5` |
-| `AGENT_CODEX_MODEL` | Codex launcher model; default `gpt-6.1-sol` |
+| `AGENT_CODEX_MODEL` | Codex launcher model; default `gpt-6.2-sol` |
 | `AGENT_CODEX_EFFORT` | Codex reasoning effort; default `high`. Values pass through to the CLI, which rejects unsupported values. |
 | `AGENT_CLAUDE_CMD` | Claude executable name or path; default `claude` |
 | `AGENT_CODEX_CMD` | Codex executable name or path; default `codex` |

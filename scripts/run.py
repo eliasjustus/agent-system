@@ -1874,7 +1874,7 @@ def launch(parser, args, result):
         prompt += ("\n## Project notes for this session's environment, supplied by the orchestrator\n"
                    + notes)
     model = (os.environ.get(f"AGENT_{args.family.upper()}_MODEL")
-             or ("claude-opus-5-5" if args.family == "claude" else "gpt-6.1-sol"))
+             or ("claude-opus-5-5" if args.family == "claude" else "gpt-6.2-sol"))
     executable = os.environ.get(f"AGENT_{args.family.upper()}_CMD") or args.family
     found = shutil.which(executable)
     if found is None:
