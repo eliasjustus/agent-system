@@ -632,18 +632,25 @@ repository's pool under its cache root, including pools of moved or deleted repo
   `slot-N.json`, which every lease rewrites) and whose lock no session holds: its checkout and
   metadata go, its lock file stays; the next lease of that slot builds it cold;
 - a session folder under `<cache>/am` whose last activity (the newest modification time of
-  anything in it) is more than **14 days** old, whose launcher no longer holds
-  its lock and whose `agent-*-<folder>.scope` is not loaded. This includes a folder a result
-  header names as kept after a failed save or stop: copy what you need from it within 14 days.
+  anything in it) is more than **14 days** old, whose launcher no longer holds its lock, whose
+  `agent-*-<folder>.scope` is not loaded, and in which none of the user's processes works or has
+  its temporary folder. This includes a folder a result header names as kept after a failed save
+  or stop: copy what you need from it within 14 days.
 
-Only folders with the launcher's names and layout are removed: eight letters, digits or `_` with
-a `tmp` folder in `<cache>/am`, `slot-N` and its metadata in `<cache>/am-pool/<name>-<hash>`.
-An empty pool slot folder, what an interrupted removal leaves, is removed too; a session
-folder whose removal is interrupted at its very last step stays as an empty folder.
-Folders agents make by hand there, symlinks and other files stay. A cleanup error is printed and
-never changes the launch. There is no size or count limit: slots in use stay warm. Stale worktree
-registrations of removed slots stay in their repository until `git worktree prune` or Git's own
-expiry; the next lease of the slot replaces its own.
+A session folder counts as the launcher's when its name is eight letters, digits or `_`, its
+mode is 0700, it holds a `tmp` folder, and it holds either the `.am-session` file launchers write
+since this rule or an `answer` file. Folders older launchers left without an `answer` file (an
+agent killed before answering) look like folders made by hand and stay; remove them yourself.
+Pool slots count as the launcher's when they are `slot-N` with valid metadata in
+`<cache>/am-pool/<name>-<hash>` and hold a worktree `.git` file. An empty slot folder, which an
+interrupted removal leaves, is removed too; a session folder whose removal is interrupted at its
+very last step stays as an empty folder. Folders agents make by hand, symlinks and other files
+stay, and nothing is removed through a path renamed or replaced during the removal. A folder
+cleanup cannot read completely is kept and reported. A cleanup error is printed and never changes
+the launch. Each launch reads every file of a session folder that looks expired, until it is
+removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
+removed slots stay in their repository until `git worktree prune` or Git's own expiry; the next
+lease of the slot replaces its own.
 
 To roll back, stop current sessions, remove their pool with the procedure above, check out the previous release tag in this clone and rerun setup for each
 project with those same arguments.
