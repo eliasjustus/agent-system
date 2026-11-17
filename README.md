@@ -642,17 +642,18 @@ mode is 0700, it holds a `tmp` folder, and it holds either the `.am-session` fil
 since this rule or an `answer` file. Folders older launchers left without an `answer` file (an
 agent killed before answering) look like folders made by hand and stay; remove them yourself.
 Pool slots count as the launcher's when they are `slot-N` with valid metadata in
-`<cache>/am-pool/<name>-<hash>` and hold a worktree `.git` file. An empty slot folder, which an
-interrupted removal leaves, is removed too; a session folder whose removal is interrupted at its
-very last step stays as an empty folder. Folders agents make by hand, symlinks and other files
+`<cache>/am-pool/<name>-<hash>` and hold a worktree `.git` file. A session folder being removed is first
+renamed to `.removing-<name>`, and a later launch finishes an interrupted removal; an empty slot
+folder, or a checkout whose metadata an interrupted reset removed (aged by the folder's own
+modification time), is removed too. A folder without read permission is kept and reported. Folders agents make by hand, symlinks and other files
 stay, and nothing is removed through a path renamed or replaced during the removal. A folder
 cleanup cannot read completely is kept and reported. A cleanup error is printed and never changes
 the launch's result; the first launch after folders expire takes as long as removing them. These
 protections are against what agents leave inside their own checkout and session folder (links,
 pipes, read-only output) and against other launchers. Sessions that can write elsewhere in the
 cache (Claude sessions, whose shield hides only the private folder, and the user's own sessions)
-are trusted not to replace, mount or plant folders there. Each launch reads every file of a launcher session folder whose top-level
-entries are all older than 14 days and whose scope is not loaded, until it is removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
+are trusted not to replace, mount or plant folders there. Each launch reads the metadata of every file in each unlocked launcher session folder whose
+scope is not loaded, until the folder is removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
 removed slots stay in their repository until `git worktree prune` or Git's own expiry; the next
 lease of the slot replaces its own.
 

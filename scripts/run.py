@@ -1204,11 +1204,8 @@ def remove_unused_storage(cache):
         os.fchmod(descriptor, stat.S_IMODE(os.fstat(descriptor).st_mode) | 0o700)
         for entry in os.scandir(descriptor):
             if entry.is_dir(follow_symlinks=False):
-                try:
-                    child = os.open(entry.name, flags, dir_fd=descriptor)
-                except PermissionError:
-                    os.chmod(entry.name, 0o700, dir_fd=descriptor)
-                    child = os.open(entry.name, flags, dir_fd=descriptor)
+                # A folder without read permission cannot be pinned first: it stays, reported.
+                child = os.open(entry.name, flags, dir_fd=descriptor)
                 try:
                     writable(child)
                 finally:
@@ -1254,10 +1251,17 @@ def remove_unused_storage(cache):
                 for number in range(1, POOL_SLOTS + 1):
                     slot, metadata = f"slot-{number}", f"slot-{number}.json"
                     try:
-                        info = os.stat(metadata, dir_fd=pool, follow_symlinks=False)
-                        if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
+                        # Leasing removes the metadata during a reset; a launcher that died
+                        # there leaves a checkout without it, aged by the folder itself.
+                        if kind(metadata, pool) is None and kind(slot, pool) == stat.S_IFDIR:
+                            info = os.stat(slot, dir_fd=pool, follow_symlinks=False)
+                        else:
+                            info = os.stat(metadata, dir_fd=pool, follow_symlinks=False)
+                            if not stat.S_ISREG(info.st_mode):
+                                continue
+                            checkout_metadata(cache / "am-pool" / name / metadata)
+                        if now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
                             continue
-                        checkout_metadata(cache / "am-pool" / name / metadata)
                         lock = os.open(slot + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pool)
                         opened.append(lock)
                         if not stat.S_ISREG(os.fstat(lock).st_mode) or not exclusive(lock):
@@ -1279,7 +1283,8 @@ def remove_unused_storage(cache):
                 fcntl.flock(pool, fcntl.LOCK_UN)
                 for slot, metadata, info, checkout in chosen:
                     try:
-                        if os.stat(metadata, dir_fd=pool, follow_symlinks=False).st_mtime != info.st_mtime:
+                        if os.stat(metadata if kind(metadata, pool) else slot, dir_fd=pool,
+                                   follow_symlinks=False).st_mtime != info.st_mtime:
                             continue
                         if checkout is not None:
                             # .git goes last, so an interrupted removal still looks like a checkout.
@@ -1292,7 +1297,8 @@ def remove_unused_storage(cache):
                         if kind(metadata + ".tmp", pool) == stat.S_IFREG:
                             os.unlink(metadata + ".tmp", dir_fd=pool)
                         # Metadata last: an interrupted removal is retried by a later launch.
-                        os.unlink(metadata, dir_fd=pool)
+                        if kind(metadata, pool) is not None:
+                            os.unlink(metadata, dir_fd=pool)
                     except FileNotFoundError:
                         pass
                     except Exception as error:
@@ -1324,8 +1330,10 @@ def remove_unused_storage(cache):
             scopes = set()
         for name in sorted(os.listdir(root)):
             # tempfile's names; the launcher's mode and marker, or an older launcher's
-            # answer file, tell its folders from ones agents made by hand.
-            if not re.fullmatch(r"[a-z0-9_]{8}", name):
+            # answer file, tell its folders from ones agents made by hand. A removal in
+            # progress renames the folder in the root, which agents do not write.
+            started = name.startswith(".removing-")
+            if not re.fullmatch(r"[a-z0-9_]{8}", name.removeprefix(".removing-")):
                 continue
             folder = None
             try:
@@ -1333,11 +1341,13 @@ def remove_unused_storage(cache):
                 info = os.fstat(folder)
                 if not mine(folder) or stat.S_IMODE(info.st_mode) != 0o700:
                     continue
-                started = kind(".removing", folder) == stat.S_IFREG
                 if not started and not (kind("tmp", folder) == stat.S_IFDIR and (
                         kind(".am-session", folder) == stat.S_IFREG or kind("answer", folder) == stat.S_IFREG)):
                     continue
-                if any(unit.endswith(f"-{name}.scope") for unit in scopes):
+                if any(unit.endswith(f"-{name.removeprefix('.removing-')}.scope") for unit in scopes):
+                    continue
+                # Lock before judging age: a launcher holds it shared while it runs.
+                if not exclusive(folder) or not still(name, root, folder):
                     continue
                 if not started:
                     def unreadable(error):
@@ -1352,13 +1362,13 @@ def remove_unused_storage(cache):
                 users = session_users()  # Per candidate: a process may enter it meanwhile.
                 if users is None or any(Path(path).is_relative_to(resolved / name) for path in users):
                     continue
-                if not exclusive(folder) or not still(name, root, folder):
-                    continue
                 if not started:
-                    os.close(os.open(".removing", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                                     | os.O_NONBLOCK, 0o600, dir_fd=folder))
-                clear(folder, {".removing"})
-                os.unlink(".removing", dir_fd=folder)
+                    target = ".removing-" + name
+                    if kind(target, root) is not None:
+                        continue
+                    os.rename(name, target, src_dir_fd=root, dst_dir_fd=root)
+                    name = target
+                clear(folder, ())
                 if still(name, root, folder):
                     os.rmdir(name, dir_fd=root)
             except FileNotFoundError:
