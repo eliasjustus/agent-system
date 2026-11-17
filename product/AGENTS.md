@@ -34,8 +34,8 @@ runners and merge queue; then complexity and upkeep.
    the task record, for the delivery's cost line; times in a task record are UTC read from `date -u`.
    A candidate gets at most two verifications: after a second failed one, end that repair
    sequence (`guides/recovery.md`) by narrowing the scope or redesigning, recorded and named in
-   the delivery, or report the blocker. Before starting or briefing a check expected to take over
-   5 minutes, write in the task record what it shows that passed checks do not; if nothing, skip it.
+   the delivery, or report the blocker. Before starting or briefing a check expected over 5 minutes,
+   write in the task record one line on what it shows passed checks do not; if empty, skip it.
    Stop and wait for the user only when going on needs a decision that "Deciding" reserves for
    them, or adds load on something shared they use (CI, this machine while they work).
 2. **Before building, take the first rung that holds:** does it need to exist; is it already in this
