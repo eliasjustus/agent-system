@@ -158,8 +158,10 @@ Invalid overrides use the defaults; overrides must be finite nonnegative numbers
 | `CGROUP_HEADROOM` | agents.slice memory.high minus memory.current < 4294967296 bytes (4 GiB), when memory.high is numeric |
 
 Each session runs in its own systemd scope inside agents.slice, with its own `MemoryHigh` of
-16 GiB: the kernel slows a session above it and reclaims that scope's own memory, so one runaway
-session does not push the others out; the limit never kills it. Set
+16 GiB: the kernel slows a session above it and reclaims that scope's own memory first, so one
+runaway session puts less pressure on the others. It is not a hard ceiling: usage can exceed it,
+sessions below it can still be reclaimed when agents.slice as a whole is full, and the limit itself
+never kills a session (the slice's or the system's out-of-memory handling still can). Set
 `AGENT_SESSION_MEMORY_HIGH` (bytes, or a number with K, M, G or T, at most 1 PiB) for one launch to change it, for
 example `AGENT_SESSION_MEMORY_HIGH=24G python3 <method>/run.py ...`. An invalid value uses the
 default with a diagnostic. Without `systemd-run` there is no scope and no limit.
