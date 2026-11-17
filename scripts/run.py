@@ -1289,7 +1289,9 @@ def remove_unused_storage(cache):
                                                           for entry in os.scandir(folder)]) <= SESSION_RETENTION_DAYS * 86400:
                     continue
                 latest = 0
-                for parent, directories, files in os.walk(folder):
+                def unreadable(error):
+                    raise error  # Unseen contents may be recent: keep the folder, say why.
+                for parent, directories, files in os.walk(folder, onerror=unreadable):
                     for item in directories + files:
                         latest = max(latest, os.lstat(os.path.join(parent, item)).st_mtime)
                 if now - latest <= SESSION_RETENTION_DAYS * 86400:
