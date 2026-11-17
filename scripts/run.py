@@ -10,6 +10,7 @@ from collections import deque
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from functools import partial
+import errno
 import fcntl
 import hashlib
 import json
@@ -1174,149 +1175,184 @@ def remove_checkout_tree(path):
 
 
 def remove_unused_storage(cache):
-    """Best effort: remove the launcher's own expired slots and session folders."""
+    """Best effort: remove the launcher's own expired slots and session folders.
+
+    Every removal goes through descriptors of folders checked and locked first,
+    so renaming or replacing a path meanwhile cannot redirect it."""
     now = time.time()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
-    def locked_out(path, flags=os.O_RDONLY | os.O_DIRECTORY):
-        # Our exclusive lock means no live owner; a failed probe means "keep".
-        try:
-            descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError:
-            return None
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return descriptor
-        except OSError:
-            os.close(descriptor)
-            return None
-
-    def real_folder(path):
-        info = path.lstat()
+    def mine(descriptor):
+        info = os.fstat(descriptor)
         return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
 
-    pools = cache / "am-pool"
-    try:
-        listed = sorted(pools.glob("*-" + "[0-9a-f]" * 12)) if real_folder(pools) else []
-    except OSError:
-        listed = []
-    for pool in listed:
+    def exclusive(descriptor):
         try:
-            if not real_folder(pool):
-                continue
-            pool_lock = locked_out(pool)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except OSError:
-            continue
-        if pool_lock is None:
-            continue
-        try:
-            for number in range(1, POOL_SLOTS + 1):
-                slot, metadata = pool / f"slot-{number}", pool / f"slot-{number}.json"
-                try:
-                    info = metadata.lstat()
-                    if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
-                        continue
-                    checkout_metadata(metadata)
-                    # A launcher checkout is a linked worktree: .git is a file.
-                    # An empty folder is what an interrupted removal leaves just before its rmdir.
-                    if os.path.lexists(slot) and not (real_folder(slot) and (
-                            not any(os.scandir(slot))
-                            or stat.S_ISREG((slot / ".git").lstat().st_mode))):
-                        continue
-                    lock = locked_out(pool / f"slot-{number}.lock", os.O_RDONLY)
-                    if lock is None:
-                        continue
-                    try:
-                        if metadata.lstat().st_mtime != info.st_mtime:
-                            continue
-                        if os.path.lexists(slot):
-                            # .git goes last, so an interrupted removal still looks like a checkout.
-                            for entry in os.scandir(slot):
-                                if entry.name != ".git":
-                                    remove_checkout_tree(Path(entry.path))
-                            remove_checkout_tree(slot)
-                        if os.path.lexists(metadata.with_suffix(".json.tmp")):
-                            remove_checkout_tree(metadata.with_suffix(".json.tmp"))
-                        # Metadata last: an interrupted removal is retried by a later launch.
-                        metadata.unlink()
-                    finally:
-                        os.close(lock)
-                except FileNotFoundError:
-                    pass
-                except Exception as error:
-                    diagnostic(f"Storage cleanup skipped {slot}: {error}")
-        finally:
-            os.close(pool_lock)
+            return False
 
-    root = cache / "am"
+    def kind(name, descriptor):
+        try:
+            return stat.S_IFMT(os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode)
+        except FileNotFoundError:
+            return None
+
+    def clear(descriptor, keep):
+        for entry in os.scandir(descriptor):
+            if entry.name in keep:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.name, dir_fd=descriptor)
+            else:
+                os.unlink(entry.name, dir_fd=descriptor)
+
+    def still(name, parent, descriptor):
+        return os.path.samestat(os.stat(name, dir_fd=parent, follow_symlinks=False), os.fstat(descriptor))
+
     try:
-        if not os.path.lexists(root) or not real_folder(root):
+        pools = os.open(cache / "am-pool", flags)
+    except OSError:
+        pools = None
+    if pools is not None:
+        try:
+            names = sorted(name for name in os.listdir(pools) if re.fullmatch(r".+-[0-9a-f]{12}", name))
+        except OSError:
+            names = []
+        for name in names:
+            opened = []
+            try:
+                pool = os.open(name, flags, dir_fd=pools)
+                opened.append(pool)
+                # Ranking holds this shared; hold it only while choosing slots.
+                if not mine(pool) or not exclusive(pool):
+                    continue
+                chosen = []
+                for number in range(1, POOL_SLOTS + 1):
+                    slot, metadata = f"slot-{number}", f"slot-{number}.json"
+                    try:
+                        info = os.stat(metadata, dir_fd=pool, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
+                            continue
+                        checkout_metadata(cache / "am-pool" / name / metadata)
+                        lock = os.open(slot + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pool)
+                        opened.append(lock)
+                        if not stat.S_ISREG(os.fstat(lock).st_mode) or not exclusive(lock):
+                            continue
+                        checkout = None
+                        if kind(slot, pool) is not None:
+                            checkout = os.open(slot, flags, dir_fd=pool)
+                            opened.append(checkout)
+                            # A launcher checkout is a linked worktree (.git is a file); an empty
+                            # folder is what an interrupted removal leaves before its rmdir.
+                            if not mine(checkout) or (os.listdir(checkout)
+                                                      and kind(".git", checkout) != stat.S_IFREG):
+                                continue
+                        chosen.append((slot, metadata, info, checkout))
+                    except FileNotFoundError:
+                        pass
+                    except Exception as error:
+                        diagnostic(f"Storage cleanup skipped {cache / 'am-pool' / name / slot}: {error}")
+                fcntl.flock(pool, fcntl.LOCK_UN)
+                for slot, metadata, info, checkout in chosen:
+                    try:
+                        if os.stat(metadata, dir_fd=pool, follow_symlinks=False).st_mtime != info.st_mtime:
+                            continue
+                        if checkout is not None:
+                            # .git goes last, so an interrupted removal still looks like a checkout.
+                            clear(checkout, {".git"})
+                            if kind(".git", checkout) is not None:
+                                os.unlink(".git", dir_fd=checkout)
+                            if still(slot, pool, checkout):
+                                os.rmdir(slot, dir_fd=pool)
+                        temporary = metadata + ".tmp"
+                        if kind(temporary, pool) == stat.S_IFDIR:
+                            shutil.rmtree(temporary, dir_fd=pool)
+                        elif kind(temporary, pool) is not None:
+                            os.unlink(temporary, dir_fd=pool)
+                        # Metadata last: an interrupted removal is retried by a later launch.
+                        os.unlink(metadata, dir_fd=pool)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as error:
+                        diagnostic(f"Storage cleanup skipped {cache / 'am-pool' / name / slot}: {error}")
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                diagnostic(f"Storage cleanup skipped {cache / 'am-pool' / name}: {error}")
+            finally:
+                for descriptor in opened:
+                    os.close(descriptor)
+        os.close(pools)
+
+    try:
+        root = os.open(cache / "am", flags)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        diagnostic(f"Storage cleanup skipped session folders: {error}")
+        return
+    try:
+        if not mine(root):
             return
-        entries = sorted(root.iterdir())
+        resolved = Path(os.path.realpath(cache / "am"))
         # A session's scope exists in the cgroup tree while any of its processes run.
         try:
             scopes = {entry.name for entry in os.scandir(agents_slice())}
         except FileNotFoundError:
             scopes = set()
-    except OSError as error:
-        diagnostic(f"Storage cleanup skipped session folders: {error}")
-        return
-    users = None
-    for folder in entries:
-        name = folder.name
-        # Only the launcher's layout: tempfile's 8 letters and a tmp folder.
-        if not re.fullmatch(r"[a-z0-9_]{8}", name):
-            continue
-        marker = folder / ".removing"
-        try:
-            if not real_folder(folder):
+        users = None
+        for name in sorted(os.listdir(root)):
+            # tempfile's names; the launcher's mode and marker, or an older launcher's
+            # answer file, tell its folders from ones agents made by hand.
+            if not re.fullmatch(r"[a-z0-9_]{8}", name):
                 continue
-            # Removal refreshes folder times, so a started one carries a marker instead.
-            def present(path, kind):
-                # Only absence is silent; an unreadable folder is reported below.
-                try:
-                    return kind(path.lstat().st_mode)
-                except FileNotFoundError:
-                    return False
-            # Not an empty folder: a new session's folder is empty until its launcher locks it.
-            started = present(marker, stat.S_ISREG)
-            if not started and not present(folder / "tmp", stat.S_ISDIR):
-                continue
-            if any(unit.endswith(f"-{name}.scope") for unit in scopes):
-                continue
-            if not started:
-                # Cheap test first, then every entry: a running session writes deep inside.
-                if now - max([folder.lstat().st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
-                                                          for entry in os.scandir(folder)]) <= SESSION_RETENTION_DAYS * 86400:
-                    continue
-                latest = 0
-                def unreadable(error):
-                    raise error  # Unseen contents may be recent: keep the folder, say why.
-                for parent, directories, files in os.walk(folder, onerror=unreadable):
-                    for item in directories + files:
-                        latest = max(latest, os.lstat(os.path.join(parent, item)).st_mtime)
-                if now - latest <= SESSION_RETENTION_DAYS * 86400:
-                    continue
-            if users is None:
-                users = session_users()
-            if users is None or any(Path(path).is_relative_to(folder) for path in users):
-                continue
-            lock = locked_out(folder)
-            if lock is None:
-                continue
+            folder = None
             try:
-                if any(os.scandir(folder)):
-                    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
-                for entry in os.scandir(folder):
-                    if entry.name != ".removing":
-                        remove_checkout_tree(Path(entry.path))
-                marker.unlink(missing_ok=True)
-                folder.rmdir()
+                folder = os.open(name, flags, dir_fd=root)
+                info = os.fstat(folder)
+                if not mine(folder) or stat.S_IMODE(info.st_mode) != 0o700:
+                    continue
+                started = kind(".removing", folder) == stat.S_IFREG
+                if not started and not (kind("tmp", folder) == stat.S_IFDIR and (
+                        kind(".am-session", folder) == stat.S_IFREG or kind("answer", folder) == stat.S_IFREG)):
+                    continue
+                if any(unit.endswith(f"-{name}.scope") for unit in scopes):
+                    continue
+                if not started:
+                    def unreadable(error):
+                        raise error  # Unseen contents may be recent: keep the folder, say why.
+                    latest = info.st_mtime
+                    for _, directories, files, parent in os.fwalk(".", dir_fd=folder, follow_symlinks=False,
+                                                                onerror=unreadable):
+                        for item in directories + files:
+                            latest = max(latest, os.stat(item, dir_fd=parent, follow_symlinks=False).st_mtime)
+                    if now - latest <= SESSION_RETENTION_DAYS * 86400:
+                        continue
+                if users is None:
+                    users = session_users()
+                if users is None or any(Path(path).is_relative_to(resolved / name) for path in users):
+                    continue
+                if not exclusive(folder) or not still(name, root, folder):
+                    continue
+                os.close(os.open(".removing", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=folder))
+                clear(folder, {".removing"})
+                os.unlink(".removing", dir_fd=folder)
+                if still(name, root, folder):
+                    os.rmdir(name, dir_fd=root)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                if error.errno != errno.ELOOP and error.errno != errno.ENOTDIR:
+                    diagnostic(f"Storage cleanup skipped {cache / 'am' / name}: {error}")
+            except Exception as error:
+                diagnostic(f"Storage cleanup skipped {cache / 'am' / name}: {error}")
             finally:
-                os.close(lock)
-        except FileNotFoundError:
-            pass
-        except Exception as error:
-            diagnostic(f"Storage cleanup skipped {folder}: {error}")
+                if folder is not None:
+                    os.close(folder)
+    finally:
+        os.close(root)
 
 
 def session_users():
@@ -1328,10 +1364,10 @@ def session_users():
         try:
             if process.stat().st_uid != os.getuid():
                 continue
-            paths.append(os.readlink(process / "cwd"))
+            paths.append(os.path.realpath(os.readlink(process / "cwd")))
             for item in (process / "environ").read_bytes().split(b"\0"):
                 if item.startswith((b"TMPDIR=", b"TMP=", b"TEMP=")):
-                    paths.append(os.fsdecode(item.split(b"=", 1)[1]))
+                    paths.append(os.path.realpath(os.fsdecode(item.split(b"=", 1)[1])))
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             # Gone, or not dumpable (setuid helpers, keyrings): no launcher session runs so.
             continue
@@ -2163,6 +2199,7 @@ def launch(parser, args, result):
         # Held until this process ends; storage cleanup never removes a locked folder.
         session_lock = os.open(temp, os.O_RDONLY | os.O_DIRECTORY)
         fcntl.flock(session_lock, fcntl.LOCK_SH)
+        os.close(os.open(temp / ".am-session", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
         temporary = temp / "tmp"
         try:
             temporary.mkdir()
