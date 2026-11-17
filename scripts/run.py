@@ -1277,8 +1277,8 @@ def remove_unused_storage(cache):
                     return kind(path.lstat().st_mode)
                 except FileNotFoundError:
                     return False
-            # An empty folder is what an interrupted removal leaves just before its rmdir.
-            started = present(marker, stat.S_ISREG) or not any(os.scandir(folder))
+            # Not an empty folder: a new session's folder is empty until its launcher locks it.
+            started = present(marker, stat.S_ISREG)
             if not started and not present(folder / "tmp", stat.S_ISDIR):
                 continue
             if any(unit.endswith(f"-{name}.scope") for unit in scopes):
