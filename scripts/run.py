@@ -32,6 +32,10 @@ DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 POOL_SLOTS = 5
 POOL_USES = 20
 SESSION_MEMORY_HIGH = "16G"  # systemd MemoryHigh of each session scope.
+# Unused launcher storage is removed by later launches: slots after their last lease,
+# session folders after their last activity (a kept one may hold an unsaved answer).
+POOL_RETENTION_DAYS = 7
+SESSION_RETENTION_DAYS = 14
 # Provisional admission thresholds; free-space limits are bytes, swap is percent.
 ADMISSION_DEFAULTS = {
     "MEMORY_SOME": 5, "MEMORY_FULL": 2, "IO_FULL": 10,
@@ -152,6 +156,17 @@ def header_value(value):
     return rendered if len(rendered) <= 4096 else rendered[:4093] + "..."
 
 
+def agents_slice():
+    try:
+        own = Path("/proc/self/cgroup").read_text()
+    except (OSError, UnicodeError):
+        own = ""
+    cgroup = re.search(r"(/user\.slice/user-\d+\.slice/user@\d+\.service)(?:/|$)", own)
+    service = (cgroup[1] if cgroup else
+               f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service")
+    return "/sys/fs/cgroup" + service + "/agents.slice/"
+
+
 def wait_for_room():
     """Wait without owning checkout resources; missing readings do not block."""
     def number(value):
@@ -173,11 +188,7 @@ def wait_for_room():
         except (OSError, UnicodeError):
             return ""
 
-    cgroup = re.search(r"(/user\.slice/user-\d+\.slice/user@\d+\.service)(?:/|$)",
-                       read("/proc/self/cgroup"))
-    service = (cgroup[1] if cgroup else
-               f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service")
-    slice_path = "/sys/fs/cgroup" + service + "/agents.slice/"
+    slice_path = agents_slice()
     started = time.monotonic()
     while True:
         readings = {}
@@ -1162,6 +1173,101 @@ def remove_checkout_tree(path):
             writable_retry(os.unlink, path, error)
 
 
+def remove_unused_storage(cache):
+    """Best effort: remove the launcher's own expired slots and session folders."""
+    now = time.time()
+
+    def unlocked(path, flags):
+        # A held lock means a live owner; a failed probe means "keep".
+        try:
+            descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except OSError:
+            os.close(descriptor)
+            return None
+
+    for pool in sorted((cache / "am-pool").glob("*-" + "[0-9a-f]" * 12)):
+        if pool.is_symlink() or not pool.is_dir():
+            continue
+        for number in range(1, POOL_SLOTS + 1):
+            slot, metadata = pool / f"slot-{number}", pool / f"slot-{number}.json"
+            try:
+                info = metadata.lstat()
+                if not stat.S_ISREG(info.st_mode) or now - info.st_mtime <= POOL_RETENTION_DAYS * 86400:
+                    continue
+                lock = unlocked(pool / f"slot-{number}.lock", os.O_RDONLY)
+                if lock is None:
+                    continue
+                try:
+                    if metadata.lstat().st_mtime != info.st_mtime:
+                        continue
+                    for path in (slot, metadata.with_suffix(".json.tmp")):
+                        if os.path.lexists(path):
+                            remove_checkout_tree(path)
+                    # Metadata last: an interrupted removal is retried by a later launch.
+                    metadata.unlink()
+                finally:
+                    os.close(lock)
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                diagnostic(f"Storage cleanup skipped {slot}: {error}")
+
+    root = cache / "am"
+    # A session's scope exists in the cgroup tree while any of its processes run.
+    try:
+        scopes = {entry.name for entry in os.scandir(agents_slice())}
+    except FileNotFoundError:
+        scopes = set()
+    except OSError as error:
+        diagnostic(f"Storage cleanup skipped session folders: cannot read scopes: {error}")
+        return
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return
+    for folder in entries:
+        expired = folder.name.startswith(".expired-")
+        name = folder.name.removeprefix(".expired-")
+        # Only folders with the launcher's name and layout: tempfile's 8 letters and tmp/.
+        if not re.fullmatch(r"[a-z0-9_]{8}", name):
+            continue
+        try:
+            info = folder.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                continue
+            if not expired:
+                if not stat.S_ISDIR((folder / "tmp").lstat().st_mode):
+                    continue
+                if any(unit.endswith(f"-{name}.scope") for unit in scopes):
+                    continue
+                activity = max([info.st_mtime] + [entry.stat(follow_symlinks=False).st_mtime
+                                                  for entry in os.scandir(folder)])
+                if now - activity <= SESSION_RETENTION_DAYS * 86400:
+                    continue
+            lock = unlocked(folder, os.O_RDONLY | os.O_DIRECTORY)
+            if lock is None:
+                continue
+            try:
+                if not expired:
+                    target = root / (".expired-" + name)
+                    if os.path.lexists(target):
+                        continue
+                    folder.rename(target)
+                    folder = target
+                remove_checkout_tree(folder)
+            finally:
+                os.close(lock)
+        except FileNotFoundError:
+            pass
+        except Exception as error:
+            diagnostic(f"Storage cleanup skipped {folder}: {error}")
+
+
 def check_checkout_parents(work, paths, missing_ok=False, directory_mode=None):
     if directory_mode is not None:
         work.chmod(directory_mode)
@@ -1954,6 +2060,10 @@ def launch(parser, args, result):
     admission = wait_for_room() if args.role in ("builder", "verifier") else ""
     if admission:
         result.header += header_value(admission) + "\n"
+    try:
+        remove_unused_storage(cache)
+    except Exception as error:
+        diagnostic(f"Storage cleanup failed: {error}")
     root = cache / "am"
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -1963,6 +2073,9 @@ def launch(parser, args, result):
         return result.refused(f"Cannot create session folder under {root}: {error}")
     try:
         temp = Path(session.name).resolve()
+        # Held until this process ends; storage cleanup never removes a locked folder.
+        session_lock = os.open(temp, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(session_lock, fcntl.LOCK_SH)
         temporary = temp / "tmp"
         try:
             temporary.mkdir()

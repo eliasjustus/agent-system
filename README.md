@@ -625,12 +625,23 @@ registration; if it fails, remove only the matching entry under the common Git d
 replace `.lock` files while launchers may start. Check that the pool registrations are gone before deleting
 its lock and metadata files.
 
-Moved, renamed or deleted repositories leave pools that are never reclaimed automatically.
-Inspect all pool sizes with `du -sh <cache>/am-pool/*`. After stopping their sessions as above,
-delete pools whose repository is gone. If the repository still exists at a new path, remove its
-old pool and run `git -C /path/to/project worktree prune` there to clear the missing slots'
-registrations; check for unrelated stale registrations before pruning.
-Delete the old pool first: Git retains registrations while their checkout folders still exist.
+Every launch, of any role, first removes launcher storage that has gone unused, in every
+repository's pool under its cache root, including pools of moved or deleted repositories:
+
+- a pool slot whose last lease is more than **7 days** old (the modification time of its
+  `slot-N.json`, which every lease rewrites) and whose lock no session holds: its checkout and
+  metadata go, its lock file stays; the next lease of that slot builds it cold;
+- a session folder under `<cache>/am` whose last activity (the newest modification time of the
+  folder and its top-level entries) is more than **14 days** old, whose launcher no longer holds
+  its lock and whose `agent-*-<folder>.scope` is not loaded. This includes a folder a result
+  header names as kept after a failed save or stop: copy what you need from it within 14 days.
+
+Only folders with the launcher's names and layout are removed: eight letters, digits or `_` with
+a `tmp` folder in `<cache>/am`, `slot-N` and its metadata in `<cache>/am-pool/<name>-<hash>`.
+Folders agents make by hand there, symlinks and other files stay. A cleanup error is printed and
+never changes the launch. There is no size or count limit: slots in use stay warm. Stale worktree
+registrations of removed slots stay in their repository until `git worktree prune` or Git's own
+expiry; the next lease of the slot replaces its own.
 
 To roll back, stop current sessions, remove their pool with the procedure above, check out the previous release tag in this clone and rerun setup for each
 project with those same arguments.
