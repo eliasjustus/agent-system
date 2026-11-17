@@ -1217,8 +1217,10 @@ def remove_unused_storage(cache):
                         continue
                     checkout_metadata(metadata)
                     # A launcher checkout is a linked worktree: .git is a file.
-                    if os.path.lexists(slot) and not (real_folder(slot)
-                                                      and stat.S_ISREG((slot / ".git").lstat().st_mode)):
+                    # An empty folder is what an interrupted removal leaves just before its rmdir.
+                    if os.path.lexists(slot) and not (real_folder(slot) and (
+                            not any(os.scandir(slot))
+                            or stat.S_ISREG((slot / ".git").lstat().st_mode))):
                         continue
                     lock = locked_out(pool / f"slot-{number}.lock", os.O_RDONLY)
                     if lock is None:
@@ -1275,7 +1277,8 @@ def remove_unused_storage(cache):
                     return kind(path.lstat().st_mode)
                 except FileNotFoundError:
                     return False
-            started = present(marker, stat.S_ISREG)
+            # An empty folder is what an interrupted removal leaves just before its rmdir.
+            started = present(marker, stat.S_ISREG) or not any(os.scandir(folder))
             if not started and not present(folder / "tmp", stat.S_ISDIR):
                 continue
             if any(unit.endswith(f"-{name}.scope") for unit in scopes):
@@ -1299,11 +1302,12 @@ def remove_unused_storage(cache):
             if lock is None:
                 continue
             try:
-                os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+                if any(os.scandir(folder)):
+                    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
                 for entry in os.scandir(folder):
                     if entry.name != ".removing":
                         remove_checkout_tree(Path(entry.path))
-                marker.unlink()
+                marker.unlink(missing_ok=True)
                 folder.rmdir()
             finally:
                 os.close(lock)

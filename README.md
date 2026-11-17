@@ -638,6 +638,7 @@ repository's pool under its cache root, including pools of moved or deleted repo
 
 Only folders with the launcher's names and layout are removed: eight letters, digits or `_` with
 a `tmp` folder in `<cache>/am`, `slot-N` and its metadata in `<cache>/am-pool/<name>-<hash>`.
+An empty folder with a launcher name, what an interrupted removal leaves, is removed too.
 Folders agents make by hand there, symlinks and other files stay. A cleanup error is printed and
 never changes the launch. There is no size or count limit: slots in use stay warm. Stale worktree
 registrations of removed slots stay in their repository until `git worktree prune` or Git's own
