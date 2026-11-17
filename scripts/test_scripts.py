@@ -7504,7 +7504,7 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 prefix = ["--user", "--scope", "--quiet", "--collect"]
                 if supports_expansion:
                     prefix += ["--expand-environment=no"]
-                prefix += ["--slice=agents.slice", "--unit=" + unit]
+                prefix += ["--slice=agents.slice", "--unit=" + unit, "-p", "MemoryHigh=16G"]
                 self.assertEqual(args[:len(prefix)], prefix)
                 self.assertEqual(args[len(prefix):len(prefix) + 2], ["--", self.env["AGENT_CODEX_CMD"]])
                 record = json.loads(self.record.read_text())

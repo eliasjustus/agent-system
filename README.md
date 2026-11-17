@@ -157,6 +157,13 @@ Invalid overrides use the defaults; overrides must be finite nonnegative numbers
 | `SWAP_FREE` | SwapFree < 10 percent of SwapTotal, when SwapTotal > 0 |
 | `CGROUP_HEADROOM` | agents.slice memory.high minus memory.current < 4294967296 bytes (4 GiB), when memory.high is numeric |
 
+Each session runs in its own systemd scope inside agents.slice, with its own `MemoryHigh` of
+16 GiB: a session above it is slowed and its memory reclaimed into swap inside its own scope, so
+one runaway session cannot push the others out; the limit never kills it. Set
+`AGENT_SESSION_MEMORY_HIGH` (bytes, or a number with K, M, G or T) for one launch to change it, for
+example `AGENT_SESSION_MEMORY_HIGH=24G python3 <method>/run.py ...`. An invalid value uses the
+default with a diagnostic. Without `systemd-run` there is no scope and no limit.
+
 The agents slice is found through `/proc/self/cgroup`'s user service, falling back to
 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/agents.slice/`.
 

@@ -31,6 +31,7 @@ import unicodedata
 DEFAULT_PRIVATE = "~/dev/agent-private"  # Set by setup.
 POOL_SLOTS = 5
 POOL_USES = 20
+SESSION_MEMORY_HIGH = "16G"  # systemd MemoryHigh of each session scope.
 # Provisional admission thresholds; free-space limits are bytes, swap is percent.
 ADMISSION_DEFAULTS = {
     "MEMORY_SOME": 5, "MEMORY_FULL": 2, "IO_FULL": 10,
@@ -1996,6 +1997,12 @@ def launch(parser, args, result):
             except (OSError, subprocess.SubprocessError):
                 pass
         unit = f"agent-{args.role}-{temp.name}.scope" if systemd else ""
+        # Each scope's own limit throttles one runaway session before agents.slice fills.
+        memory_high = os.environ.get("AGENT_SESSION_MEMORY_HIGH", SESSION_MEMORY_HIGH)
+        if not re.fullmatch(r"[1-9][0-9]*[KMGT]?", memory_high):
+            diagnostic(f"AGENT_SESSION_MEMORY_HIGH is invalid ({ascii(memory_high)}); "
+                       f"using the default {SESSION_MEMORY_HIGH}")
+            memory_high = SESSION_MEMORY_HIGH
         def update_header():
             result.header = (f"Role: {args.role}\nFamily: {args.family}\nModel: {header_value(model)}\n"
                              + round_header
@@ -2026,7 +2033,8 @@ def launch(parser, args, result):
             if unit:
                 command = [systemd, "--user", "--scope", "--quiet", "--collect",
                            *(["--expand-environment=no"] if expand_environment else []),
-                           "--slice=agents.slice", f"--unit={unit}", "--", *command]
+                           "--slice=agents.slice", f"--unit={unit}", "-p", f"MemoryHigh={memory_high}",
+                           "--", *command]
             else:
                 diagnostic("systemd-run unavailable; running without a scope")
             if guarded:
