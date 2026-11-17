@@ -1199,14 +1199,36 @@ def remove_unused_storage(cache):
         except FileNotFoundError:
             return None
 
-    def clear(descriptor, keep):
+    def writable(descriptor):
+        # Build output can be read-only; open each folder without following links, then fchmod.
+        os.fchmod(descriptor, stat.S_IMODE(os.fstat(descriptor).st_mode) | 0o700)
         for entry in os.scandir(descriptor):
-            if entry.name in keep:
-                continue
             if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.name, dir_fd=descriptor)
-            else:
-                os.unlink(entry.name, dir_fd=descriptor)
+                try:
+                    child = os.open(entry.name, flags, dir_fd=descriptor)
+                except PermissionError:
+                    os.chmod(entry.name, 0o700, dir_fd=descriptor)
+                    child = os.open(entry.name, flags, dir_fd=descriptor)
+                try:
+                    writable(child)
+                finally:
+                    os.close(child)
+
+    def clear(descriptor, keep):
+        for attempt in (1, 2):
+            try:
+                for entry in os.scandir(descriptor):
+                    if entry.name in keep:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        shutil.rmtree(entry.name, dir_fd=descriptor)
+                    else:
+                        os.unlink(entry.name, dir_fd=descriptor)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                writable(descriptor)
 
     def still(name, parent, descriptor):
         return os.path.samestat(os.stat(name, dir_fd=parent, follow_symlinks=False), os.fstat(descriptor))
@@ -1266,11 +1288,9 @@ def remove_unused_storage(cache):
                                 os.unlink(".git", dir_fd=checkout)
                             if still(slot, pool, checkout):
                                 os.rmdir(slot, dir_fd=pool)
-                        temporary = metadata + ".tmp"
-                        if kind(temporary, pool) == stat.S_IFDIR:
-                            shutil.rmtree(temporary, dir_fd=pool)
-                        elif kind(temporary, pool) is not None:
-                            os.unlink(temporary, dir_fd=pool)
+                        # The launcher writes only a file there; leave anything else alone.
+                        if kind(metadata + ".tmp", pool) == stat.S_IFREG:
+                            os.unlink(metadata + ".tmp", dir_fd=pool)
                         # Metadata last: an interrupted removal is retried by a later launch.
                         os.unlink(metadata, dir_fd=pool)
                     except FileNotFoundError:
@@ -1302,7 +1322,6 @@ def remove_unused_storage(cache):
             scopes = {entry.name for entry in os.scandir(agents_slice())}
         except FileNotFoundError:
             scopes = set()
-        users = None
         for name in sorted(os.listdir(root)):
             # tempfile's names; the launcher's mode and marker, or an older launcher's
             # answer file, tell its folders from ones agents made by hand.
@@ -1330,13 +1349,14 @@ def remove_unused_storage(cache):
                             latest = max(latest, os.stat(item, dir_fd=parent, follow_symlinks=False).st_mtime)
                     if now - latest <= SESSION_RETENTION_DAYS * 86400:
                         continue
-                if users is None:
-                    users = session_users()
+                users = session_users()  # Per candidate: a process may enter it meanwhile.
                 if users is None or any(Path(path).is_relative_to(resolved / name) for path in users):
                     continue
                 if not exclusive(folder) or not still(name, root, folder):
                     continue
-                os.close(os.open(".removing", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=folder))
+                if not started:
+                    os.close(os.open(".removing", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                                     | os.O_NONBLOCK, 0o600, dir_fd=folder))
                 clear(folder, {".removing"})
                 os.unlink(".removing", dir_fd=folder)
                 if still(name, root, folder):
@@ -1364,10 +1384,11 @@ def session_users():
         try:
             if process.stat().st_uid != os.getuid():
                 continue
-            paths.append(os.path.realpath(os.readlink(process / "cwd")))
+            working = os.readlink(process / "cwd")
+            paths.append(os.path.realpath(working))
             for item in (process / "environ").read_bytes().split(b"\0"):
                 if item.startswith((b"TMPDIR=", b"TMP=", b"TEMP=")):
-                    paths.append(os.path.realpath(os.fsdecode(item.split(b"=", 1)[1])))
+                    paths.append(os.path.realpath(os.path.join(working, os.fsdecode(item.split(b"=", 1)[1]))))
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             # Gone, or not dumpable (setuid helpers, keyrings): no launcher session runs so.
             continue
@@ -2199,7 +2220,10 @@ def launch(parser, args, result):
         # Held until this process ends; storage cleanup never removes a locked folder.
         session_lock = os.open(temp, os.O_RDONLY | os.O_DIRECTORY)
         fcntl.flock(session_lock, fcntl.LOCK_SH)
-        os.close(os.open(temp / ".am-session", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        try:
+            os.close(os.open(temp / ".am-session", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        except OSError as error:
+            diagnostic(f"Session folder not marked for storage cleanup: {error}")
         temporary = temp / "tmp"
         try:
             temporary.mkdir()

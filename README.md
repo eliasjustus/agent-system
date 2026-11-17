@@ -647,7 +647,11 @@ interrupted removal leaves, is removed too; a session folder whose removal is in
 very last step stays as an empty folder. Folders agents make by hand, symlinks and other files
 stay, and nothing is removed through a path renamed or replaced during the removal. A folder
 cleanup cannot read completely is kept and reported. A cleanup error is printed and never changes
-the launch. Each launch reads every file of a session folder that looks expired, until it is
+the launch's result; the first launch after folders expire takes as long as removing them. These
+protections are against what agents leave inside their own checkout and session folder (links,
+pipes, read-only output) and against other launchers. Sessions that can write elsewhere in the
+cache (Claude sessions, whose shield hides only the private folder, and the user's own sessions)
+are trusted not to replace, mount or plant folders there. Each launch reads every file of a session folder that looks expired, until it is
 removed. There is no size or count limit: slots in use stay warm. Stale worktree registrations of
 removed slots stay in their repository until `git worktree prune` or Git's own expiry; the next
 lease of the slot replaces its own.
