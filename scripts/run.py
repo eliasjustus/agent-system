@@ -1275,11 +1275,6 @@ def remove_unused_storage(cache):
                             if not mine(checkout) or (os.listdir(checkout)
                                                       and kind(".git", checkout) != stat.S_IFREG):
                                 continue
-                        # Someone may work in an unleased checkout (a shell, a build): keep it.
-                        users = session_users()
-                        if users is None or any(Path(path).is_relative_to(
-                                Path(os.path.realpath(cache / "am-pool" / name / slot))) for path in users):
-                            continue
                         chosen.append((slot, metadata, info, checkout))
                     except FileNotFoundError:
                         pass
