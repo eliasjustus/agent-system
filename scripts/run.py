@@ -1307,7 +1307,8 @@ def session_users():
             for item in (process / "environ").read_bytes().split(b"\0"):
                 if item.startswith((b"TMPDIR=", b"TMP=", b"TEMP=")):
                     paths.append(os.fsdecode(item.split(b"=", 1)[1]))
-        except (FileNotFoundError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            # Gone, or not dumpable (setuid helpers, keyrings): no launcher session runs so.
             continue
         except OSError as error:
             diagnostic(f"Storage cleanup skipped session folders: cannot read {process}: {error}")
