@@ -7504,12 +7504,29 @@ pathlib.Path(os.environ["RECORD"]).write_text(json.dumps(record))
                 prefix = ["--user", "--scope", "--quiet", "--collect"]
                 if supports_expansion:
                     prefix += ["--expand-environment=no"]
-                prefix += ["--slice=agents.slice", "--unit=" + unit]
+                prefix += ["--slice=agents.slice", "--unit=" + unit, "-p", "MemoryHigh=16G"]
                 self.assertEqual(args[:len(prefix)], prefix)
                 self.assertEqual(args[len(prefix):len(prefix) + 2], ["--", self.env["AGENT_CODEX_CMD"]])
                 record = json.loads(self.record.read_text())
                 self.assertEqual(record["argv"][record["argv"].index("-m") + 1], "literal-$HOME")
                 self.assertTrue((self.scope_state / (unit + ".stop")).exists())
+
+    def test_L2_session_memory_high_override_and_invalid_values(self):
+        for value, expected in (("512M", "512M"), ("1024T", "1024T"), ("garbage", "16G"), ("0", "16G"),
+                                ("1025T", "16G"), ("16777216T", "16G"), ("18446744073709551616", "16G"),
+                                ("256M\nMemoryMax=1", "16G")):
+            with self.subTest(value=value):
+                self.env["AGENT_SESSION_MEMORY_HIGH"] = value
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                unit = [line[7:] for line in self.out.read_text().splitlines() if line.startswith("Scope: ")][0]
+                args = json.loads((self.scope_state / unit).read_text())
+                self.assertEqual(args[args.index("-p") + 1], "MemoryHigh=" + expected)
+                self.assertNotIn("MemoryMax", " ".join(args[:args.index("--")]))
+                if expected == "16G":
+                    self.assertIn("AGENT_SESSION_MEMORY_HIGH is invalid", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
 
     def test_gradle_registry_is_session_local_and_preserves_caller_environment(self):
         self.agent_extra('''
