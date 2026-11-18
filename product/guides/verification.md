@@ -31,7 +31,7 @@ Run checks so failures propagate; never hide one behind `tail` or another pipe.
 ## Before and after
 
 - Your working directory is your leased copy of the committed candidate. With `--before <commit>`,
-  use the writable **Before checkout** named in the prompt and header for the baseline. The launcher
+  use the writable **Before checkout** the launcher names for the baseline. The launcher
   resets and cleans it like the candidate and fails the result if the candidate's tracked files,
   index or HEAD changed.
   With `--before none` there is no before checkout; if you need one, make a
@@ -51,7 +51,7 @@ Run checks so failures propagate; never hide one behind `tail` or another pipe.
 
 ## Your own cases
 
-The scenario list is someone else's framing. Add at least one case aimed at what it most likely
+Add at least one case aimed at what the scenario list most likely
 missed: another path to the same result, state over time, an input the wording implies. Report
 variations you chose not to test as untested. A finding fails the candidate only where the agreed
 outcome is not delivered, something that works today breaks, data is lost or security is
@@ -59,8 +59,9 @@ weakened; anything else goes under `Noticed:` and starts no repair, a wrong sent
 description or report too: list every one you find at once. To call a reported defect not real, address the
 reported entry point and conditions; a safe path elsewhere does not refute it.
 
-Once something fails the candidate, stop checks expected to take over 5 minutes and start none
-unless the brief asks; finish your own cases; report the others as not run.
+Once a finding fails the candidate, finish your own cases; stop or skip other checks expected to
+exceed 5 minutes, unless the brief requires them regardless, and report each as not run for this
+reason.
 
 ## Report
 

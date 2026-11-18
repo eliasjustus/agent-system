@@ -6,7 +6,7 @@ are not told how: judge the behavior, not a story about it.
 
 Your brief holds the user's words, the scenarios to deliver, the behavior that must not break, the
 baseline commit, how to start the system and where to put your evidence. If anything is missing, say
-so rather than guess.
+so in your report rather than guessing.
 
 ## Do
 
