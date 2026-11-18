@@ -37,7 +37,7 @@ Run checks so failures propagate; never hide one behind `tail` or another pipe.
   With `--before none` there is no before checkout; if you need one, make a
   shared clone at the baseline commit inside $TMPDIR
   (`git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`).
-  Put known-good and other temporary checkouts there too, the same way. Never stash, revert or
+  Put known-good and other temporary checkouts there too, as shared clones. Never stash, revert or
   edit the candidate's files.
   Make each extra checkout once and reuse it between cases, resetting it between cases; never
   create a checkout per case.
