@@ -23,7 +23,7 @@ owner's running apps, a dev stack, a GPU, shared dependency folders); never use 
 running service or write into a dependency tree other checkouts use; restore the owner's apps you
 stopped, from outside your own process scope, and show that they run again.
 
-When the candidate includes other merged changes, first run the cheapest checks that cover code they
+When the candidate includes other merged changes, run the cheapest checks that cover code they
 share (build, type check, compiling the tests) before any narrower recheck.
 
 Run checks so failures propagate; never hide one behind `tail` or another pipe.
@@ -32,13 +32,13 @@ Run checks so failures propagate; never hide one behind `tail` or another pipe.
 
 - Your working directory is your leased copy of the committed candidate. With `--before <commit>`,
   use the writable **Before checkout** named in the prompt and header for the baseline. The launcher
-  resets and cleans it like the candidate; do not delete either pool checkout.
-  Afterwards, the launcher fails the result if the candidate's tracked files, index or HEAD changed.
-  With `--before none`, there is no before checkout; if you need one after all, make an ad-hoc
+  resets and cleans it like the candidate and fails the result if the candidate's tracked files,
+  index or HEAD changed.
+  With `--before none` there is no before checkout; if you need one, make a
   shared clone at the baseline commit inside $TMPDIR
   (`git clone --quiet --shared --no-checkout . "$TMPDIR/before" && git -C "$TMPDIR/before" checkout --quiet --detach <baseline>`).
-  Put known-good and other temporary checkouts there too, using shared clones that write nothing
-  into the source repository. Never stash, revert or edit the candidate's files.
+  Put known-good and other temporary checkouts there too, the same way. Never stash, revert or
+  edit the candidate's files.
   Make each extra checkout once and reuse it between cases, resetting it between cases; never
   create a checkout per case.
 - Build each source tree only into its own build folder. Never point one tree's build output
@@ -59,6 +59,9 @@ weakened; anything else goes under `Noticed:` and starts no repair, a wrong sent
 description or report too: list every one you find at once. To call a reported defect not real, address the
 reported entry point and conditions; a safe path elsewhere does not refute it.
 
+Once something fails the candidate, stop checks expected to take over 5 minutes and start none
+unless the brief asks; finish your own cases; report the others as not run.
+
 ## Report
 
 ```
@@ -72,4 +75,4 @@ Then your own cases and what they showed, anything unverified and why, and on it
 `Verdict: pass | fail | inconclusive`, with the scenario or the next question to answer.
 
 Stop every process you started and remove your temporary checkouts. Leave launcher pool slots
-registered and in place for reuse.
+registered and in place.
