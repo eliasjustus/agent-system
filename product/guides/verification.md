@@ -59,9 +59,8 @@ weakened; anything else goes under `Noticed:` and starts no repair, a wrong sent
 description or report too: list every one you find at once. To call a reported defect not real, address the
 reported entry point and conditions; a safe path elsewhere does not refute it.
 
-Once a finding fails the candidate, finish your own cases; stop or skip other checks expected to
-exceed 5 minutes, unless the brief requires them regardless, and report each as not run for this
-reason.
+Once a finding fails the candidate, stop or skip checks expected to exceed 5 minutes, except your
+own cases and those the brief requires regardless, and say which you stopped or skipped and why.
 
 ## Report
 
